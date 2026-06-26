@@ -216,6 +216,23 @@ An operator issues a query:
 You can easily drive Myrmex Hive programmatically from other automated AI systems, such as **Antigravity SDK** agents. 
 The gateway exposes standard endpoints (`/api/chat` and `/api/call`) protected by the secure bearer token. Your Antigravity agents can query the endpoint, receive structured tool list payloads, and trigger actions over the SSH tunnel.
 
+### Scenario C: Airgapped Gemma 4 Setup & Cryptographic Auditing
+An enterprise administrator configures a secure, fully compliance-audited local assistant using the offline-ready Ollama side-service:
+1. **Launch Ollama**: The administrator starts the preloaded CPU-only Gemma 4 side-service in Docker:
+   ```bash
+   docker compose --profile ollama-cpu up -d
+   ```
+2. **Configure Gateway**: In `gateway_config.json`, the gateway is linked to the Ollama endpoint:
+   ```json
+   "ollama_url": "http://myrmex-ollama-cpu:11434",
+   "ollama_model": "gemma4:e4b"
+   ```
+3. **Execute Operator Request**: An operator executes a compliance-audited CLI query:
+   ```bash
+   myrmex ask "Verify the nginx server is running on agent-nginx" --token "operator-token-456"
+   ```
+4. **Log & Verify Audit Event**: Since the request has write-like evaluation steps, the gateway logs a cryptographically signed entry in `audit.log` showing the timestamp, token role (`operator`), API route (`/api/chat`), and base64 signature. The security auditor verifies the log authenticity using the gateway's public SSH host key.
+
 ---
 
 ## 7. GCP Best Practices
