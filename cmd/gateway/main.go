@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -74,6 +75,40 @@ type AskGemmaArgs struct {
 type HumanizeSyslogArgs struct {
 	AgentID string `json:"agent_id"`
 	LogLine string `json:"log_line"`
+}
+
+type contextKey string
+
+const (
+	contextKeyToken contextKey = "token"
+	contextKeyRole  contextKey = "role"
+)
+
+var hostKeySigner ssh.Signer
+
+var rolePermissions = map[string]map[string]bool{
+	"admin": {
+		"/sse":        true,
+		"/message":    true,
+		"/api/status": true,
+		"/api/config": true,
+		"/api/keys":   true,
+		"/api/call":   true,
+		"/api/tools":  true,
+		"/api/chat":   true,
+	},
+	"operator": {
+		"/sse":        true,
+		"/message":    true,
+		"/api/status": true,
+		"/api/call":   true,
+		"/api/tools":  true,
+		"/api/chat":   true,
+	},
+	"read-only": {
+		"/api/status": true,
+		"/api/tools":  true,
+	},
 }
 
 func normalizeID(id interface{}) string {
@@ -447,6 +482,7 @@ func startSSHServer(cfg *config.GatewayConfig) {
 			log.Fatalf("Failed to generate transient key: %v", err)
 		}
 	}
+	hostKeySigner = hostKey
 	sshConfig.AddHostKey(hostKey)
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
@@ -1064,6 +1100,99 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	}
 }
 
+func signAuditData(data string) (string, error) {
+	if hostKeySigner == nil {
+		return "", fmt.Errorf("host key signer not initialized")
+	}
+	sig, err := hostKeySigner.Sign(rand.Reader, []byte(data))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sig.Blob), nil
+}
+
+type AuditEntry struct {
+	Timestamp string `json:"timestamp"`
+	TokenID   string `json:"token_id"`
+	Role      string `json:"role"`
+	Action    string `json:"action"` // "api_call", "api_chat"
+	AgentID   string `json:"agent_id,omitempty"`
+	Command   string `json:"command,omitempty"`
+	Status    string `json:"status"` // "success" or "failure"
+	Details   string `json:"details"`
+	Signature string `json:"signature,omitempty"`
+}
+
+var auditLogMu sync.Mutex
+
+func logAuditEvent(ctx context.Context, action, agentID, command, status, details string) {
+	token, _ := ctx.Value(contextKeyToken).(string)
+	role, _ := ctx.Value(contextKeyRole).(string)
+
+	anonymizedToken := "none"
+	if token != "" {
+		if len(token) > 8 {
+			anonymizedToken = token[:4] + "..." + token[len(token)-4:]
+		} else {
+			anonymizedToken = "..."
+		}
+	}
+	if role == "" {
+		role = "system"
+	}
+
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	entry := AuditEntry{
+		Timestamp: timestamp,
+		TokenID:   anonymizedToken,
+		Role:      role,
+		Action:    action,
+		AgentID:   agentID,
+		Command:   command,
+		Status:    status,
+		Details:   details,
+	}
+
+	signData := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s",
+		entry.Timestamp, entry.TokenID, entry.Role, entry.Action,
+		entry.AgentID, entry.Command, entry.Status, entry.Details)
+
+	sig, err := signAuditData(signData)
+	if err == nil {
+		entry.Signature = sig
+	} else {
+		log.Printf("[AUDIT ERROR] Failed to sign audit log: %v", err)
+	}
+
+	logBytes, err := json.Marshal(entry)
+	if err != nil {
+		log.Printf("[AUDIT ERROR] Failed to marshal audit log: %v", err)
+		return
+	}
+
+	currentConfigMu.RLock()
+	logPath := currentConfig.AuditLogPath
+	currentConfigMu.RUnlock()
+
+	if logPath == "" {
+		logPath = "audit.log"
+	}
+
+	auditLogMu.Lock()
+	defer auditLogMu.Unlock()
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Printf("[AUDIT ERROR] Failed to open audit log file %s: %v", logPath, err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Write(append(logBytes, '\n')); err != nil {
+		log.Printf("[AUDIT ERROR] Failed to write audit log to file: %v", err)
+	}
+}
+
 func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1076,31 +1205,54 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		}
 
 		currentConfigMu.RLock()
-		token := currentConfig.AuthToken
+		tokensMap := currentConfig.Tokens
+		defaultToken := currentConfig.AuthToken
 		currentConfigMu.RUnlock()
 
-		// Skip auth if token is empty (for fallback/development only)
-		if token == "" {
+		// Get token from Auth Header or query param
+		var reqToken string
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			reqToken = strings.TrimPrefix(authHeader, "Bearer ")
+		} else {
+			reqToken = r.URL.Query().Get("token")
+		}
+
+		// Fallback for development if no token is configured
+		if defaultToken == "" && len(tokensMap) == 0 {
 			handler(w, r)
 			return
 		}
 
-		// Check Authorization header
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			if strings.TrimPrefix(authHeader, "Bearer ") == token {
-				handler(w, r)
-				return
+		// Determine the role
+		role := ""
+		if reqToken != "" {
+			if r, ok := tokensMap[reqToken]; ok {
+				role = r
+			} else if reqToken == defaultToken {
+				role = "admin"
 			}
 		}
 
-		// Check query parameter
-		if r.URL.Query().Get("token") == token {
-			handler(w, r)
+		if role == "" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		// Check RBAC permissions for the request path
+		path := r.URL.Path
+		allowedPaths := rolePermissions[role]
+		if allowedPaths == nil || !allowedPaths[path] {
+			http.Error(w, fmt.Sprintf("Forbidden: Role %q has no access to %s", role, path), http.StatusForbidden)
+			return
+		}
+
+		// Store token/role in context for audit trail
+		ctx := r.Context()
+		ctx = context.WithValue(ctx, contextKeyToken, reqToken)
+		ctx = context.WithValue(ctx, contextKeyRole, role)
+
+		handler(w, r.WithContext(ctx))
 	}
 }
 
@@ -1861,8 +2013,31 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case resp := <-done:
+		status := "success"
+		details := "Tool execution completed"
+		if resp.Error != nil {
+			status = "failure"
+			errBytes, _ := json.Marshal(resp.Error)
+			details = string(errBytes)
+		}
+		parts := strings.SplitN(body.Name, "__", 2)
+		agentID := "gateway"
+		toolName := body.Name
+		if len(parts) == 2 {
+			agentID = parts[0]
+			toolName = parts[1]
+		}
+		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), status, details)
 		json.NewEncoder(w).Encode(resp)
 	case <-time.After(35 * time.Second):
+		parts := strings.SplitN(body.Name, "__", 2)
+		agentID := "gateway"
+		toolName := body.Name
+		if len(parts) == 2 {
+			agentID = parts[0]
+			toolName = parts[1]
+		}
+		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), "failure", "Gateway timeout")
 		http.Error(w, "Request timed out", http.StatusGatewayTimeout)
 	}
 }
@@ -1971,10 +2146,12 @@ func handleApiChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		logAuditEvent(r.Context(), "api_chat", "", req.Prompt, "failure", fmt.Sprintf("LLM generation failed: %v", err))
 		http.Error(w, fmt.Sprintf("LLM generation failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	logAuditEvent(r.Context(), "api_chat", "", req.Prompt, "success", fmt.Sprintf("Generated response: %s", replyText))
 	json.NewEncoder(w).Encode(map[string]string{"response": replyText})
 }
 

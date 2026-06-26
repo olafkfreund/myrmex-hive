@@ -89,11 +89,15 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 ## 3. Configuration
 
 ### Agent Configuration (`agent_config.json`)
-Allows you to strictly define the gateway address and allowlisted system commands:
+Allows you to define a single gateway or a list of multiple gateway addresses for High Availability (HA) failover cycling:
 ```json
 {
   "agent_id": "agent-nginx",
-  "gateway_addr": "gateway.internal:2222",
+  "gateway_addr": "gateway-1.internal:2222",
+  "gateway_addrs": [
+    "gateway-1.internal:2222",
+    "gateway-2.internal:2222"
+  ],
   "private_key_path": "/etc/mcp-agent/id_ed25519",
   "allowed_commands": [
     {
@@ -109,6 +113,7 @@ Allows you to strictly define the gateway address and allowlisted system command
 ```
 
 ### Gateway Configuration (`gateway_config.json`)
+Configures the receiver, TLS certs, OIDC/Tokens RBAC role mapping (`admin`, `operator`, `read-only`), and signed audit log path:
 ```json
 {
   "listen_addr": ":2222",
@@ -116,20 +121,41 @@ Allows you to strictly define the gateway address and allowlisted system command
   "host_key_path": "",
   "authorized_keys_path": "authorized_keys",
   "ollama_url": "http://localhost:11434",
-  "ollama_model": "gemma2:2b",
-  "auth_token": "your_secure_auth_token_here"
+  "ollama_model": "gemma4:e4b",
+  "auth_token": "fallback_admin_token",
+  "tokens": {
+    "admin-token-123": "admin",
+    "operator-token-456": "operator",
+    "read-token-789": "read-only"
+  },
+  "audit_log_path": "audit.log"
 }
 ```
+*Note: If `audit_log_path` is set, Myrmex Gateway records all `/api/call` and `/api/chat` executions alongside a cryptographic signature generated using the Gateway's private SSH host key.*
 
 ---
 
-## 4. Local LLM Setup (Ollama & Gemma)
+## 4. Local LLM Setup (Ollama & Gemma 4)
 
 Myrmex Hive orchestrates actions and interprets output using local LLMs.
+
+### Option A: Running as Docker Side-Services (Recommended)
+An optional Docker setup is available via profiles in `docker-compose.test.yml` preloaded with the `gemma4:e4b` model (offline-ready):
+
+* **CPU-only mode**:
+  ```bash
+  docker compose --profile ollama-cpu up -d
+  ```
+* **GPU-accelerated mode** (requires NVIDIA Container Toolkit):
+  ```bash
+  docker compose --profile ollama-gpu up -d
+  ```
+
+### Option B: Manual Host Setup
 1. Install [Ollama](https://ollama.com/) on your Gateway server.
-2. Pull the desired model (Gemma 2/4):
+2. Pull the desired model (Gemma 4):
    ```bash
-   ollama pull gemma2:2b
+   ollama pull gemma4:e4b
    ```
 3. Ensure Ollama is running and accessible (default `http://localhost:11434`). Link it in `gateway_config.json`.
 
