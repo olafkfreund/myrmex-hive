@@ -2725,6 +2725,44 @@ const PortalHTML = `<!DOCTYPE html>
             word-break: break-word;
         }
 
+        .ast-msg h1, .ast-msg h2, .ast-msg h3, .ast-msg h4 {
+            margin-top: 8px;
+            margin-bottom: 4px;
+            color: var(--accent);
+        }
+        .ast-msg h1 { font-size: 1.15rem; }
+        .ast-msg h2 { font-size: 1.05rem; }
+        .ast-msg h3 { font-size: 0.95rem; }
+        .ast-msg h4 { font-size: 0.85rem; }
+        .ast-msg ul, .ast-msg ol {
+            margin-left: 20px;
+            margin-bottom: 6px;
+        }
+        .ast-msg li {
+            margin-bottom: 3px;
+        }
+        .ast-msg code {
+            font-family: 'Fira Code', monospace;
+            background-color: rgba(255, 255, 255, 0.08);
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-size: 0.9em;
+            color: var(--accent-hover);
+        }
+        .ast-msg pre {
+            background-color: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--border-color);
+            padding: 6px 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            margin: 6px 0;
+        }
+        .ast-msg pre code {
+            background-color: transparent;
+            padding: 0;
+            color: var(--text-primary);
+        }
+
         .ast-msg.user {
             background-color: var(--accent);
             color: #0b0f19;
@@ -3739,6 +3777,89 @@ const PortalHTML = `<!DOCTYPE html>
             }
         }
 
+        function renderMarkdown(text) {
+            if (!text) return '';
+            
+            // Escape HTML
+            let html = text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            
+            // Code blocks
+            html = html.replace(/\x60\x60\x60(.*?)\n([\s\S]*?)\x60\x60\x60/g, function(match, lang, code) {
+                return '<pre><code class="language-' + lang.trim() + '">' + code.trim() + '</code></pre>';
+            });
+
+            // Inline code
+            html = html.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
+
+            // Headers
+            html = html.replace(/^#### (.*?)$/gm, '<h4>$1</h4>');
+            html = html.replace(/^### (.*?)$/gm, '<h3>$1</h3>');
+            html = html.replace(/^## (.*?)$/gm, '<h2>$1</h2>');
+            html = html.replace(/^# (.*?)$/gm, '<h1>$1</h1>');
+
+            // Bold
+            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+
+            // Italic
+            html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+            html = html.replace(/_([^_]+)_/g, '<em>$1</em>');
+
+            // Lists
+            const lines = html.split('\n');
+            let inList = false;
+            let listType = null;
+            for (let i = 0; i < lines.length; i++) {
+                let line = lines[i].trim();
+                let matchUl = line.match(/^[\*\-\+]\s+(.*)$/);
+                let matchOl = line.match(/^(\d+)\.\s+(.*)$/);
+
+                if (matchUl) {
+                    let content = matchUl[1];
+                    let prefix = '';
+                    if (!inList || listType !== 'ul') {
+                        prefix = (inList ? '</' + listType + '>' : '') + '<ul>';
+                        inList = true;
+                        listType = 'ul';
+                    }
+                    lines[i] = prefix + '<li>' + content + '</li>';
+                } else if (matchOl) {
+                    let content = matchOl[2];
+                    let prefix = '';
+                    if (!inList || listType !== 'ol') {
+                        prefix = (inList ? '</' + listType + '>' : '') + '<ol>';
+                        inList = true;
+                        listType = 'ol';
+                    }
+                    lines[i] = prefix + '<li>' + content + '</li>';
+                } else {
+                    if (inList) {
+                        lines[i] = '</' + listType + '>' + lines[i];
+                        inList = false;
+                        listType = null;
+                    }
+                }
+            }
+            if (inList) {
+                lines[lines.length - 1] += '</' + listType + '>';
+            }
+            html = lines.join('\n');
+
+            // Replace newlines with <br> excluding pre blocks
+            const parts = html.split(/(<pre>[\s\S]*?<\/pre>)/);
+            for (let i = 0; i < parts.length; i++) {
+                if (!parts[i].startsWith('<pre>')) {
+                    parts[i] = parts[i].replace(/\n/g, '<br>');
+                }
+            }
+            html = parts.join('');
+
+            return html;
+        }
+
         function appendAssistantMessage(role, text, type = 'text') {
             const chatLog = document.getElementById('assistant-chat-log');
             if (!chatLog) return;
@@ -3750,6 +3871,8 @@ const PortalHTML = `<!DOCTYPE html>
                 pre.style.margin = '0';
                 pre.innerText = text;
                 msgEl.appendChild(pre);
+            } else if (role === 'assistant' || role === 'user' || role === 'system') {
+                msgEl.innerHTML = renderMarkdown(text);
             } else {
                 msgEl.innerText = text;
             }

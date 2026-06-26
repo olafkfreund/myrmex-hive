@@ -57,8 +57,8 @@ func main() {
 				}
 			}
 
-			key = strings.TrimLeft(key, "-")
-			switch key {
+			trimmedKey := strings.TrimLeft(key, "-")
+			switch trimmedKey {
 			case "url":
 				cfg.URL = val
 			case "token":
@@ -67,6 +67,12 @@ func main() {
 				cfg.Insecure = (val != "false")
 			case "output", "o":
 				cfg.Output = val
+			default:
+				// Pass command-specific flags and values to cmdArgs
+				cmdArgs = append(cmdArgs, key)
+				if val != "" {
+					cmdArgs = append(cmdArgs, val)
+				}
 			}
 		} else {
 			cmdArgs = append(cmdArgs, arg)
@@ -420,8 +426,40 @@ func handleCall(client *http.Client, cfg Config, args []string) {
 		os.Exit(1)
 	}
 
-	resultBytes, _ := json.MarshalIndent(rpcResp.Result, "", "  ")
-	fmt.Println(string(resultBytes))
+	if cfg.Output == "json" {
+		// Attempt to extract nested JSON payload if it exists
+		var mcpRes struct {
+			Content []struct {
+				Type string          `json:"type"`
+				Text json.RawMessage `json:"text"`
+			} `json:"content"`
+		}
+		resultJSON, _ := json.Marshal(rpcResp.Result)
+		if err := json.Unmarshal(resultJSON, &mcpRes); err == nil && len(mcpRes.Content) > 0 {
+			var extracted interface{}
+			if err := json.Unmarshal(mcpRes.Content[0].Text, &extracted); err == nil {
+				if str, ok := extracted.(string); ok {
+					var nested interface{}
+					if err := json.Unmarshal([]byte(str), &nested); err == nil {
+						indent, _ := json.MarshalIndent(nested, "", "  ")
+						fmt.Println(string(indent))
+						return
+					}
+				}
+				indent, _ := json.MarshalIndent(extracted, "", "  ")
+				fmt.Println(string(indent))
+				return
+			}
+		}
+
+		resultBytes, _ := json.MarshalIndent(rpcResp.Result, "", "  ")
+		fmt.Println(string(resultBytes))
+		return
+	}
+
+	resultBytes, _ := json.Marshal(rpcResp.Result)
+	printReadableText(string(resultBytes))
+	fmt.Println()
 }
 
 func handleAsk(client *http.Client, cfg Config, args []string) {
@@ -433,25 +471,318 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 
 	prompt := args[0]
 
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"provider": "antigravity",
-		"prompt":   prompt,
-	})
-
-	data, err := makeRequest(client, cfg, "POST", "/api/chat", bytes.NewReader(reqBody))
+	// 1. Get the list of all tools to provide context to the model
+	toolsData, err := makeRequest(client, cfg, "GET", "/api/tools", nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Warning: Failed to retrieve tools list: %v. Continuing without tools context.\n", err)
 	}
 
-	var chatResp struct {
-		Response string `json:"response"`
+	var toolsResp struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	var toolNames []string
+	if err == nil {
+		if err := json.Unmarshal(toolsData, &toolsResp); err == nil {
+			for _, t := range toolsResp.Tools {
+				toolNames = append(toolNames, t.Name)
+			}
+		}
 	}
 
-	if err := json.Unmarshal(data, &chatResp); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	// 2. Query status to get active agents and upstreams count
+	statusData, err := makeRequest(client, cfg, "GET", "/api/status", nil)
+	var countAgents int
+	var countUpstreams int
+	if err == nil {
+		var status struct {
+			Agents    []interface{} `json:"agents"`
+			Upstreams []interface{} `json:"upstreams"`
+		}
+		if err := json.Unmarshal(statusData, &status); err == nil {
+			countAgents = len(status.Agents)
+			countUpstreams = len(status.Upstreams)
+		}
 	}
 
-	fmt.Println(chatResp.Response)
+	systemPrompt := fmt.Sprintf(
+		"You are the Myrmex Assistant. You can monitor status and run approved commands using tools."+
+			" Context: Connected Edge Agents count = %d; Registered Upstream Servers count = %d."+
+			" Available tools: %s."+
+			" If you need to perform an action (e.g. check status, run command, read logs), respond with a SINGLE JSON command block:"+
+			" {\"call\": \"tool_name\", \"arguments\": {...}}"+
+			" Do not include other text when calling a tool. If you do not need any tools to answer, respond normally with plain text.",
+		countAgents, countUpstreams, mustMarshalJSON(toolNames),
+	)
+
+	history := []map[string]string{}
+	promptToModel := prompt
+	loopCount := 0
+	maxLoops := 5
+
+	var finalResponse string
+
+	for loopCount < maxLoops {
+		loopCount++
+
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"provider": "antigravity",
+			"prompt":   promptToModel,
+			"history":  history,
+			"system":   systemPrompt,
+		})
+
+		data, err := makeRequest(client, cfg, "POST", "/api/chat", bytes.NewReader(reqBody))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error calling assistant: %v\n", err)
+			os.Exit(1)
+		}
+
+		var chatResp struct {
+			Response string `json:"response"`
+		}
+		if err := json.Unmarshal(data, &chatResp); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing assistant response: %v\n", err)
+			os.Exit(1)
+		}
+
+		reply := strings.TrimSpace(chatResp.Response)
+		if reply == "" {
+			fmt.Fprintln(os.Stderr, "Error: Empty response from model.")
+			os.Exit(1)
+		}
+
+		// Try to parse tool call from markdown or raw string
+		var isToolCall bool
+		var toolCallObj struct {
+			Call      string          `json:"call"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+
+		jsonText := reply
+		if strings.Contains(reply, "```") {
+			start := strings.Index(reply, "```")
+			end := strings.LastIndex(reply, "```")
+			if start != -1 && end != -1 && start < end {
+				content := reply[start+3 : end]
+				if strings.HasPrefix(strings.TrimSpace(content), "json") {
+					jsonText = strings.TrimSpace(content)[4:]
+				} else {
+					jsonText = strings.TrimSpace(content)
+				}
+			}
+		}
+
+		if err := json.Unmarshal([]byte(jsonText), &toolCallObj); err == nil && toolCallObj.Call != "" {
+			isToolCall = true
+		}
+
+		if isToolCall {
+			if cfg.Output != "json" {
+				fmt.Printf("[Myrmex Agent Action]: Executing tool %q with arguments: %s\n", toolCallObj.Call, string(toolCallObj.Arguments))
+			}
+
+			// Add to history
+			history = append(history, map[string]string{"role": "user", "text": promptToModel})
+			history = append(history, map[string]string{"role": "assistant", "text": reply})
+
+			// Execute tool call via /api/call
+			callBody, _ := json.Marshal(map[string]interface{}{
+				"name":      toolCallObj.Call,
+				"arguments": toolCallObj.Arguments,
+			})
+
+			callData, err := makeRequest(client, cfg, "POST", "/api/call", bytes.NewReader(callBody))
+			var toolResult string
+			if err != nil {
+				toolResult = fmt.Sprintf("Error calling tool: %v", err)
+			} else {
+				var rpcResp struct {
+					Result json.RawMessage `json:"result"`
+					Error  *struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				if err := json.Unmarshal(callData, &rpcResp); err != nil {
+					toolResult = fmt.Sprintf("Error parsing tool response: %v", err)
+				} else if rpcResp.Error != nil {
+					toolResult = fmt.Sprintf("Tool error: %s", rpcResp.Error.Message)
+				} else {
+					toolResult = string(rpcResp.Result)
+				}
+			}
+
+			if cfg.Output != "json" {
+				fmt.Printf("[Myrmex Tool Result]:\n")
+				printReadableText(toolResult)
+				fmt.Println()
+			}
+
+			// Feed the result back to the model in the next step of the loop
+			promptToModel = fmt.Sprintf("Tool %s returned result: %s", toolCallObj.Call, toolResult)
+		} else {
+			finalResponse = reply
+			break
+		}
+	}
+
+	if cfg.Output == "json" {
+		outBytes, _ := json.MarshalIndent(map[string]string{"response": finalResponse}, "", "  ")
+		fmt.Println(string(outBytes))
+		return
+	}
+
+	fmt.Println(renderMarkdown(finalResponse))
+}
+
+func mustMarshalJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func printReadableText(text string) {
+	// Check if it's an MCP result structure (e.g. {"content": [{"type": "text", "text": "..."}]})
+	type mcpResult struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+
+	var mcpRes mcpResult
+	if err := json.Unmarshal([]byte(text), &mcpRes); err == nil && len(mcpRes.Content) > 0 {
+		for _, item := range mcpRes.Content {
+			if item.Type == "text" {
+				printReadableText(item.Text)
+			}
+		}
+		return
+	}
+
+	var js map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &js); err == nil {
+		indent, _ := json.MarshalIndent(js, "", "  ")
+		fmt.Println(string(indent))
+		return
+	}
+
+	var jsArray []interface{}
+	if err := json.Unmarshal([]byte(text), &jsArray); err == nil {
+		indent, _ := json.MarshalIndent(jsArray, "", "  ")
+		fmt.Println(string(indent))
+		return
+	}
+
+	// Render as markdown if it has markdown indicators, otherwise print as-is
+	if strings.Contains(text, "**") || strings.Contains(text, "###") || strings.Contains(text, "```") || strings.Contains(text, "`") {
+		fmt.Print(renderMarkdown(text))
+	} else {
+		fmt.Print(text)
+	}
+}
+
+func renderMarkdown(input string) string {
+	lines := strings.Split(input, "\n")
+	var result []string
+	inCodeBlock := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Code blocks
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
+			if inCodeBlock {
+				result = append(result, "  \x1b[90m┌────────────────────────────────────────────────────────────\x1b[0m")
+			} else {
+				result = append(result, "  \x1b[90m└────────────────────────────────────────────────────────────\x1b[0m")
+			}
+			continue
+		}
+
+		if inCodeBlock {
+			// Inside code block: indent and color cyan/gray
+			result = append(result, "  \x1b[90m│\x1b[0m  \x1b[36m"+line+"\x1b[0m")
+			continue
+		}
+
+		// Headers
+		if strings.HasPrefix(trimmed, "# ") {
+			title := strings.TrimPrefix(trimmed, "# ")
+			result = append(result, "\n\x1b[1m\x1b[35m"+strings.ToUpper(title)+"\x1b[0m\n"+strings.Repeat("=", len(title)))
+			continue
+		} else if strings.HasPrefix(trimmed, "## ") {
+			title := strings.TrimPrefix(trimmed, "## ")
+			result = append(result, "\n\x1b[1m\x1b[34m"+title+"\x1b[0m\n"+strings.Repeat("-", len(title)))
+			continue
+		} else if strings.HasPrefix(trimmed, "### ") {
+			title := strings.TrimPrefix(trimmed, "### ")
+			result = append(result, "\n\x1b[1m\x1b[32m"+title+"\x1b[0m")
+			continue
+		} else if strings.HasPrefix(trimmed, "#### ") {
+			title := strings.TrimPrefix(trimmed, "#### ")
+			result = append(result, "\n\x1b[1m"+title+"\x1b[0m")
+			continue
+		}
+
+		// List items
+		if strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "+ ") {
+			var content string
+			if strings.HasPrefix(trimmed, "* ") {
+				content = strings.TrimPrefix(trimmed, "* ")
+			} else if strings.HasPrefix(trimmed, "- ") {
+				content = strings.TrimPrefix(trimmed, "- ")
+			} else {
+				content = strings.TrimPrefix(trimmed, "+ ")
+			}
+			content = formatInlineMarkdown(content)
+			result = append(result, "  • "+content)
+			continue
+		}
+
+		// Ordered list items
+		if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' {
+			dotIdx := strings.Index(trimmed, ". ")
+			if dotIdx > 0 && dotIdx < 5 {
+				prefix := trimmed[:dotIdx]
+				content := formatInlineMarkdown(trimmed[dotIdx+2:])
+				result = append(result, "  "+prefix+". "+content)
+				continue
+			}
+		}
+
+		// Regular line
+		result = append(result, formatInlineMarkdown(line))
+	}
+
+	return strings.Join(result, "\n")
+}
+
+func formatInlineMarkdown(text string) string {
+	// Bold: **text** -> \x1b[1mtext\x1b[0m
+	text = replacePattern(text, "**", "\x1b[1m", "\x1b[0m")
+	// Inline code: `code` -> \x1b[33mcode\x1b[0m
+	text = replacePattern(text, "`", "\x1b[33m", "\x1b[0m")
+	return text
+}
+
+func replacePattern(text, pattern, startTag, endTag string) string {
+	for {
+		startIdx := strings.Index(text, pattern)
+		if startIdx == -1 {
+			break
+		}
+		remaining := text[startIdx+len(pattern):]
+		endIdx := strings.Index(remaining, pattern)
+		if endIdx == -1 {
+			break
+		}
+
+		before := text[:startIdx]
+		matched := remaining[:endIdx]
+		after := remaining[endIdx+len(pattern):]
+		text = before + startTag + matched + endTag + after
+	}
+	return text
 }
