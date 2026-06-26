@@ -4,6 +4,7 @@
 build:
     go build -o bin/agent cmd/agent/main.go
     go build -o bin/gateway cmd/gateway/main.go
+    go build -o bin/myrmex cmd/myrmex/main.go
 
 # Run syntax check and linting
 validate:
