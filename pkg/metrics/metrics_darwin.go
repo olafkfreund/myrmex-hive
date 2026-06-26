@@ -94,26 +94,18 @@ func getMemInfoDarwin(m *SystemMetrics) error {
 }
 
 func getLoadAvgDarwin(m *SystemMetrics) error {
-	var load [3]float64
-	_, err := syscall.Getloadavg(load[:])
+	out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output()
 	if err != nil {
-		out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output()
-		if err != nil {
-			return err
-		}
-		fields := strings.Fields(string(out))
-		if len(fields) >= 4 {
-			m.LoadAvg1m, _ = strconv.ParseFloat(fields[1], 64)
-			m.LoadAvg5m, _ = strconv.ParseFloat(fields[2], 64)
-			m.LoadAvg15m, _ = strconv.ParseFloat(fields[3], 64)
-			return nil
-		}
-		return fmt.Errorf("failed to get load avg")
+		return err
 	}
-	m.LoadAvg1m = load[0]
-	m.LoadAvg5m = load[1]
-	m.LoadAvg15m = load[2]
-	return nil
+	fields := strings.Fields(string(out))
+	if len(fields) >= 4 {
+		m.LoadAvg1m, _ = strconv.ParseFloat(fields[1], 64)
+		m.LoadAvg5m, _ = strconv.ParseFloat(fields[2], 64)
+		m.LoadAvg15m, _ = strconv.ParseFloat(fields[3], 64)
+		return nil
+	}
+	return fmt.Errorf("failed to parse vm.loadavg output: %s", string(out))
 }
 
 func getCPUUsageDarwin(m *SystemMetrics) error {
