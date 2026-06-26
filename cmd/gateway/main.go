@@ -2791,10 +2791,14 @@ const PortalHTML = `<!DOCTYPE html>
         #ast-mic-btn {
             background: transparent;
             border: 1px solid var(--border-color);
-            border-radius: 8px;
-            width: 36px;
+            border-radius: 4px;
+            width: auto;
+            min-width: 55px;
+            padding: 0 10px;
             height: 36px;
-            font-size: 16px;
+            font-family: inherit;
+            font-weight: bold;
+            font-size: 11px;
             display: flex;
             align-items: center;
             justify-content: center;
