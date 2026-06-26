@@ -1,0 +1,11 @@
+{
+  "gateway_addr": "gateway:2222",
+  "private_key_path": "/app/id_ed25519",
+  "agent_id": "agent-2",
+  "allowed_commands": [
+    {
+      "name": "free",
+      "args_regex": "^-m$"
+    }
+  ]
+}

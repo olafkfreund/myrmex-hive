@@ -1,0 +1,7 @@
+{
+  "listen_addr": ":2222",
+  "host_key_path": "",
+  "authorized_keys_path": "authorized_keys",
+  "ollama_url": "http://p510.tail833f7.ts.net:11434",
+  "ollama_model": "gemma4:e4b"
+}

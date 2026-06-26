@@ -1,0 +1,15 @@
+# Stage 1: Build
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o agent cmd/agent/main.go
+
+# Stage 2: Runtime
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates procps iputils coreutils
+WORKDIR /app
+COPY --from=builder /app/agent .
+COPY agent_config.json .
+ENTRYPOINT ["/app/agent", "-config", "/app/agent_config.json"]

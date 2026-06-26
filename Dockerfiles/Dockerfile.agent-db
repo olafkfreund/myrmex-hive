@@ -1,0 +1,31 @@
+# Stage 1: Build Agent
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o agent cmd/agent/main.go
+
+# Stage 2: Runtime with PostgreSQL
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates procps iputils coreutils postgresql iproute2
+
+WORKDIR /app
+COPY --from=builder /app/agent .
+
+# Setup Postgres directories and permissions
+RUN mkdir -p /run/postgresql && chown -R postgres:postgres /run/postgresql && \
+    mkdir -p /var/lib/postgresql/data && chown -R postgres:postgres /var/lib/postgresql/data
+
+# Create entrypoint script to initialize & start Postgres, then run agent
+RUN echo -e '#!/bin/sh\n\
+if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then\n\
+    chown -R postgres:postgres /var/lib/postgresql/data\n\
+    su - postgres -c "initdb -D /var/lib/postgresql/data"\n\
+    su - postgres -c "echo \"listen_addresses = '\''*'\''\" >> /var/lib/postgresql/data/postgresql.conf"\n\
+fi\n\
+su - postgres -c "pg_ctl -D /var/lib/postgresql/data -l /var/lib/postgresql/data/logfile start"\n\
+exec /app/agent -config /app/agent_config.json\n\
+' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]

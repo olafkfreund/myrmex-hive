@@ -1,0 +1,27 @@
+{
+  "gateway_addr": "localhost:2222",
+  "private_key_path": "id_ed25519",
+  "agent_id": "prod-server-1",
+  "allowed_commands": [
+    {
+      "name": "uptime",
+      "args_regex": "^$"
+    },
+    {
+      "name": "df",
+      "args_regex": "^-h$"
+    },
+    {
+      "name": "free",
+      "args_regex": "^-m$"
+    },
+    {
+      "name": "systemctl",
+      "args_regex": "^(status|restart) (nginx|docker|sshd)$"
+    },
+    {
+      "name": "ping",
+      "args_regex": "^-c \\d+ [a-zA-Z0-9\\.]+$"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+---
+layout: default
+title: Blog
+---
+
+## System Log / Blog
+
+<ul class="post-list">
+  {% for post in site.posts %}
+    <li class="post-item">
+      <h3>
+        <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
+      </h3>
+      <div class="post-meta">
+        Posted on {{ post.date | date: "%Y-%m-%d" }} by {{ post.author | default: "olafkfreund" }}
+      </div>
+      <p>{{ post.excerpt | strip_html | truncatewords: 30 }}</p>
+      <a href="{{ post.url | relative_url }}">[Read More...]</a>
+    </li>
+  {% else %}
+    <li>No posts found.</li>
+  {% endfor %}
+</ul>

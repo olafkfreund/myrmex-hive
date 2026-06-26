@@ -1,0 +1,20 @@
+title: Myrmex Hive
+description: "Myrmex Hive: Secure Agent Orchestrator & Gateway with multi-transport MCP integrations"
+exclude:
+  - cmd
+  - pkg
+  - bin
+  - Dockerfiles
+  - test_env
+  - Justfile
+  - docker-compose.test.yml
+  - generate_keys.sh
+  - setup_test_env.sh
+  - agent_config.json
+  - gateway_config.json
+  - go.mod
+  - go.sum
+  - install.sh
+  - install.ps1
+  - k8s
+  - README.md

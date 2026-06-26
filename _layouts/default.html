@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ page.title }} | Myrmex Hive</title>
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+</head>
+<body>
+  <header>
+    <div class="logo-container">
+      <img src="{{ '/assets/images/logo.jpg' | relative_url }}" alt="Myrmex Hive" class="logo-image">
+      <div>
+        <h1 style="margin: 0; font-size: 2.2em;">Myrmex Hive</h1>
+        <p style="margin: 5px 0 0 0; color: var(--text-secondary);">[Secure Agent Orchestrator & Gateway]</p>
+      </div>
+    </div>
+    <nav>
+      <a href="{{ '/' | relative_url }}">[Home]</a>
+      <a href="{{ '/blog/' | relative_url }}">[Blog]</a>
+      <a href="https://github.com/olafkfreund/myrmex-hive">[GitHub]</a>
+    </nav>
+  </header>
+
+  <main>
+    {{ content }}
+  </main>
+
+  <footer>
+    <p>Myrmex Hive &copy; {{ site.time | date: '%Y' }}. Geeky, nerdy, and secure agent orchestration.</p>
+  </footer>
+</body>
+</html>

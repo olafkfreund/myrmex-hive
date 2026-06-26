@@ -1,0 +1,84 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfiles/Dockerfile.gateway
+    container_name: mcp-gateway-test
+    ports:
+      - "2222:2222"
+      - "8080:8080"
+    volumes:
+      - ./test_env/gateway/gateway_config.json:/app/gateway_config.json
+      - ./test_env/gateway/authorized_keys:/app/authorized_keys
+    networks:
+      - mcp-net
+    extra_hosts:
+      - "p510.tail833f7.ts.net:100.118.96.32"
+
+  agent-1:
+    build:
+      context: .
+      dockerfile: Dockerfiles/Dockerfile.agent
+    container_name: mcp-agent-1-test
+    depends_on:
+      - gateway
+    volumes:
+      - ./test_env/agent-1/agent_config.json:/app/agent_config.json
+      - ./test_env/agent-1/id_ed25519:/app/id_ed25519
+      - ./test_env/agent-1/messages:/var/log/messages:ro
+    networks:
+      - mcp-net
+
+  agent-2:
+    build:
+      context: .
+      dockerfile: Dockerfiles/Dockerfile.agent
+    container_name: mcp-agent-2-test
+    depends_on:
+      - gateway
+    volumes:
+      - ./test_env/agent-2/agent_config.json:/app/agent_config.json
+      - ./test_env/agent-2/id_ed25519:/app/id_ed25519
+    networks:
+      - mcp-net
+
+  agent-3:
+    build:
+      context: .
+      dockerfile: Dockerfiles/Dockerfile.agent
+    container_name: mcp-agent-3-test
+    depends_on:
+      - gateway
+    volumes:
+      - ./test_env/agent-3/agent_config.json:/app/agent_config.json
+      - ./test_env/agent-3/id_ed25519:/app/id_ed25519
+    networks:
+      - mcp-net
+  agent-nginx:
+    build:
+      context: .
+      dockerfile: Dockerfiles/Dockerfile.agent-nginx
+    container_name: mcp-agent-nginx-test
+    depends_on:
+      - gateway
+    volumes:
+      - ./test_env/agent-nginx/agent_config.json:/app/agent_config.json
+      - ./test_env/agent-nginx/id_ed25519:/app/id_ed25519
+    networks:
+      - mcp-net
+  agent-db:
+    build:
+      context: .
+      dockerfile: Dockerfiles/Dockerfile.agent-db
+    container_name: mcp-agent-db-test
+    depends_on:
+      - gateway
+    volumes:
+      - ./test_env/agent-db/agent_config.json:/app/agent_config.json
+      - ./test_env/agent-db/id_ed25519:/app/id_ed25519
+    networks:
+      - mcp-net
+
+networks:
+  mcp-net:
+    driver: bridge

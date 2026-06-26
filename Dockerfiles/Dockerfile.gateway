@@ -1,0 +1,16 @@
+# Stage 1: Build
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o gateway cmd/gateway/main.go
+
+# Stage 2: Runtime
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates openssh-client
+WORKDIR /app
+COPY --from=builder /app/gateway .
+COPY gateway_config.json .
+EXPOSE 2222
+ENTRYPOINT ["/app/gateway", "-config", "/app/gateway_config.json"]

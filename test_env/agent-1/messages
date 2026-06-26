@@ -1,0 +1,3 @@
+2026-06-26T11:00:00Z auth.info sshd[100]: Server listening on 0.0.0.0 port 22.
+2026-06-26T11:05:00Z auth.warning sshd[105]: Invalid user admin from 192.168.1.15 port 43212
+2026-06-26T11:07:00Z daemon.err systemd[1]: Failed to start Nginx High-Performance Web Server.

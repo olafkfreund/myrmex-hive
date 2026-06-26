@@ -1,0 +1,18 @@
+---
+layout: default
+---
+
+<article>
+  <h2>{{ page.title }}</h2>
+  <div class="post-meta">
+    Date: {{ page.date | date: "%Y-%m-%d" }} | Author: {{ page.author | default: "olafkfreund" }}
+  </div>
+  
+  <div class="post-content">
+    {{ content }}
+  </div>
+</article>
+
+<div style="margin-top: 40px; border-top: 1px solid var(--border-color); padding-top: 20px;">
+  <a href="{{ '/blog/' | relative_url }}">&lt;&lt; [Back to Blog]</a>
+</div>

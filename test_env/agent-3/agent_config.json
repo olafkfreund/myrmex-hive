@@ -1,0 +1,11 @@
+{
+  "gateway_addr": "gateway:2222",
+  "private_key_path": "/app/id_ed25519",
+  "agent_id": "agent-3",
+  "allowed_commands": [
+    {
+      "name": "uptime",
+      "args_regex": "^$"
+    }
+  ]
+}

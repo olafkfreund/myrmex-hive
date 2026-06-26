@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-agent-config
+  namespace: mcp-hive
+data:
+  agent_config.json: |
+    {
+      "gateway_addr": "mcp-gateway.mcp-hive.svc.cluster.local:2222",
+      "private_key_path": "/app/secrets/id_ed25519",
+      "agent_id": "k8s-node",
+      "allowed_commands": [
+        {
+          "name": "uptime",
+          "args_regex": "^$"
+        },
+        {
+          "name": "df",
+          "args_regex": "^-h$"
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-agent-secrets
+  namespace: mcp-hive
+type: Opaque
+data:
+  # Base64 encoded private key matching public key on Gateway.
+  # Generate using: cat id_ed25519 | base64
+  id_ed25519: |
+    LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJtRnRaMjl1TFhOemFDMXNaREkxTlRFNUFBQUFBbWNwLWFnZW50LS0tLS0K
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mcp-agent
+  namespace: mcp-hive
+  labels:
+    app: mcp-agent
+spec:
+  selector:
+    matchLabels:
+      app: mcp-agent
+  template:
+    metadata:
+      labels:
+        app: mcp-agent
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: agent
+          image: mcp-agent:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/agent_config.json
+              subPath: agent_config.json
+            - name: secrets-volume
+              mountPath: /app/secrets
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-sys
+              mountPath: /host/sys
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: mcp-agent-config
+        - name: secrets-volume
+          secret:
+            secretName: mcp-agent-secrets
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-sys
+          hostPath:
+            path: /sys

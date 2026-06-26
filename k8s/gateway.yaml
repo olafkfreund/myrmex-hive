@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-gateway-config
+  namespace: mcp-hive
+data:
+  gateway_config.json: |
+    {
+      "listen_addr": ":2222",
+      "host_key_path": "",
+      "authorized_keys_path": "/app/secrets/authorized_keys",
+      "ollama_url": "http://ollama-service.mcp-hive.svc.cluster.local:11434",
+      "ollama_model": "gemma2:2b"
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-gateway-secrets
+  namespace: mcp-hive
+type: Opaque
+data:
+  # Base64 encoded authorized_keys file containing agent public keys.
+  # Generate using: cat authorized_keys | base64
+  authorized_keys: |
+    c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSU9yY2h4S3F0YmRHYjNocURjNmZlOUxSMm1jNml5UldZc1p5d1VxN0I1M0ggbWNwLWFnZW50Cg==
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-gateway
+  namespace: mcp-hive
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 2222
+      targetPort: 2222
+      name: ssh-mcp
+  selector:
+    app: mcp-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gateway
+  namespace: mcp-hive
+  labels:
+    app: mcp-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-gateway
+  template:
+    metadata:
+      labels:
+        app: mcp-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: mcp-gateway:latest
+          ports:
+            - containerPort: 2222
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/gateway_config.json
+              subPath: gateway_config.json
+            - name: secrets-volume
+              mountPath: /app/secrets
+      volumes:
+        - name: config-volume
+          configMap:
+            name: mcp-gateway-config
+        - name: secrets-volume
+          secret:
+            secretName: mcp-gateway-secrets
