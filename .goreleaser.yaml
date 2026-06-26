@@ -1,0 +1,62 @@
+# .goreleaser.yaml
+version: 2
+
+project_name: myrmex-hive
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gateway
+    main: ./cmd/gateway/main.go
+    binary: myrmex-gateway
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: agent
+    main: ./cmd/agent/main.go
+    binary: myrmex-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: 'checksums.txt'
+
+sboms:
+  - id: default
+    artifacts: archive
+    documents:
+      - "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}.sbom.spdx.json"
+
+signs:
+  - id: cosign
+    cmd: cosign
+    args:
+      - "sign-blob"
+      - "--output-signature"
+      - "${signature}"
+      - "${artifact}"
+      - "--yes" # Keyless signing via Sigstore
+    artifacts: checksum

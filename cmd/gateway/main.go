@@ -1032,6 +1032,9 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	http.HandleFunc("/api/call", requireAuth(handleApiCall))
 	http.HandleFunc("/api/tools", requireAuth(handleApiTools))
 	http.HandleFunc("/api/chat", requireAuth(handleApiChat))
+	http.HandleFunc("/logo.png", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "assets/images/logo.png")
+	})
 	http.HandleFunc("/", handlePortal)
 
 	var tlsConfig *tls.Config
@@ -2625,8 +2628,12 @@ const PortalHTML = `<!DOCTYPE html>
             border: 1px solid var(--accent);
             font-family: 'Fira Code', 'Courier New', monospace;
             font-weight: bold;
-            font-size: 14px;
-            padding: 10px 16px;
+            font-size: 22px;
+            width: 50px;
+            height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             border-radius: 4px;
             cursor: pointer;
             box-shadow: 0 4px 20px rgba(254, 128, 25, 0.2);
@@ -2818,8 +2825,8 @@ const PortalHTML = `<!DOCTYPE html>
 <body>
     <header>
         <div class="logo-section">
-            <span class="logo-icon">[Myrmex]</span>
-            <div class="logo-title">Hive Gateway</div>
+            <img src="/logo.png" alt="Myrmex Hive" style="width: 32px; height: 32px; border: 1px solid var(--accent); border-radius: 4px; image-rendering: pixelated; display: block;">
+            <div class="logo-title">Myrmex Hive Gateway</div>
         </div>
         <div class="status-badge">
             <span class="pulse"></span>
@@ -3019,8 +3026,8 @@ const PortalHTML = `<!DOCTYPE html>
     <div id="login-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(29, 32, 33, 0.98); z-index: 1000; justify-content: center; align-items: center; flex-direction: column;">
         <div class="card" style="width: 400px; text-align: center; border-color: var(--accent);">
             <div class="logo-section" style="justify-content: center; margin-bottom: 20px;">
-                <span class="logo-icon">[Myrmex]</span>
-                <div class="logo-title">Hive Access</div>
+                <img src="/logo.png" alt="Myrmex Hive" style="width: 48px; height: 48px; border: 1px solid var(--accent); border-radius: 4px; image-rendering: pixelated; display: block; margin-right: 10px;">
+                <div class="logo-title">Myrmex Hive Access</div>
             </div>
             <p style="font-size: 14px; color: var(--text-secondary); margin-bottom: 20px;">Please enter the secure Gateway Auth Token to continue.</p>
             <div class="form-group">
@@ -3114,11 +3121,11 @@ const PortalHTML = `<!DOCTYPE html>
     </div>
 
     <!-- Assistant FAB & Window -->
-    <button id="assistant-fab-btn" onclick="toggleAssistant()" title="Open Myrmex Assistant">[MYRMEX]</button>
+    <button id="assistant-fab-btn" onclick="toggleAssistant()" title="Open Myrmex Assistant">🤖</button>
     <div id="assistant-window">
         <div class="assistant-header">
             <div class="assistant-title-row">
-                <span style="font-size: 15px; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px;">Myrmex Assistant</span>
+                <span style="font-size: 15px; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px;">🤖 Myrmex Assistant</span>
                 <button class="close-btn" onclick="toggleAssistant()">&times;</button>
             </div>
             <div class="assistant-controls-row">

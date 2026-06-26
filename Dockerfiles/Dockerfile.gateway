@@ -11,6 +11,7 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates openssh-client
 WORKDIR /app
 COPY --from=builder /app/gateway .
+COPY --from=builder /app/assets ./assets
 COPY gateway_config.json .
 EXPOSE 2222
 ENTRYPOINT ["/app/gateway", "-config", "/app/gateway_config.json"]
