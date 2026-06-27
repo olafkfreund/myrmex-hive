@@ -8,29 +8,35 @@ Myrmex Hive is a decentralized, secure, and geeky agent orchestration framework 
 
 Myrmex Hive is designed for zero-trust environments where target edge systems (agents) must remain completely isolated from direct inbound network traffic.
 
-```
-┌──────────────────────────────────────┐        ┌──────────────────────────────┐
-│  Target Edge Node (Myrmex Agent)     │        │ Central Hive Gateway         │
-│                                      │        │                              │
-│  - Gathers CPU, Memory, Disk         │        │ - Authenticates agents       │
-│  - Runs strict command allowlist     │        │ - Aggregates client tools    │
-│  - Connects OUTBOUND via SSH         │        │ - Exposes MCP over HTTP/SSE  │
-│                                      │        │                              │
-│             │                        │        │              ▲               │
-└─────────────┼────────────────────────┘        └──────────────┼───────────────┘
-              │                                                │
-              │ SSH Outbound Tunnel (Port 2222)                │ Stdio / SSE MCP Interface
-              ▼                                                ▼
-       ┌──────────────┐                                 ┌──────────────┐
-       │ Secure SSHD  │ ──────────────────────────────> │ Myrmex Hive  │
-       │ Receiver     │    JSON-RPC over SSH channel    │ Orchestrator │
-       └──────────────┘                                 └──────────────┘
-                                                               │
-                                                               ▼
-                                                        ┌──────────────┐
-                                                        │ Ollama LLM   │
-                                                        │ (Gemma 4/2)  │
-                                                        └──────────────┘
+```mermaid
+flowchart TD
+    %% Node Definitions
+    subgraph Edge ["Target Edge Node (Myrmex Agent)"]
+        Agent["Myrmex Agent<br/>(CPU/Mem/Disk, strict allowlist)"]
+    end
+
+    subgraph Gateway ["Central Hive Gateway"]
+        SSHD["Secure SSHD Receiver<br/>(Port 2222)"]
+        Orch["Myrmex Hive Orchestrator"]
+        LLM["Ollama LLM<br/>(Gemma 4/2)"]
+    end
+
+    Client["Client / CLI / Portal<br/>(Stdio / SSE MCP Interface)"]
+
+    %% Connections
+    Agent -- "SSH Outbound Tunnel" --> SSHD
+    SSHD -- "JSON-RPC over SSH channel" --> Orch
+    Orch <--> LLM
+    Client <--> Orch
+
+    %% Styling / Colors
+    classDef edgeNode fill:#282828,stroke:#fabd2f,stroke-width:2px,color:#ebdbb2;
+    classDef gatewayNode fill:#282828,stroke:#fe8019,stroke-width:2px,color:#ebdbb2;
+    classDef clientNode fill:#282828,stroke:#b8bb26,stroke-width:2px,color:#ebdbb2;
+
+    class Agent edgeNode;
+    class SSHD,Orch,LLM gatewayNode;
+    class Client clientNode;
 ```
 
 ### Security Principles (Why We Made These Choices)
