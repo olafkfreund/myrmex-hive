@@ -1071,6 +1071,9 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	http.HandleFunc("/logo.png", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "assets/images/logo.png")
 	})
+	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "favicon.jpg")
+	})
 	http.HandleFunc("/", handlePortal)
 
 	var tlsConfig *tls.Config
@@ -2248,6 +2251,8 @@ const PortalHTML = `<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Myrmex Hive Gateway Control Center</title>
+    <link rel="shortcut icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
