@@ -1,5 +1,7 @@
 title: Myrmex Hive
 description: "Myrmex Hive: Secure Agent Orchestrator & Gateway with multi-transport MCP integrations"
+url: "https://myrmex-hive.freundcloud.com"
+baseurl: ""
 exclude:
   - cmd
   - pkg
