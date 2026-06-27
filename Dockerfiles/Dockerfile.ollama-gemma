@@ -1,0 +1,16 @@
+FROM ollama/ollama:latest
+
+# Set environment variables for network bind
+ENV OLLAMA_HOST=0.0.0.0
+ENV OLLAMA_ORIGINS="*"
+
+# Pre-load the Gemma 4 model (gemma4:e4b) during container build so it is offline-ready
+RUN (ollama serve &) && \
+    sleep 5 && \
+    ollama pull gemma4:e4b && \
+    pkill ollama
+
+# Expose standard Ollama port
+EXPOSE 11434
+
+ENTRYPOINT ["ollama", "serve"]

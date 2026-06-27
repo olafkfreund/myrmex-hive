@@ -54,24 +54,36 @@ func main() {
 	configPath := flag.String("config", "agent_config.json", "Path to agent configuration file")
 	flag.Parse()
 
-	log.Println("Starting MCP OS Agent...")
+	log.Println("Starting Myrmex Agent...")
 	cfg, err := config.LoadAgentConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	log.Printf("Agent ID: %s, connecting to Gateway: %s", cfg.AgentID, cfg.GatewayAddr)
+	// Support HA/Failover gateway addresses
+	addrs := cfg.GatewayAddrs
+	if len(addrs) == 0 {
+		if cfg.GatewayAddr != "" {
+			addrs = []string{cfg.GatewayAddr}
+		} else {
+			log.Fatal("Error: No gateway_addr or gateway_addrs configured.")
+		}
+	}
 
+	addrIdx := 0
 	for {
-		err := connectAndServe(cfg)
+		targetAddr := addrs[addrIdx%len(addrs)]
+		log.Printf("Agent ID: %s, connecting to Gateway: %s (HA Node %d/%d)", cfg.AgentID, targetAddr, (addrIdx%len(addrs))+1, len(addrs))
+		err := connectAndServe(cfg, targetAddr)
 		if err != nil {
-			log.Printf("Connection error: %v. Reconnecting in 5 seconds...", err)
+			log.Printf("Connection error to %s: %v. Retrying next node in 5 seconds...", targetAddr, err)
+			addrIdx++
 			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
-func connectAndServe(cfg *config.AgentConfig) error {
+func connectAndServe(cfg *config.AgentConfig, gatewayAddr string) error {
 	// 1. Read SSH private key
 	keyBytes, err := os.ReadFile(cfg.PrivateKeyPath)
 	if err != nil {
@@ -93,13 +105,13 @@ func connectAndServe(cfg *config.AgentConfig) error {
 		Timeout:         15 * time.Second,
 	}
 
-	conn, err := net.DialTimeout("tcp", cfg.GatewayAddr, 15*time.Second)
+	conn, err := net.DialTimeout("tcp", gatewayAddr, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to dial Gateway: %w", err)
 	}
 	defer conn.Close()
 
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, cfg.GatewayAddr, clientConfig)
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, gatewayAddr, clientConfig)
 	if err != nil {
 		return fmt.Errorf("SSH handshake failed: %w", err)
 	}

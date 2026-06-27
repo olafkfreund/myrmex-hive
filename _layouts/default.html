@@ -4,6 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ page.title }} | Myrmex Hive</title>
+  <link rel="shortcut icon" href="{{ '/favicon.jpg' | relative_url }}" type="image/x-icon">
+  <link rel="icon" href="{{ '/favicon.jpg' | relative_url }}" type="image/x-icon">
   <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
 </head>
 <body>
@@ -29,5 +31,20 @@
   <footer>
     <p>Myrmex Hive &copy; {{ site.time | date: '%Y' }}. Geeky, nerdy, and secure agent orchestration.</p>
   </footer>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        background: '#1d2021',
+        primaryColor: '#282828',
+        primaryTextColor: '#ebdbb2',
+        lineColor: '#fe8019',
+        secondaryColor: '#3c3836',
+        tertiaryColor: '#282828'
+      }
+    });
+  </script>
 </body>
 </html>

@@ -12,6 +12,7 @@ type AllowedCommand struct {
 
 type AgentConfig struct {
 	GatewayAddr     string           `json:"gateway_addr"`
+	GatewayAddrs    []string         `json:"gateway_addrs,omitempty"`
 	PrivateKeyPath  string           `json:"private_key_path"`
 	AgentID         string           `json:"agent_id"`
 	AllowedCommands []AllowedCommand `json:"allowed_commands"`
@@ -45,6 +46,8 @@ type GatewayConfig struct {
 	TLSKeyPath         string                    `json:"tls_key_path,omitempty"`
 	AuthToken          string                    `json:"auth_token,omitempty"`
 	AntigravityToken   string                    `json:"antigravity_token,omitempty"`
+	Tokens             map[string]string         `json:"tokens,omitempty"`
+	AuditLogPath       string                    `json:"audit_log_path,omitempty"`
 }
 
 func LoadAgentConfig(path string) (*AgentConfig, error) {
