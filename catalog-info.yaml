@@ -8,6 +8,7 @@ metadata:
   title: myrmex-hive
   description: "Myrmex Hive: Secure Agent Orchestrator & Gateway with multi-transport MCP integrations"
   annotations:
+    backstage.io/techdocs-ref: dir:.
     github.com/project-slug: olafkfreund/myrmex-hive
   tags: []
 spec:
