@@ -54,17 +54,36 @@ func NewOpenAIClient(baseURL, model, apiKey string) *OpenAIClient {
 		BaseURL: baseURL,
 		Model:   model,
 		APIKey:  apiKey,
-		client: &http.Client{
-			Timeout: 60 * time.Second,
-		},
+		// No client-level Timeout: the deadline is applied per-request via
+		// context in doGenerate so that GenerateOptions.Timeout can
+		// override it in either direction (see defaultRequestTimeout).
+		client: &http.Client{},
 	}
 }
 
 // Generate produces a completion for the given prompt via the
 // /chat/completions endpoint, sending it as a single user message.
 func (c *OpenAIClient) Generate(prompt string) (string, error) {
+	return c.GenerateWithOptions(prompt, GenerateOptions{})
+}
+
+// GenerateWithOptions produces a completion for prompt via the
+// /chat/completions endpoint, honoring a per-call model override, timeout,
+// and bounded retry with backoff. See GenerateOptions for details on each
+// field.
+func (c *OpenAIClient) GenerateWithOptions(prompt string, opts GenerateOptions) (string, error) {
+	model := c.Model
+	if opts.Model != "" {
+		model = opts.Model
+	}
+
+	timeout := defaultRequestTimeout
+	if opts.Timeout > 0 {
+		timeout = opts.Timeout
+	}
+
 	reqBody := OpenAIChatRequest{
-		Model: c.Model,
+		Model: model,
 		Messages: []OpenAIChatMessage{
 			{Role: "user", Content: prompt},
 		},
@@ -75,12 +94,36 @@ func (c *OpenAIClient) Generate(prompt string) (string, error) {
 		return "", fmt.Errorf("failed to marshal OpenAI-compatible request: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.client.Timeout)
+	var lastErr error
+	for attempt := 0; attempt <= opts.MaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(retryBackoff(attempt - 1))
+		}
+
+		result, retryable, err := c.doGenerate(jsonData, timeout)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !retryable {
+			return "", err
+		}
+	}
+
+	return "", lastErr
+}
+
+// doGenerate performs a single OpenAI-compatible /chat/completions request
+// within timeout. The second return value reports whether a non-nil error
+// is transient and worth retrying (transport failures and HTTP 429/5xx
+// responses).
+func (c *OpenAIClient) doGenerate(jsonData []byte, timeout time.Duration) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return "", fmt.Errorf("failed to build OpenAI-compatible request: %w", err)
+		return "", false, fmt.Errorf("failed to build OpenAI-compatible request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.APIKey != "" {
@@ -89,24 +132,24 @@ func (c *OpenAIClient) Generate(prompt string) (string, error) {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to contact OpenAI-compatible LLM backend: %w", err)
+		return "", true, fmt.Errorf("failed to contact OpenAI-compatible LLM backend: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("OpenAI-compatible LLM backend returned non-200 status: %d", resp.StatusCode)
+		return "", isRetryableStatus(resp.StatusCode), fmt.Errorf("OpenAI-compatible LLM backend returned non-200 status: %d", resp.StatusCode)
 	}
 
 	var chatResp OpenAIChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", fmt.Errorf("failed to decode OpenAI-compatible LLM response: %w", err)
+		return "", false, fmt.Errorf("failed to decode OpenAI-compatible LLM response: %w", err)
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("OpenAI-compatible LLM backend returned no choices")
+		return "", false, fmt.Errorf("OpenAI-compatible LLM backend returned no choices")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	return chatResp.Choices[0].Message.Content, false, nil
 }
 
 // Name identifies this engine for logging/diagnostics purposes, e.g.
