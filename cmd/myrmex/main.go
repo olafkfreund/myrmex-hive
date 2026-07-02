@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -149,6 +150,7 @@ Commands:
   config        View the current gateway configuration
   ask           Ask the Myrmex AI Assistant to perform a task
   audit verify  Verify a signed, hash-chained gateway audit log
+  audit watch   Poll the audit log and alert (exit non-zero) on tamper
   audit export  Export the audit log as JSON or CSV for archival/review
   audit pubkey  Print the gateway host public key for external auditors
 
@@ -177,16 +179,32 @@ Real-Life Scenarios:
   6. Verify the integrity of the gateway's signed audit log:
      myrmex audit verify --log audit.log --host-key host_key.pub
 
-  7. Export the audit log to CSV for archival or a compliance reviewer:
+  7. Watch the audit log continuously and alert if it's ever tampered with:
+     myrmex audit watch --log audit.log --host-key host_key.pub --interval 30
+
+  8. Export the audit log to CSV for archival or a compliance reviewer:
      myrmex audit export --log audit.log --format csv --out audit.csv
 
-  8. Print the gateway host public key to hand to an external auditor:
+  9. Print the gateway host public key to hand to an external auditor:
      myrmex audit pubkey --host-key host_key.pub
 
 Audit Verify Options:
   --log         Path to the audit log file (default: audit.log)
   --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
                 authorized-key format, e.g. host_key.pub (required)
+
+Audit Watch Options:
+  --log         Path to the audit log file (default: audit.log)
+  --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
+                authorized-key format, e.g. host_key.pub (required)
+  --interval    Seconds between checks (default: 30)
+
+  Prints one status line per cycle to stdout. On the FIRST cycle that finds
+  a signature or hash-chain failure, prints a single line
+  "ALERT: audit log tamper detected at line N (<reason>)" to stderr and
+  exits non-zero — it does not keep watching past the first detected
+  tamper, so it never spams repeat alerts for the same break. Re-run the
+  command to resume watching after investigating.
 
 Audit Export Options:
   --log         Path to the audit log file (default: audit.log)
@@ -705,26 +723,159 @@ type auditLineResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// auditVerifyResult is the outcome of one full pass over an audit log,
+// shared by "audit verify" (which prints it once) and "audit watch" (which
+// prints a condensed line every polling cycle).
+type auditVerifyResult struct {
+	Results       []auditLineResult
+	Total         int
+	Valid         int
+	SigFailures   int
+	ChainFailures int
+	// FirstBadLine is the 1-based line number of the first entry with a
+	// signature or chain failure, or 0 if every entry verified cleanly.
+	FirstBadLine int
+	// FirstBadReason is the auditLineResult.Error text for FirstBadLine.
+	FirstBadReason string
+}
+
+// verifyAuditLog re-verifies every entry in a gateway audit log: each
+// entry's own SSH signature over its fields, and the PrevSig -> Signature
+// hash chain linking it to the entry before it. It performs no printing —
+// callers (handleAuditVerify, handleAuditWatch) render the result however
+// they need. A returned error means the log/key could not even be read or
+// parsed, distinct from tamper being found (which is reported in the
+// returned auditVerifyResult).
+func verifyAuditLog(logPath, hostKeyPath string) (auditVerifyResult, error) {
+	var out auditVerifyResult
+
+	keyBytes, err := os.ReadFile(hostKeyPath)
+	if err != nil {
+		return out, fmt.Errorf("Failed to read host key %q: %v", hostKeyPath, err)
+	}
+
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
+	if err != nil {
+		return out, fmt.Errorf("Failed to parse host public key %q: %v", hostKeyPath, err)
+	}
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		return out, fmt.Errorf("Failed to open audit log %q: %v", logPath, err)
+	}
+	defer f.Close()
+
+	var prevSig string
+	lineNum := 0
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		out.Total++
+
+		res := auditLineResult{Line: lineNum}
+
+		var entry auditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			res.Error = fmt.Sprintf("invalid JSON: %v", err)
+			out.SigFailures++
+			out.ChainFailures++
+			if out.FirstBadLine == 0 {
+				out.FirstBadLine = lineNum
+				out.FirstBadReason = res.Error
+			}
+			out.Results = append(out.Results, res)
+			// Leave prevSig untouched: we cannot trust anything derived from
+			// this line, but subsequent entries may still chain correctly
+			// from the last entry we could parse.
+			continue
+		}
+
+		res.Timestamp = entry.Timestamp
+		res.Action = entry.Action
+
+		if entry.PrevSig == prevSig {
+			res.ChainValid = true
+		} else {
+			out.ChainFailures++
+			res.Error = fmt.Sprintf("chain break: prev_sig %q does not match previous entry's signature %q", entry.PrevSig, prevSig)
+		}
+
+		payload := strings.Join([]string{
+			entry.Timestamp, entry.TokenID, entry.Role, entry.Action,
+			entry.AgentID, entry.Command, entry.Status, entry.Details, entry.PrevSig,
+		}, "|")
+
+		blob, err := hex.DecodeString(entry.Signature)
+		if err != nil {
+			out.SigFailures++
+			if res.Error != "" {
+				res.Error += "; "
+			}
+			res.Error += fmt.Sprintf("invalid signature encoding: %v", err)
+		} else {
+			sig := &ssh.Signature{Format: pub.Type(), Blob: blob}
+			if err := pub.Verify([]byte(payload), sig); err != nil {
+				out.SigFailures++
+				if res.Error != "" {
+					res.Error += "; "
+				}
+				res.Error += fmt.Sprintf("signature verification failed: %v", err)
+			} else {
+				res.SigValid = true
+			}
+		}
+
+		if (!res.SigValid || !res.ChainValid) && out.FirstBadLine == 0 {
+			out.FirstBadLine = lineNum
+			out.FirstBadReason = res.Error
+		}
+
+		out.Results = append(out.Results, res)
+		prevSig = entry.Signature
+	}
+
+	if err := scanner.Err(); err != nil {
+		return out, fmt.Errorf("Failed to read audit log %q: %v", logPath, err)
+	}
+
+	for _, r := range out.Results {
+		if r.SigValid && r.ChainValid {
+			out.Valid++
+		}
+	}
+
+	return out, nil
+}
+
 // handleAudit dispatches "audit" subcommands: "verify" checks integrity,
-// "export" re-emits the log as JSON/CSV, and "pubkey" prints the gateway's
-// host public key for independent verification.
+// "watch" polls the log on an interval and alerts on tamper, "export"
+// re-emits the log as JSON/CSV, and "pubkey" prints the gateway's host
+// public key for independent verification.
 func handleAudit(cfg Config, args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Error: Missing 'audit' subcommand.")
-		fmt.Fprintln(os.Stderr, "Usage: myrmex audit <verify|export|pubkey> [options]")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit <verify|watch|export|pubkey> [options]")
 		os.Exit(1)
 	}
 
 	switch args[0] {
 	case "verify":
 		handleAuditVerify(cfg, args[1:])
+	case "watch":
+		handleAuditWatch(args[1:])
 	case "export":
 		handleAuditExport(cfg, args[1:])
 	case "pubkey":
 		handleAuditPubkey(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown 'audit' subcommand %q.\n", args[0])
-		fmt.Fprintln(os.Stderr, "Usage: myrmex audit <verify|export|pubkey> [options]")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit <verify|watch|export|pubkey> [options]")
 		os.Exit(1)
 	}
 }
@@ -757,116 +908,21 @@ func handleAuditVerify(cfg Config, args []string) {
 		os.Exit(1)
 	}
 
-	keyBytes, err := os.ReadFile(hostKeyPath)
+	result, err := verifyAuditLog(logPath, hostKeyPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to read host key %q: %v\n", hostKeyPath, err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
-	}
-
-	pub, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to parse host public key %q: %v\n", hostKeyPath, err)
-		os.Exit(1)
-	}
-
-	f, err := os.Open(logPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to open audit log %q: %v\n", logPath, err)
-		os.Exit(1)
-	}
-	defer f.Close()
-
-	var results []auditLineResult
-	var prevSig string
-	lineNum := 0
-	total := 0
-	sigFailures := 0
-	chainFailures := 0
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		total++
-
-		res := auditLineResult{Line: lineNum}
-
-		var entry auditEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			res.Error = fmt.Sprintf("invalid JSON: %v", err)
-			sigFailures++
-			chainFailures++
-			results = append(results, res)
-			// Leave prevSig untouched: we cannot trust anything derived from
-			// this line, but subsequent entries may still chain correctly
-			// from the last entry we could parse.
-			continue
-		}
-
-		res.Timestamp = entry.Timestamp
-		res.Action = entry.Action
-
-		if entry.PrevSig == prevSig {
-			res.ChainValid = true
-		} else {
-			chainFailures++
-			res.Error = fmt.Sprintf("chain break: prev_sig %q does not match previous entry's signature %q", entry.PrevSig, prevSig)
-		}
-
-		payload := strings.Join([]string{
-			entry.Timestamp, entry.TokenID, entry.Role, entry.Action,
-			entry.AgentID, entry.Command, entry.Status, entry.Details, entry.PrevSig,
-		}, "|")
-
-		blob, err := hex.DecodeString(entry.Signature)
-		if err != nil {
-			sigFailures++
-			if res.Error != "" {
-				res.Error += "; "
-			}
-			res.Error += fmt.Sprintf("invalid signature encoding: %v", err)
-		} else {
-			sig := &ssh.Signature{Format: pub.Type(), Blob: blob}
-			if err := pub.Verify([]byte(payload), sig); err != nil {
-				sigFailures++
-				if res.Error != "" {
-					res.Error += "; "
-				}
-				res.Error += fmt.Sprintf("signature verification failed: %v", err)
-			} else {
-				res.SigValid = true
-			}
-		}
-
-		results = append(results, res)
-		prevSig = entry.Signature
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to read audit log %q: %v\n", logPath, err)
-		os.Exit(1)
-	}
-
-	valid := 0
-	for _, r := range results {
-		if r.SigValid && r.ChainValid {
-			valid++
-		}
 	}
 
 	if cfg.Output == "json" {
 		out := map[string]interface{}{
 			"log":                logPath,
 			"host_key":           hostKeyPath,
-			"total_entries":      total,
-			"valid_entries":      valid,
-			"signature_failures": sigFailures,
-			"chain_failures":     chainFailures,
-			"entries":            results,
+			"total_entries":      result.Total,
+			"valid_entries":      result.Valid,
+			"signature_failures": result.SigFailures,
+			"chain_failures":     result.ChainFailures,
+			"entries":            result.Results,
 		}
 		b, _ := json.MarshalIndent(out, "", "  ")
 		fmt.Println(string(b))
@@ -874,7 +930,7 @@ func handleAuditVerify(cfg Config, args []string) {
 		fmt.Printf("Verifying audit log %q against host key %q\n\n", logPath, hostKeyPath)
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 		fmt.Fprintln(w, "LINE\tTIMESTAMP\tACTION\tSIGNATURE\tCHAIN\tNOTE")
-		for _, r := range results {
+		for _, r := range result.Results {
 			sigStatus := "PASS"
 			if !r.SigValid {
 				sigStatus = "FAIL"
@@ -889,10 +945,10 @@ func handleAuditVerify(cfg Config, args []string) {
 
 		fmt.Println()
 		fmt.Printf("Total entries: %d, Valid: %d, Signature failures: %d, Chain breaks: %d\n",
-			total, valid, sigFailures, chainFailures)
+			result.Total, result.Valid, result.SigFailures, result.ChainFailures)
 	}
 
-	if sigFailures > 0 || chainFailures > 0 {
+	if result.SigFailures > 0 || result.ChainFailures > 0 {
 		if cfg.Output != "json" {
 			fmt.Println("Result: AUDIT LOG VERIFICATION FAILED")
 		}
@@ -901,6 +957,84 @@ func handleAuditVerify(cfg Config, args []string) {
 
 	if cfg.Output != "json" {
 		fmt.Println("Result: AUDIT LOG VERIFICATION PASSED")
+	}
+}
+
+// handleAuditWatch periodically re-verifies the audit log's signature and
+// hash chain, printing a one-line status each cycle.
+//
+// Design (kept intentionally simple): this is a stateless poller, not a
+// diff-based one. It re-verifies the *entire* log from the first line on
+// every cycle. The first time a cycle finds any signature or chain failure,
+// it prints a single "ALERT: audit log tamper detected at line N (<reason>)"
+// line to stderr and exits non-zero immediately — it does not keep
+// watching afterward. This means it never re-alerts for the same tamper
+// (there is only ever one alert, on first detection), and it makes the
+// process exit code a reliable one-shot signal for a supervisor/monitor
+// (systemd, `myrmex audit watch ... || page-oncall`, etc.) to act on. To
+// resume watching after investigating/rotating the log, just re-run the
+// command.
+func handleAuditWatch(args []string) {
+	logPath := "audit.log"
+	hostKeyPath := ""
+	interval := 30
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--log":
+			if i+1 < len(args) {
+				logPath = args[i+1]
+				i++
+			}
+		case "--host-key":
+			if i+1 < len(args) {
+				hostKeyPath = args[i+1]
+				i++
+			}
+		case "--interval":
+			if i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err == nil && v > 0 {
+					interval = v
+				}
+				i++
+			}
+		}
+	}
+
+	if hostKeyPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: --host-key <path> is required for 'audit watch'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit watch --log <path> --host-key <path> [--interval <seconds>]")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Watching audit log %q for tampering (host key %q, checking every %ds)...\n", logPath, hostKeyPath, interval)
+
+	check := func() {
+		result, err := verifyAuditLog(logPath, hostKeyPath)
+		now := time.Now().UTC().Format(time.RFC3339)
+		if err != nil {
+			fmt.Printf("[%s] check error: %v\n", now, err)
+			return
+		}
+
+		if result.SigFailures > 0 || result.ChainFailures > 0 {
+			fmt.Printf("[%s] entries=%d valid=%d signature_failures=%d chain_failures=%d status=FAILED\n",
+				now, result.Total, result.Valid, result.SigFailures, result.ChainFailures)
+			fmt.Fprintf(os.Stderr, "ALERT: audit log tamper detected at line %d (%s)\n",
+				result.FirstBadLine, result.FirstBadReason)
+			os.Exit(1)
+		}
+
+		fmt.Printf("[%s] entries=%d valid=%d status=OK\n", now, result.Total, result.Valid)
+	}
+
+	// Check immediately on start, then every tick thereafter.
+	check()
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		check()
 	}
 }
 
