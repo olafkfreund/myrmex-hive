@@ -95,6 +95,36 @@ var k8sResourceRegex = regexp.MustCompile(`^[a-z][a-z0-9.-]*$`)
 // avoid argument injection; matches well-formed Kubernetes namespace names.
 var k8sNamespaceRegex = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
+// PackageQueryArgs holds the typed arguments for the package_query tool.
+// It is a structured, read-only wrapper around OS package manager "list
+// installed" commands; it still delegates to command.ExecuteCommand so the
+// operator's allowlist remains the enforced security boundary (the package
+// manager binary must be allowlisted).
+type PackageQueryArgs struct {
+	Manager string `json:"manager"`
+	Name    string `json:"name,omitempty"`
+}
+
+// packageNameRegex conservatively restricts the optional package name filter
+// to avoid argument injection; ExecuteCommand always passes args to os/exec
+// directly (never a shell), but this keeps inputs to well-formed package
+// names.
+var packageNameRegex = regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
+
+// FileReadArgs holds the typed arguments for the file_read tool.
+// It is a bounded, read-only wrapper around `cat`; it still delegates to
+// command.ExecuteCommand so the operator's allowlist (specifically the
+// args_regex configured for the cat entry) remains the actual security gate
+// governing which paths are readable. The client-side checks here (absolute
+// path, no "..") only reject obviously malformed input early.
+type FileReadArgs struct {
+	Path string `json:"path"`
+}
+
+// maxFileReadBytes bounds the amount of file content returned by file_read
+// so a single call can't flood the response with an enormous file.
+const maxFileReadBytes = 65536
+
 // Build information, injected at build time via -ldflags.
 var (
 	version = "dev"
@@ -385,6 +415,39 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 				"required": []string{"resource"},
 			},
 		},
+		{
+			"name":        "package_query",
+			"description": "Typed, read-only query of installed OS packages via the system package manager (dpkg, rpm, apk, pacman, or dnf). Enforced by the agent's command allowlist; requires the corresponding package manager binary to be allowlisted.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"manager": map[string]interface{}{
+						"type":        "string",
+						"description": "The package manager to query. One of: dpkg, rpm, apk, pacman, dnf",
+						"enum":        []string{"dpkg", "rpm", "apk", "pacman", "dnf"},
+					},
+					"name": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional package name filter",
+					},
+				},
+				"required": []string{"manager"},
+			},
+		},
+		{
+			"name":        "file_read",
+			"description": "Bounded, read-only read of a file on the agent host via `cat` (output truncated to 64KB). The agent's command allowlist — specifically the args_regex configured for the cat entry — is the actual security boundary governing which paths may be read; this tool additionally rejects non-absolute paths and path traversal (\"..\") client-side.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{
+						"type":        "string",
+						"description": "Absolute path of the file to read (must not contain \"..\")",
+					},
+				},
+				"required": []string{"path"},
+			},
+		},
 	}
 
 	response := JsonRpcResponse{
@@ -593,6 +656,102 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 		var textContent string
 		if err != nil {
 			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+		} else {
+			textContent = output
+		}
+
+		response := JsonRpcResponse{
+			JsonRpc: "2.0",
+			Result: map[string]interface{}{
+				"content": []map[string]interface{}{
+					{
+						"type": "text",
+						"text": textContent,
+					},
+				},
+			},
+			ID: req.ID,
+		}
+		sendResponse(w, response)
+
+	case "package_query":
+		var pkgArgs PackageQueryArgs
+		if err := json.Unmarshal(params.Arguments, &pkgArgs); err != nil {
+			sendError(w, req.ID, -32602, "Invalid package_query arguments")
+			return
+		}
+
+		var listArgs []string
+		switch pkgArgs.Manager {
+		case "dpkg":
+			listArgs = []string{"-l"}
+		case "rpm":
+			listArgs = []string{"-qa"}
+		case "apk":
+			listArgs = []string{"info"}
+		case "pacman":
+			listArgs = []string{"-Q"}
+		case "dnf":
+			listArgs = []string{"list", "installed"}
+		default:
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid manager %q: must be one of dpkg, rpm, apk, pacman, dnf", pkgArgs.Manager))
+			return
+		}
+
+		if pkgArgs.Name != "" {
+			if !packageNameRegex.MatchString(pkgArgs.Name) {
+				sendError(w, req.ID, -32602, fmt.Sprintf("Invalid package name %q", pkgArgs.Name))
+				return
+			}
+			listArgs = append(listArgs, pkgArgs.Name)
+		}
+
+		output, err := command.ExecuteCommand(pkgArgs.Manager, listArgs, cfg.AllowedCommands)
+
+		var textContent string
+		if err != nil {
+			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+		} else {
+			textContent = output
+		}
+
+		response := JsonRpcResponse{
+			JsonRpc: "2.0",
+			Result: map[string]interface{}{
+				"content": []map[string]interface{}{
+					{
+						"type": "text",
+						"text": textContent,
+					},
+				},
+			},
+			ID: req.ID,
+		}
+		sendResponse(w, response)
+
+	case "file_read":
+		var fileArgs FileReadArgs
+		if err := json.Unmarshal(params.Arguments, &fileArgs); err != nil {
+			sendError(w, req.ID, -32602, "Invalid file_read arguments")
+			return
+		}
+
+		if fileArgs.Path == "" || !strings.HasPrefix(fileArgs.Path, "/") {
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid path %q: must be an absolute path", fileArgs.Path))
+			return
+		}
+		if strings.Contains(fileArgs.Path, "..") {
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid path %q: path traversal (\"..\") is not allowed", fileArgs.Path))
+			return
+		}
+
+		output, err := command.ExecuteCommand("cat", []string{fileArgs.Path}, cfg.AllowedCommands)
+
+		var textContent string
+		if err != nil {
+			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+		} else if len(output) > maxFileReadBytes {
+			textContent = output[:maxFileReadBytes] + "\n...[truncated at 64KB]"
 		} else {
 			textContent = output
 		}
