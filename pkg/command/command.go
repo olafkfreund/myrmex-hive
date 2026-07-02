@@ -12,8 +12,11 @@ import (
 	"github.com/olafkfreund/mcp-os-agent/pkg/config"
 )
 
-// ExecuteCommand validates and runs an approved command with a timeout
-func ExecuteCommand(name string, args []string, allowedCommands []config.AllowedCommand) (string, error) {
+// validateCommand enforces the allowlist and argument policy for a requested
+// command and resolves it to an absolute executable path. It performs every
+// safety check ExecuteCommand relies on WITHOUT running anything, so it can be
+// shared by the real execution path and the dry-run path.
+func validateCommand(name string, args []string, allowedCommands []config.AllowedCommand) (execPath string, err error) {
 	// 1. Validate if the command name is allowed
 	var matchedCmd *config.AllowedCommand
 	for _, cmd := range allowedCommands {
@@ -42,14 +45,10 @@ func ExecuteCommand(name string, args []string, allowedCommands []config.Allowed
 		return "", fmt.Errorf("command %q does not allow arguments", name)
 	}
 
-	// 3. Execute the command securely with a 30s timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Harden against silent PATH substitution: if the allowlisted command name is
-	// not already an absolute path, resolve it to one via LookPath and execute the
-	// resolved absolute path. Fail if it cannot be resolved.
-	execPath := name
+	// 3. Harden against silent PATH substitution: if the allowlisted command name
+	// is not already an absolute path, resolve it to one via LookPath. Fail if it
+	// cannot be resolved.
+	execPath = name
 	if !filepath.IsAbs(execPath) {
 		resolved, lookErr := exec.LookPath(name)
 		if lookErr != nil {
@@ -57,6 +56,32 @@ func ExecuteCommand(name string, args []string, allowedCommands []config.Allowed
 		}
 		execPath = resolved
 	}
+
+	return execPath, nil
+}
+
+// DryRun validates a command exactly as ExecuteCommand would (allowlist,
+// argument regex, absolute-path resolution) but does NOT execute it. It returns
+// a human-readable description of the command that WOULD run, so operators can
+// preview an action before committing to it.
+func DryRun(name string, args []string, allowedCommands []config.AllowedCommand) (string, error) {
+	execPath, err := validateCommand(name, args, allowedCommands)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("[dry-run] approved; would execute: %s %s", execPath, strings.Join(args, " ")), nil
+}
+
+// ExecuteCommand validates and runs an approved command with a timeout
+func ExecuteCommand(name string, args []string, allowedCommands []config.AllowedCommand) (string, error) {
+	execPath, err := validateCommand(name, args, allowedCommands)
+	if err != nil {
+		return "", err
+	}
+
+	// Execute the command securely with a 30s timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	// Run command directly (no shell invocation, preventing injection)
 	cmd := exec.CommandContext(ctx, execPath, args...)

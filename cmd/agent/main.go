@@ -48,8 +48,9 @@ type CallToolParams struct {
 }
 
 type RunCommandArgs struct {
-	Name string   `json:"name"`
-	Args []string `json:"args,omitempty"`
+	Name   string   `json:"name"`
+	Args   []string `json:"args,omitempty"`
+	DryRun bool     `json:"dry_run,omitempty"`
 }
 
 // ServiceControlArgs holds the typed arguments for the service_control tool.
@@ -277,6 +278,10 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 						},
 						"description": "Arguments to pass to the command",
 					},
+					"dry_run": map[string]interface{}{
+						"type":        "boolean",
+						"description": "If true, validate against the allowlist and report what would run without executing it",
+					},
 				},
 				"required": []string{"name"},
 			},
@@ -392,7 +397,15 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 			return
 		}
 
-		output, err := command.ExecuteCommand(cmdArgs.Name, cmdArgs.Args, cfg.AllowedCommands)
+		var output string
+		var err error
+		if cmdArgs.DryRun {
+			// Preview only: validate against the allowlist and report what would
+			// run, without executing anything.
+			output, err = command.DryRun(cmdArgs.Name, cmdArgs.Args, cfg.AllowedCommands)
+		} else {
+			output, err = command.ExecuteCommand(cmdArgs.Name, cmdArgs.Args, cfg.AllowedCommands)
+		}
 
 		var textContent string
 		if err != nil {
