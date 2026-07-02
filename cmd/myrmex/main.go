@@ -20,6 +20,13 @@ type Config struct {
 	Output   string
 }
 
+// Build information, injected at build time via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		printHelp()
@@ -29,6 +36,10 @@ func main() {
 	cmd := os.Args[1]
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		printHelp()
+		os.Exit(0)
+	}
+	if cmd == "version" || cmd == "--version" || cmd == "-v" {
+		fmt.Printf("myrmex %s (commit %s, built %s)\n", version, commit, date)
 		os.Exit(0)
 	}
 

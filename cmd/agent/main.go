@@ -51,9 +51,22 @@ type RunCommandArgs struct {
 	Args []string `json:"args,omitempty"`
 }
 
+// Build information, injected at build time via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", "agent_config.json", "Path to agent configuration file")
+	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("agent %s (commit %s, built %s)\n", version, commit, date)
+		os.Exit(0)
+	}
 
 	log.Println("Starting Myrmex Agent...")
 	cfg, err := config.LoadAgentConfig(*configPath)

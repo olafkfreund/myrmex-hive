@@ -366,9 +366,26 @@ func listAgentIDs() []string {
 
 var httpActive bool
 
+// sshReady reports whether the SSH gateway listener has started accepting
+// connections. Used by handleReadyz to gauge readiness.
+var sshReady bool
+
+// Build information, injected at build time via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", "gateway_config.json", "Path to gateway config")
+	showVersion := flag.Bool("version", false, "Print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("gateway %s (commit %s, built %s)\n", version, commit, date)
+		os.Exit(0)
+	}
 
 	// Disable logs on stdout so they don't corrupt MCP stdio protocol
 	log.SetOutput(os.Stderr)
@@ -525,6 +542,7 @@ func startSSHServer(cfg *config.GatewayConfig) {
 		log.Fatalf("Failed to listen on %s: %v", cfg.ListenAddr, err)
 	}
 	log.Printf("SSH Gateway listening on %s...", cfg.ListenAddr)
+	sshReady = true
 
 	for {
 		conn, err := listener.Accept()
@@ -1095,8 +1113,36 @@ var (
 	sseSessionsMu sync.Mutex
 )
 
+// handleHealthz is an unauthenticated liveness probe. It always returns 200
+// and reveals no configuration, secret, or agent detail.
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleReadyz is an unauthenticated readiness probe. It returns 200 once
+// configuration has been loaded and the SSH server has started accepting
+// connections, and 503 otherwise. It reveals no counts or identities.
+func handleReadyz(w http.ResponseWriter, r *http.Request) {
+	currentConfigMu.RLock()
+	ready := currentConfig != nil && sshReady
+	currentConfigMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"not-ready"}`))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ready"}`))
+}
+
 func startHTTPServer(cfg *config.GatewayConfig) {
 	httpActive = true
+	http.HandleFunc("/healthz", handleHealthz)
+	http.HandleFunc("/readyz", handleReadyz)
 	http.HandleFunc("/sse", requireAuth(handleSse))
 	http.HandleFunc("/message", requireAuth(handleMessage))
 	http.HandleFunc("/api/status", requireAuth(handleApiStatus))
