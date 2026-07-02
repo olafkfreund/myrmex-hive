@@ -4060,6 +4060,107 @@ const PortalHTML = `<!DOCTYPE html>
             70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
             100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
         }
+
+        /* Fleet & Approvals Management Views */
+        .mgmt-toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+        .mgmt-toolbar .form-group {
+            margin-bottom: 0;
+        }
+        .mgmt-toolbar .form-control {
+            width: auto;
+            min-width: 150px;
+        }
+        .toolbar-spacer {
+            flex-grow: 1;
+        }
+        .autorefresh-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+        .table-wrap {
+            overflow-x: auto;
+        }
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .data-table th,
+        .data-table td {
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-color);
+            vertical-align: middle;
+        }
+        .data-table th {
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.05em;
+            white-space: nowrap;
+        }
+        .data-table tbody tr:hover {
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+        .data-table .empty-row td {
+            color: var(--text-secondary);
+            text-align: center;
+            padding: 24px 12px;
+        }
+        .status-dot.online { background-color: var(--success); }
+        .status-dot.stale { background-color: var(--danger); }
+        .mini-metrics {
+            display: flex;
+            gap: 12px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+        .mini-metrics strong {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+        .mini-na {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .tag-pill {
+            display: inline-block;
+            background-color: rgba(254, 128, 25, 0.08);
+            border: 1px solid rgba(254, 128, 25, 0.25);
+            color: var(--accent);
+            padding: 2px 7px;
+            border-radius: 6px;
+            font-size: 11px;
+            margin: 2px 4px 2px 0;
+        }
+        .tier-pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            border: 1px solid var(--warning);
+            color: var(--warning);
+            background-color: rgba(250, 189, 47, 0.08);
+        }
+        .row-actions {
+            display: flex;
+            gap: 8px;
+        }
     </style>
 </head>
 <body>
@@ -4076,6 +4177,8 @@ const PortalHTML = `<!DOCTYPE html>
 
     <div class="nav-tabs">
         <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+        <button class="tab-btn" onclick="switchTab('fleet')">Fleet</button>
+        <button class="tab-btn" onclick="switchTab('approvals')">Approvals</button>
         <button class="tab-btn" onclick="switchTab('playground')">Playground</button>
         <button class="tab-btn" onclick="switchTab('keys')">SSH Authorized Keys</button>
         <button class="tab-btn" onclick="switchTab('config')">Configuration</button>
@@ -4115,6 +4218,93 @@ const PortalHTML = `<!DOCTYPE html>
                     <ul class="item-list" id="upstreams-list">
                         <li class="item-row"><span class="item-name">No upstream servers configured.</span></li>
                     </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Fleet Tab -->
+        <div id="fleet" class="tab-content">
+            <div class="card" style="width: 100%;">
+                <div class="card-header">
+                    <span class="card-title">Fleet Inventory</span>
+                    <span class="item-meta" id="fleet-count">0 agents</span>
+                </div>
+                <div id="fleet-alert"></div>
+                <div class="mgmt-toolbar">
+                    <div class="form-group">
+                        <label for="fleet-status">Status</label>
+                        <select id="fleet-status" class="form-control" onchange="loadFleet()">
+                            <option value="all">All</option>
+                            <option value="online">Online</option>
+                            <option value="stale">Stale</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="fleet-tag">Tag</label>
+                        <input type="text" id="fleet-tag" class="form-control" placeholder="exact tag" onkeydown="if(event.key==='Enter'){loadFleet();}">
+                    </div>
+                    <div class="form-group">
+                        <label for="fleet-os">OS contains</label>
+                        <input type="text" id="fleet-os" class="form-control" placeholder="e.g. linux" onkeydown="if(event.key==='Enter'){loadFleet();}">
+                    </div>
+                    <div class="toolbar-spacer"></div>
+                    <label class="autorefresh-label">
+                        <input type="checkbox" id="fleet-autorefresh" onchange="toggleFleetAutoRefresh()">
+                        Auto-refresh (5s)
+                    </label>
+                    <button class="btn" onclick="loadFleet()">Refresh</button>
+                </div>
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Agent</th>
+                                <th>Status</th>
+                                <th>OS</th>
+                                <th>Tags</th>
+                                <th>Last Seen</th>
+                                <th>Latest Metrics</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fleet-tbody">
+                            <tr class="empty-row"><td colspan="6">No fleet data loaded yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Approvals Tab -->
+        <div id="approvals" class="tab-content">
+            <div class="card" style="width: 100%;">
+                <div class="card-header">
+                    <span class="card-title">Approval Queue</span>
+                    <span class="item-meta" id="approvals-count">0 pending</span>
+                </div>
+                <div id="approvals-alert"></div>
+                <div class="mgmt-toolbar">
+                    <div style="font-size: 13px; color: var(--text-secondary); flex-grow: 1;">
+                        Risky tool calls parked for human-in-the-loop review. Approving executes the call (admin token required).
+                    </div>
+                    <button class="btn" onclick="loadApprovals()">Refresh</button>
+                </div>
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Agent</th>
+                                <th>Tool</th>
+                                <th>Tier</th>
+                                <th>Requested By</th>
+                                <th>Created</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="approvals-tbody">
+                            <tr class="empty-row"><td colspan="7">No pending approvals.</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -4466,12 +4656,21 @@ const PortalHTML = `<!DOCTYPE html>
             if (targetContent) targetContent.classList.add('active');
 
             currentTab = tabId;
+            // Leaving the Fleet tab must halt its auto-refresh timer so we
+            // never keep polling /api/fleet in the background.
+            if (tabId !== 'fleet') {
+                stopFleetAutoRefresh();
+            }
             if (tabId === 'playground') {
                 loadTools();
             } else if (tabId === 'keys') {
                 loadKeys();
             } else if (tabId === 'config') {
                 loadConfig();
+            } else if (tabId === 'fleet') {
+                loadFleet();
+            } else if (tabId === 'approvals') {
+                loadApprovals();
             }
         }
 
@@ -4875,6 +5074,233 @@ const PortalHTML = `<!DOCTYPE html>
             } else {
                 document.getElementById('sse-fields').style.display = 'none';
                 document.getElementById('stdio-fields').style.display = 'block';
+            }
+        }
+
+        // ---- Fleet Inventory (issue #38: GET /api/fleet) ----
+        let fleetAutoRefreshTimer = null;
+
+        function htmlEscape(str) {
+            return String(str == null ? '' : str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function buildFleetUrl() {
+            const status = document.getElementById('fleet-status').value;
+            const tag = document.getElementById('fleet-tag').value.trim();
+            const os = document.getElementById('fleet-os').value.trim();
+            const params = new URLSearchParams();
+            if (status && status !== 'all') params.set('status', status);
+            if (tag) params.set('tag', tag);
+            if (os) params.set('os', os);
+            const qs = params.toString();
+            return '/api/fleet' + (qs ? '?' + qs : '');
+        }
+
+        // latest_metrics is raw agent JSON; show cpu/mem/disk if present, else n/a.
+        function renderFleetMetrics(raw) {
+            if (raw === null || raw === undefined) return '<span class="mini-na">n/a</span>';
+            let m = raw;
+            if (typeof raw === 'string') {
+                try { m = JSON.parse(raw); } catch (e) { return '<span class="mini-na">n/a</span>'; }
+            }
+            if (!m || typeof m !== 'object') return '<span class="mini-na">n/a</span>';
+            const parts = [];
+            if (typeof m.cpu_usage_percent === 'number') {
+                parts.push('<span>CPU <strong>' + m.cpu_usage_percent.toFixed(1) + '%</strong></span>');
+            }
+            if (typeof m.mem_used_percent === 'number') {
+                parts.push('<span>Mem <strong>' + m.mem_used_percent.toFixed(1) + '%</strong></span>');
+            }
+            if (typeof m.disk_used_percent === 'number') {
+                parts.push('<span>Disk <strong>' + m.disk_used_percent.toFixed(1) + '%</strong></span>');
+            }
+            if (parts.length === 0) return '<span class="mini-na">n/a</span>';
+            return '<div class="mini-metrics">' + parts.join('') + '</div>';
+        }
+
+        function renderFleet(agents) {
+            const tbody = document.getElementById('fleet-tbody');
+            const countEl = document.getElementById('fleet-count');
+            if (!Array.isArray(agents) || agents.length === 0) {
+                tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No agents match the current filters.</td></tr>';
+                countEl.innerText = '0 agents';
+                return;
+            }
+            countEl.innerText = agents.length + (agents.length === 1 ? ' agent' : ' agents');
+            tbody.innerHTML = agents.map(function(a) {
+                const online = a.online === true;
+                const dotClass = online ? 'online' : 'stale';
+                const statusLabel = online ? 'online' : 'stale';
+                const tags = Array.isArray(a.tags) && a.tags.length
+                    ? a.tags.map(function(t){ return '<span class="tag-pill">' + htmlEscape(t) + '</span>'; }).join('')
+                    : '<span class="mini-na">-</span>';
+                const lastSeen = a.last_seen ? htmlEscape(a.last_seen) : '<span class="mini-na">-</span>';
+                return '<tr>' +
+                    '<td><span class="item-name">' + htmlEscape(a.id) + '</span><div class="item-meta">' + htmlEscape(a.ip || '') + '</div></td>' +
+                    '<td><span class="item-name"><span class="status-dot ' + dotClass + '"></span>' + statusLabel + '</span></td>' +
+                    '<td>' + (a.os ? htmlEscape(a.os) : '<span class="mini-na">-</span>') + '</td>' +
+                    '<td>' + tags + '</td>' +
+                    '<td>' + lastSeen + '</td>' +
+                    '<td>' + renderFleetMetrics(a.latest_metrics) + '</td>' +
+                '</tr>';
+            }).join('');
+        }
+
+        async function loadFleet() {
+            const tbody = document.getElementById('fleet-tbody');
+            const alertBox = document.getElementById('fleet-alert');
+            alertBox.innerHTML = '';
+            try {
+                const res = await authFetch(buildFleetUrl());
+                if (!res.ok) {
+                    let msg = 'HTTP ' + res.status;
+                    if (res.status === 403) {
+                        msg = 'Forbidden: a valid token is required to view the fleet';
+                    } else {
+                        try { const t = await res.text(); if (t) msg += ': ' + t; } catch (e) {}
+                    }
+                    throw new Error(msg);
+                }
+                const data = await res.json();
+                renderFleet(data);
+            } catch (e) {
+                // Stop auto-refresh on any error so we never hammer the gateway.
+                stopFleetAutoRefresh();
+                alertBox.innerHTML = '<div class="alert alert-danger">Failed to load fleet: ' + htmlEscape(e.message) + '</div>';
+                tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Unable to load fleet data.</td></tr>';
+            }
+        }
+
+        function toggleFleetAutoRefresh() {
+            const box = document.getElementById('fleet-autorefresh');
+            if (box && box.checked) {
+                stopFleetAutoRefresh(true);
+                fleetAutoRefreshTimer = setInterval(loadFleet, 5000);
+                loadFleet();
+            } else {
+                stopFleetAutoRefresh(true);
+            }
+        }
+
+        function stopFleetAutoRefresh(keepCheckbox) {
+            if (fleetAutoRefreshTimer !== null) {
+                clearInterval(fleetAutoRefreshTimer);
+                fleetAutoRefreshTimer = null;
+            }
+            if (!keepCheckbox) {
+                const box = document.getElementById('fleet-autorefresh');
+                if (box) box.checked = false;
+            }
+        }
+
+        // ---- Approval Queue (issue #38: GET/POST /api/approvals) ----
+        function renderApprovals(list) {
+            const tbody = document.getElementById('approvals-tbody');
+            const countEl = document.getElementById('approvals-count');
+            if (!Array.isArray(list) || list.length === 0) {
+                tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No pending approvals.</td></tr>';
+                countEl.innerText = '0 pending';
+                return;
+            }
+            countEl.innerText = list.length + ' pending';
+            tbody.innerHTML = list.map(function(a) {
+                const id = htmlEscape(a.id);
+                const tier = a.tier ? '<span class="tier-pill">' + htmlEscape(a.tier) + '</span>' : '<span class="mini-na">-</span>';
+                const requestedBy = htmlEscape(a.role || '-') + (a.token_id ? ' <span class="item-meta">(' + htmlEscape(a.token_id) + ')</span>' : '');
+                return '<tr id="appr-row-' + id + '">' +
+                    '<td><span class="item-meta">' + id + '</span></td>' +
+                    '<td>' + htmlEscape(a.agent_id || '-') + '</td>' +
+                    '<td><span class="item-name">' + htmlEscape(a.tool || '-') + '</span></td>' +
+                    '<td>' + tier + '</td>' +
+                    '<td>' + requestedBy + '</td>' +
+                    '<td>' + (a.created_at ? htmlEscape(a.created_at) : '<span class="mini-na">-</span>') + '</td>' +
+                    '<td><div class="row-actions">' +
+                        '<button class="btn" style="padding:6px 12px; font-size:12px;" onclick="decideApproval(\'' + id + '\', \'approve\')">Approve</button>' +
+                        '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px;" onclick="decideApproval(\'' + id + '\', \'reject\')">Reject</button>' +
+                    '</div><div class="item-meta" id="appr-result-' + id + '" style="margin-top:6px;"></div></td>' +
+                '</tr>';
+            }).join('');
+        }
+
+        async function loadApprovals() {
+            const tbody = document.getElementById('approvals-tbody');
+            const alertBox = document.getElementById('approvals-alert');
+            alertBox.innerHTML = '';
+            try {
+                const res = await authFetch('/api/approvals');
+                if (!res.ok) {
+                    let msg = 'HTTP ' + res.status;
+                    if (res.status === 403) {
+                        msg = 'Forbidden: operator or admin token required to view approvals';
+                    } else {
+                        try { const t = await res.text(); if (t) msg += ': ' + t; } catch (e) {}
+                    }
+                    throw new Error(msg);
+                }
+                const data = await res.json();
+                renderApprovals(data);
+            } catch (e) {
+                alertBox.innerHTML = '<div class="alert alert-danger">Failed to load approvals: ' + htmlEscape(e.message) + '</div>';
+                tbody.innerHTML = '<tr class="empty-row"><td colspan="7">Unable to load approvals.</td></tr>';
+            }
+        }
+
+        async function decideApproval(id, decision) {
+            const resultEl = document.getElementById('appr-result-' + id);
+            const row = document.getElementById('appr-row-' + id);
+            if (row) {
+                row.querySelectorAll('button').forEach(function(b){ b.disabled = true; });
+            }
+            if (resultEl) {
+                resultEl.style.color = 'var(--text-secondary)';
+                resultEl.innerText = decision === 'approve' ? 'Approving...' : 'Rejecting...';
+            }
+            try {
+                const res = await authFetch('/api/approvals', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id, decision: decision })
+                });
+                if (!res.ok) {
+                    let msg = 'HTTP ' + res.status;
+                    let bodyText = '';
+                    try { bodyText = await res.text(); } catch (e) {}
+                    if (res.status === 403) {
+                        msg = 'Admin token required to decide approvals';
+                    } else if (bodyText) {
+                        msg += ': ' + bodyText.trim();
+                    }
+                    if (resultEl) {
+                        resultEl.style.color = 'var(--danger)';
+                        resultEl.innerText = msg;
+                    }
+                    if (row) row.querySelectorAll('button').forEach(function(b){ b.disabled = false; });
+                    return;
+                }
+                let payload = null;
+                try { payload = await res.json(); } catch (e) {}
+                if (resultEl) {
+                    resultEl.style.color = 'var(--success)';
+                    let summary = decision === 'approve' ? 'Approved & executed.' : 'Rejected.';
+                    if (payload && payload.error) {
+                        resultEl.style.color = 'var(--danger)';
+                        summary = 'Executed with error: ' + (payload.error.message || JSON.stringify(payload.error));
+                    }
+                    resultEl.innerText = summary;
+                }
+                // Refresh the queue shortly so the decided item drops off.
+                setTimeout(loadApprovals, 800);
+            } catch (e) {
+                if (resultEl) {
+                    resultEl.style.color = 'var(--danger)';
+                    resultEl.innerText = 'Request failed: ' + e.message;
+                }
+                if (row) row.querySelectorAll('button').forEach(function(b){ b.disabled = false; });
             }
         }
 
