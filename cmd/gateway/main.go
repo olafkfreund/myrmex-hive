@@ -26,16 +26,19 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"reflect"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/olafkfreund/myrmex-hive/pkg/config"
 	"github.com/olafkfreund/myrmex-hive/pkg/llm"
+	"github.com/olafkfreund/myrmex-hive/pkg/store"
 )
 
 // UpstreamCaller defines the interface for all external/upstream MCP servers (SSE and Stdio)
@@ -691,6 +694,24 @@ var (
 	currentConfigMu   sync.RWMutex
 	upstreamClients   = make(map[string]UpstreamCaller)
 	upstreamClientsMu sync.RWMutex
+
+	// stateStore persists fleet inventory + audit index to disk when
+	// GatewayConfig.StatePath is set (issue #44). It remains nil when
+	// persistence is disabled, which is the byte-for-byte-compatible default:
+	// snapshotState becomes a no-op and lastKnownAgents is never populated.
+	stateStore *store.Store
+	// stateFilePath mirrors configFilePath for logging purposes only.
+	stateFilePath string
+
+	// lastKnownAgents holds the fleet inventory loaded from stateStore at
+	// startup (issue #50): agents seen before a restart that have not yet
+	// reconnected. It is populated once, at startup, from the persisted
+	// snapshot, and never mutated afterward — as agents reconnect they
+	// become "live" (in the agents map above) and take precedence over any
+	// stale lastKnownAgents entry in handleApiFleet's merge (see
+	// mergeFleet). Guarded by lastKnownMu.
+	lastKnownAgents = make(map[string]store.AgentRecord)
+	lastKnownMu     sync.RWMutex
 )
 
 // addAgent registers a newly connected agent. It refuses to overwrite an
@@ -729,6 +750,67 @@ func listAgentIDs() []string {
 		list = append(list, id)
 	}
 	return list
+}
+
+// snapshotState builds a store.Snapshot from the currently-connected agent
+// registry and the in-memory audit index, and persists it via stateStore
+// (issue #44). It is a no-op when stateStore is nil (GatewayConfig.StatePath
+// unset), so it is always safe to call unconditionally — e.g. from the
+// graceful-shutdown signal handler — regardless of whether persistence is
+// enabled.
+//
+// Note the persisted Agents list always reflects only the agents connected
+// at the moment of the snapshot; it is not merged with any prior
+// lastKnownAgents. This is intentional: the snapshot is a fresh fleet
+// inventory cache, not an ever-growing history, so agents that are
+// permanently decommissioned naturally age out of it after the next save.
+func snapshotState() {
+	if stateStore == nil {
+		return
+	}
+
+	agentsMu.RLock()
+	records := make([]store.AgentRecord, 0, len(agents))
+	for _, c := range agents {
+		c.mu.Lock()
+		rec := store.AgentRecord{
+			ID:              c.agentID,
+			IP:              c.ipAddress,
+			OSVersion:       c.osVersion,
+			RunningServices: append([]string(nil), c.runningServices...),
+			OpenPorts:       append([]string(nil), c.openPorts...),
+			LastSeen:        c.lastSeen,
+		}
+		if n := len(c.metricsHistory); n > 0 {
+			rec.LatestMetrics = c.metricsHistory[n-1].Raw
+		}
+		c.mu.Unlock()
+		records = append(records, rec)
+	}
+	agentsMu.RUnlock()
+
+	auditLogMu.Lock()
+	idx := store.AuditIndex{
+		TotalEntries:  auditTotalEntries,
+		ByAction:      make(map[string]int, len(auditByAction)),
+		LastSignature: lastAuditSig,
+	}
+	for action, count := range auditByAction {
+		idx.ByAction[action] = count
+	}
+	auditLogMu.Unlock()
+
+	snap := &store.Snapshot{
+		SavedAt:    time.Now().UTC(),
+		Agents:     records,
+		AuditIndex: idx,
+	}
+
+	if err := stateStore.Save(snap); err != nil {
+		log.Printf("[STATE] failed to save state to %s: %v", stateFilePath, err)
+		return
+	}
+	log.Printf("[STATE] saved state to %s: %d agent(s), %d audit entries", stateFilePath, len(records), idx.TotalEntries)
 }
 
 // llmEngineConfig derives the llm.EngineConfig used to build the Gateway's
@@ -805,8 +887,32 @@ func main() {
 	configFilePath = *configPath
 	currentConfig = cfg
 
+	// Load persisted state (issues #44/#50) BEFORE starting any server, so
+	// the last-known fleet and audit index are available to serve the very
+	// first request after a restart. Opt-in: stateStore stays nil, and
+	// lastKnownAgents stays empty, when StatePath is unset — preserving pure
+	// in-memory behavior byte-for-byte.
+	if cfg.StatePath != "" {
+		stateFilePath = cfg.StatePath
+		stateStore = store.New(cfg.StatePath)
+		snap, err := stateStore.Load()
+		if err != nil {
+			log.Printf("[STATE] failed to load persisted state from %s: %v (starting with empty state)", cfg.StatePath, err)
+		} else {
+			lastKnownMu.Lock()
+			for _, rec := range snap.Agents {
+				lastKnownAgents[rec.ID] = rec
+			}
+			lastKnownMu.Unlock()
+			seedAuditIndexFromSnapshot(snap.AuditIndex)
+			log.Printf("[STATE] loaded persisted state from %s: %d last-known agent(s), %d audit entries recorded", cfg.StatePath, len(snap.Agents), snap.AuditIndex.TotalEntries)
+		}
+	}
+
 	// Seed the tamper-evident audit chain from any existing log so newly written
-	// entries chain onto the last recorded signature across restarts.
+	// entries chain onto the last recorded signature across restarts. This reads
+	// the audit log file directly (the authoritative source), independent of
+	// (and after) any state-snapshot seeding above.
 	if cfg.AuditLogPath != "" {
 		seedLastAuditSig(cfg.AuditLogPath)
 	}
@@ -840,6 +946,37 @@ func main() {
 
 	// Start Upstream MCP clients if configured
 	reloadUpstreamClients(cfg)
+
+	// Graceful shutdown (issue #50): flush current state to disk (a no-op
+	// when stateStore is nil) on SIGINT/SIGTERM, then exit. This handler is
+	// installed unconditionally, not just when StatePath is set, so
+	// operators always get a clean, logged shutdown; snapshotState itself is
+	// the part gated on persistence being enabled. Agents reconnect on their
+	// own retry loop, so no agent-side change is needed for recovery.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("Received signal %v, flushing state and shutting down...", sig)
+		snapshotState()
+		os.Exit(0)
+	}()
+
+	// Periodic state snapshots (issue #44). Opt-in via StatePath; defaults
+	// the interval to 30s when StateSaveSeconds is unset/invalid.
+	if cfg.StatePath != "" {
+		saveSeconds := cfg.StateSaveSeconds
+		if saveSeconds <= 0 {
+			saveSeconds = 30
+		}
+		go func() {
+			ticker := time.NewTicker(time.Duration(saveSeconds) * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				snapshotState()
+			}
+		}()
+	}
 
 	// 1. Start SSH Server in background
 	go startSSHServer(cfg)
@@ -1844,6 +1981,16 @@ type AuditEntry struct {
 var (
 	auditLogMu   sync.Mutex
 	lastAuditSig string // chained hash of the previous audit entry; guarded by auditLogMu
+
+	// auditTotalEntries/auditByAction are a compact, in-memory running index
+	// of the audit log (issue #44): a total count and a per-action
+	// breakdown, updated alongside lastAuditSig in logAuditEvent and
+	// persisted via snapshotState so a restart doesn't lose audit stats. The
+	// audit log file itself remains the sole source of truth for the
+	// tamper-evident signature chain; these counters are a convenience
+	// summary only. Guarded by auditLogMu.
+	auditTotalEntries int
+	auditByAction     = make(map[string]int)
 )
 
 // anonymizeToken redacts a bearer token to a short prefix/suffix so it can be
@@ -1926,10 +2073,13 @@ func logAuditEvent(ctx context.Context, action, agentID, command, status, detail
 		return
 	}
 
-	// Advance the chain only after the entry is durably appended.
+	// Advance the chain, and the running index, only after the entry is
+	// durably appended.
 	if sig != "" {
 		lastAuditSig = sig
 	}
+	auditTotalEntries++
+	auditByAction[action]++
 }
 
 // seedLastAuditSig best-effort reads the last line of the existing audit log and
@@ -1957,6 +2107,22 @@ func seedLastAuditSig(logPath string) {
 	auditLogMu.Lock()
 	lastAuditSig = entry.Signature
 	auditLogMu.Unlock()
+}
+
+// seedAuditIndexFromSnapshot seeds the in-memory audit index counters
+// (auditTotalEntries/auditByAction) from a persisted store.Snapshot loaded
+// at startup (issue #44/#50), so audit stats survive a restart even before
+// any new entry is written. It intentionally does NOT touch lastAuditSig:
+// the audit log file itself (via seedLastAuditSig) remains the authoritative
+// source for the tamper-evident chain tip, since the snapshot could be
+// slightly stale relative to the last entries actually written to disk.
+func seedAuditIndexFromSnapshot(idx store.AuditIndex) {
+	auditLogMu.Lock()
+	defer auditLogMu.Unlock()
+	auditTotalEntries = idx.TotalEntries
+	for action, count := range idx.ByAction {
+		auditByAction[action] = count
+	}
 }
 
 // rateLimitWindows tracks, per key, the timestamps of recent calls within the
@@ -3110,6 +3276,47 @@ func fleetMatches(info FleetAgentInfo, statusFilter, tagFilter, osFilter string)
 	return true
 }
 
+// mergeFleet combines the currently-connected (live) agents with
+// last-known agents loaded from persisted state (issue #50), so an operator
+// querying /api/fleet immediately after a Gateway restart sees the full
+// fleet rather than an empty list while agents reconnect. Live entries
+// always take precedence: an agent present in live is never duplicated from
+// lastKnown. Last-known-only agents are appended with Online forced to
+// false, since their liveness cannot be verified without an actual
+// connection. Pure function (no I/O, no locking) so the merge policy is
+// directly unit-testable; live and the returned slice must not be mutated
+// concurrently by the caller.
+func mergeFleet(live []FleetAgentInfo, lastKnown map[string]store.AgentRecord) []FleetAgentInfo {
+	if len(lastKnown) == 0 {
+		return live
+	}
+
+	liveIDs := make(map[string]bool, len(live))
+	for _, info := range live {
+		liveIDs[info.ID] = true
+	}
+
+	merged := make([]FleetAgentInfo, len(live), len(live)+len(lastKnown))
+	copy(merged, live)
+
+	for id, rec := range lastKnown {
+		if liveIDs[id] {
+			continue
+		}
+		merged = append(merged, FleetAgentInfo{
+			ID:            rec.ID,
+			IP:            rec.IP,
+			OS:            rec.OSVersion,
+			Services:      rec.RunningServices,
+			Ports:         rec.OpenPorts,
+			Online:        false,
+			LastSeen:      formatLastSeen(rec.LastSeen),
+			LatestMetrics: rec.LatestMetrics,
+		})
+	}
+	return merged
+}
+
 // handleApiFleet is the fleet-wide inventory/query API (issues #37/#42): a
 // searchable, filterable snapshot of every connected agent, including
 // liveness (#33) and the latest polled metrics/history size (#35/#41 rely on
@@ -3145,7 +3352,7 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 	agentsMu.RUnlock()
 
 	now := time.Now()
-	fleet := make([]FleetAgentInfo, 0, len(clients))
+	live := make([]FleetAgentInfo, 0, len(clients))
 	for _, client := range clients {
 		client.mu.Lock()
 		info := FleetAgentInfo{
@@ -3163,7 +3370,30 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 			info.LatestMetrics = client.metricsHistory[n-1].Raw
 		}
 		client.mu.Unlock()
+		live = append(live, info)
+	}
 
+	// Merge in last-known agents loaded from persisted state (issue #50), so
+	// a just-restarted gateway reports the full fleet before agents
+	// reconnect. No-op (full == live) when persistence is disabled or no
+	// last-known state was loaded.
+	lastKnownMu.RLock()
+	lastKnownCopy := make(map[string]store.AgentRecord, len(lastKnownAgents))
+	for id, rec := range lastKnownAgents {
+		lastKnownCopy[id] = rec
+	}
+	lastKnownMu.RUnlock()
+	full := mergeFleet(live, lastKnownCopy)
+
+	fleet := make([]FleetAgentInfo, 0, len(full))
+	for _, info := range full {
+		// Last-known-only entries (mergeFleet doesn't have access to
+		// currentConfig) still get tag filtering applied consistently with
+		// live agents by resolving tags here, at the point AgentTags is
+		// already in scope.
+		if info.Tags == nil {
+			info.Tags = agentTags[info.ID]
+		}
 		if !fleetMatches(info, statusFilter, tagFilter, osFilter) {
 			continue
 		}

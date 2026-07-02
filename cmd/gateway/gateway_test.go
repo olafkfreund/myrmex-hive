@@ -24,6 +24,7 @@ import (
 
 	"github.com/olafkfreund/myrmex-hive/pkg/config"
 	"github.com/olafkfreund/myrmex-hive/pkg/llm"
+	"github.com/olafkfreund/myrmex-hive/pkg/store"
 )
 
 func TestIntegrationAgentGateway(t *testing.T) {
@@ -887,6 +888,85 @@ func TestFleetMatches(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMergeFleet covers the last-known-agent merge behavior added for the
+// #50 restart-recovery feature: currently-connected (live) agents must
+// always win over a stale persisted record for the same ID, and last-known
+// agents absent from live must be appended and reported offline.
+func TestMergeFleet(t *testing.T) {
+	t.Run("empty lastKnown returns live unchanged", func(t *testing.T) {
+		live := []FleetAgentInfo{{ID: "agent-1", Online: true}}
+		got := mergeFleet(live, nil)
+		if len(got) != 1 || got[0].ID != "agent-1" || !got[0].Online {
+			t.Errorf("mergeFleet(live, nil) = %+v, want live unchanged", got)
+		}
+	})
+
+	t.Run("last-known-only agent is appended offline", func(t *testing.T) {
+		live := []FleetAgentInfo{{ID: "agent-1", Online: true}}
+		lastKnown := map[string]store.AgentRecord{
+			"agent-2": {ID: "agent-2", IP: "10.0.0.2", OSVersion: "Debian 12"},
+		}
+
+		got := mergeFleet(live, lastKnown)
+		if len(got) != 2 {
+			t.Fatalf("mergeFleet() returned %d entries, want 2: %+v", len(got), got)
+		}
+
+		byID := map[string]FleetAgentInfo{}
+		for _, info := range got {
+			byID[info.ID] = info
+		}
+
+		if !byID["agent-1"].Online {
+			t.Errorf("live agent-1 should remain online")
+		}
+		lastKnownInfo, ok := byID["agent-2"]
+		if !ok {
+			t.Fatalf("expected last-known agent-2 in merged result: %+v", got)
+		}
+		if lastKnownInfo.Online {
+			t.Errorf("last-known-only agent-2 should be reported offline, got Online=true")
+		}
+		if lastKnownInfo.IP != "10.0.0.2" || lastKnownInfo.OS != "Debian 12" {
+			t.Errorf("last-known agent-2 fields = %+v, want IP=10.0.0.2 OS=Debian 12", lastKnownInfo)
+		}
+	})
+
+	t.Run("live entry takes precedence over stale last-known duplicate", func(t *testing.T) {
+		live := []FleetAgentInfo{{ID: "agent-1", IP: "10.0.0.99", Online: true}}
+		lastKnown := map[string]store.AgentRecord{
+			// Stale record for the same agent, e.g. from before it reconnected
+			// with a different IP; live must win and it must not be duplicated.
+			"agent-1": {ID: "agent-1", IP: "10.0.0.1", OSVersion: "old-os"},
+		}
+
+		got := mergeFleet(live, lastKnown)
+		if len(got) != 1 {
+			t.Fatalf("mergeFleet() returned %d entries, want 1 (no duplicate): %+v", len(got), got)
+		}
+		if got[0].IP != "10.0.0.99" || !got[0].Online {
+			t.Errorf("mergeFleet() = %+v, want live entry (IP=10.0.0.99, Online=true) to win", got[0])
+		}
+	})
+
+	t.Run("multiple last-known agents all appended", func(t *testing.T) {
+		lastKnown := map[string]store.AgentRecord{
+			"agent-a": {ID: "agent-a"},
+			"agent-b": {ID: "agent-b"},
+			"agent-c": {ID: "agent-c"},
+		}
+		got := mergeFleet(nil, lastKnown)
+		if len(got) != 3 {
+			t.Fatalf("mergeFleet(nil, 3 lastKnown) returned %d entries, want 3: %+v", len(got), got)
+		}
+		for _, info := range got {
+			if info.Online {
+				t.Errorf("last-known agent %s should be offline", info.ID)
+			}
+		}
+	})
 }
 
 // TestValidAgentID covers the agent-id allowlist enforced by the enrollment

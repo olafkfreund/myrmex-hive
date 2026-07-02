@@ -224,6 +224,24 @@ type GatewayConfig struct {
 	// TrustedProxyRole is the role granted to requests authenticated via the
 	// trusted proxy. Defaults to "operator" when empty.
 	TrustedProxyRole string `json:"trusted_proxy_role,omitempty"`
+
+	// --- Durability: persistent state + graceful restart recovery (#44/#50) ---
+	//
+	// StatePath, when set, enables durable persistence of the fleet inventory
+	// and audit-log index to a JSON file at this path (see pkg/store), so an
+	// operator sees the last-known fleet immediately after a Gateway restart
+	// instead of an empty list while agents reconnect. Empty (the default)
+	// disables persistence entirely: behavior is identical to the
+	// pre-persistence gateway (pure in-memory state, lost on restart). This
+	// delivers single-gateway durability/recovery only; it is not a shared
+	// backend and does not provide multi-gateway clustering (see #47/#56/#63).
+	StatePath string `json:"state_path,omitempty"`
+	// StateSaveSeconds sets how often (in seconds) the gateway snapshots its
+	// state to StatePath in the background, in addition to the always-on
+	// snapshot taken on graceful shutdown (SIGINT/SIGTERM). Only meaningful
+	// when StatePath is set; a value <= 0 (including unset) defaults to 30
+	// once persistence is active.
+	StateSaveSeconds int `json:"state_save_seconds,omitempty"`
 }
 
 // AlertThresholds defines the percentage thresholds that trigger a threshold
