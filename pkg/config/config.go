@@ -2,7 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"log"
 	"os"
+	"strings"
 )
 
 type AllowedCommand struct {
@@ -60,6 +62,33 @@ type GatewayConfig struct {
 	AllowedOrigins []string `json:"allowed_origins,omitempty"`
 }
 
+// resolveSecret resolves indirect secret references so secret-bearing config
+// values need not be written inline in the JSON config. Supported forms:
+//
+//   - "env:NAME"        -> the value of environment variable NAME
+//   - "file:/path/to/f" -> the trimmed contents of that file
+//   - "${NAME}"         -> the value of environment variable NAME (whole-string form)
+//   - anything else     -> returned unchanged, preserving backward compatibility
+//
+// File read errors are logged to stderr and resolve to "" rather than panicking.
+func resolveSecret(s string) string {
+	switch {
+	case strings.HasPrefix(s, "env:"):
+		return strings.TrimSpace(os.Getenv(strings.TrimPrefix(s, "env:")))
+	case strings.HasPrefix(s, "file:"):
+		data, err := os.ReadFile(strings.TrimPrefix(s, "file:"))
+		if err != nil {
+			log.Printf("resolveSecret: failed to read secret file %q: %v", strings.TrimPrefix(s, "file:"), err)
+			return ""
+		}
+		return strings.TrimSpace(string(data))
+	case strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}"):
+		return strings.TrimSpace(os.Getenv(s[2 : len(s)-1]))
+	default:
+		return s
+	}
+}
+
 func LoadAgentConfig(path string) (*AgentConfig, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -87,6 +116,18 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	dec := json.NewDecoder(file)
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
+	}
+
+	// Resolve secret indirection so operators can reference an env var or a
+	// file instead of embedding the secret value directly in the JSON config.
+	cfg.AuthToken = resolveSecret(cfg.AuthToken)
+	cfg.AntigravityToken = resolveSecret(cfg.AntigravityToken)
+	if cfg.Tokens != nil {
+		resolvedTokens := make(map[string]string, len(cfg.Tokens))
+		for token, role := range cfg.Tokens {
+			resolvedTokens[resolveSecret(token)] = role
+		}
+		cfg.Tokens = resolvedTokens
 	}
 
 	return &cfg, nil
