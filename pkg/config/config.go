@@ -16,6 +16,13 @@ type AgentConfig struct {
 	PrivateKeyPath  string           `json:"private_key_path"`
 	AgentID         string           `json:"agent_id"`
 	AllowedCommands []AllowedCommand `json:"allowed_commands"`
+	// GatewayHostKey pins the gateway's SSH host key. When set, it must be an
+	// OpenSSH authorized_keys-formatted public key line and the agent will only
+	// connect to a gateway presenting exactly this host key.
+	GatewayHostKey string `json:"gateway_host_key,omitempty"`
+	// KnownHostKeyPath is the path used to persist a trust-on-first-use (TOFU)
+	// learned gateway host key. Defaults to PrivateKeyPath+".gateway_hostkey".
+	KnownHostKeyPath string `json:"known_host_key_path,omitempty"`
 }
 
 type UpstreamServer struct {
@@ -48,6 +55,9 @@ type GatewayConfig struct {
 	AntigravityToken   string                    `json:"antigravity_token,omitempty"`
 	Tokens             map[string]string         `json:"tokens,omitempty"`
 	AuditLogPath       string                    `json:"audit_log_path,omitempty"`
+	// AllowedOrigins is the CORS allowlist of browser origins permitted to make
+	// cross-origin requests to the gateway HTTP API. Empty means same-origin only.
+	AllowedOrigins []string `json:"allowed_origins,omitempty"`
 }
 
 func LoadAgentConfig(path string) (*AgentConfig, error) {

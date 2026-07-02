@@ -36,7 +36,7 @@ func main() {
 	cfg := Config{
 		URL:      "https://localhost:8080",
 		Token:    os.Getenv("MYRMEX_TOKEN"),
-		Insecure: true,
+		Insecure: false,
 		Output:   "text",
 	}
 
@@ -132,7 +132,7 @@ Commands:
 Global Options:
   --url         Gateway API base URL (default: https://localhost:8080)
   --token       Secure Gateway Auth Token (or MYRMEX_TOKEN env var)
-  --insecure    Skip TLS verification (default: true)
+  --insecure    Skip TLS verification (default: false)
   --output, -o  Output format: text, json (default: text)
 
 Real-Life Scenarios:

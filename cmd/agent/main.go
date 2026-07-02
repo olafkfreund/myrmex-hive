@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -83,6 +84,50 @@ func main() {
 	}
 }
 
+// buildHostKeyCallback returns an SSH HostKeyCallback that verifies the
+// gateway's host key. If GatewayHostKey is configured the key is pinned;
+// otherwise a trust-on-first-use (TOFU) policy learns and persists the key on
+// first contact and rejects any later mismatch as a possible MITM attack. The
+// host key is never ignored.
+func buildHostKeyCallback(cfg *config.AgentConfig) (ssh.HostKeyCallback, error) {
+	// Pinned host key takes precedence over TOFU.
+	if cfg.GatewayHostKey != "" {
+		pinned, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cfg.GatewayHostKey))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse gateway_host_key: %w", err)
+		}
+		return ssh.FixedHostKey(pinned), nil
+	}
+
+	knownPath := cfg.KnownHostKeyPath
+	if knownPath == "" {
+		knownPath = cfg.PrivateKeyPath + ".gateway_hostkey"
+	}
+
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		stored, err := os.ReadFile(knownPath)
+		if err == nil {
+			knownKey, _, _, _, perr := ssh.ParseAuthorizedKey(stored)
+			if perr != nil {
+				return fmt.Errorf("failed to parse stored gateway host key %s: %w", knownPath, perr)
+			}
+			if !bytes.Equal(key.Marshal(), knownKey.Marshal()) {
+				return fmt.Errorf("gateway host key mismatch for %s: stored key does not match presented key (possible MITM attack)", hostname)
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read known gateway host key %s: %w", knownPath, err)
+		}
+		// Trust-on-first-use: persist the presented key and accept.
+		if werr := os.WriteFile(knownPath, ssh.MarshalAuthorizedKey(key), 0600); werr != nil {
+			return fmt.Errorf("failed to persist gateway host key to %s: %w", knownPath, werr)
+		}
+		log.Printf("[TOFU] Learned and stored gateway host key for %s at %s (first connection)", hostname, knownPath)
+		return nil
+	}, nil
+}
+
 func connectAndServe(cfg *config.AgentConfig, gatewayAddr string) error {
 	// 1. Read SSH private key
 	keyBytes, err := os.ReadFile(cfg.PrivateKeyPath)
@@ -95,13 +140,17 @@ func connectAndServe(cfg *config.AgentConfig, gatewayAddr string) error {
 		return fmt.Errorf("failed to parse private key: %w", err)
 	}
 
-	// 2. Establish SSH Client connection
+	// 2. Establish SSH Client connection with real host-key verification.
+	hostKeyCallback, err := buildHostKeyCallback(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to configure gateway host-key verification: %w", err)
+	}
 	clientConfig := &ssh.ClientConfig{
 		User: cfg.AgentID, // Send agent ID as the SSH username
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // In production, verify the host key!
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         15 * time.Second,
 	}
 

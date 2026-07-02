@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -23,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -323,11 +326,19 @@ var (
 	upstreamClientsMu sync.RWMutex
 )
 
-func addAgent(agentID string, ip string, channel ssh.Channel) {
+// addAgent registers a newly connected agent. It refuses to overwrite an
+// already-connected agent-id (which would let a second connection hijack the
+// first agent's identity), returning false so the caller can close the channel.
+func addAgent(agentID string, ip string, channel ssh.Channel) bool {
 	agentsMu.Lock()
 	defer agentsMu.Unlock()
+	if _, exists := agents[agentID]; exists {
+		log.Printf("[SECURITY] Rejecting registration for agent-id %q from %s: an agent with that id is already connected", agentID, ip)
+		return false
+	}
 	agents[agentID] = NewAgentClient(agentID, ip, channel)
 	log.Printf("Agent registered: %s (IP: %s)", agentID, ip)
+	return true
 }
 
 func removeAgent(agentID string) {
@@ -371,16 +382,25 @@ func main() {
 	configFilePath = *configPath
 	currentConfig = cfg
 
+	// Seed the tamper-evident audit chain from any existing log so newly written
+	// entries chain onto the last recorded signature across restarts.
+	if cfg.AuditLogPath != "" {
+		seedLastAuditSig(cfg.AuditLogPath)
+	}
+
 	// Generate a secure Auth Token if none is set
 	if cfg.AuthToken == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err == nil {
 			cfg.AuthToken = fmt.Sprintf("%x", tokenBytes)
-			log.Printf("[SECURITY] Generated secure Auth Token: %s", cfg.AuthToken)
-			// Save token to disk
+			// Never log the token value. Log a short SHA-256 fingerprint so ops can
+			// correlate the active token without the secret appearing in logs.
+			sum := sha256.Sum256([]byte(cfg.AuthToken))
+			log.Printf("[SECURITY] Generated secure Auth Token (SHA-256 fingerprint: %x). Read the value from the config file.", sum[:4])
+			// Save token to disk with 0600 (file now contains a secret).
 			if configFilePath != "" {
 				fileBytes, _ := json.MarshalIndent(cfg, "", "  ")
-				_ = os.WriteFile(configFilePath, fileBytes, 0644)
+				_ = os.WriteFile(configFilePath, fileBytes, 0600)
 			}
 		}
 	}
@@ -408,46 +428,50 @@ func main() {
 }
 
 func generateTransientHostKey() (ssh.Signer, error) {
-	log.Println("WARNING: Generating a transient host key. Agent connections will see changed host keys upon restart!")
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	log.Println("WARNING: Generating a transient Ed25519 host key. Agent connections will see a changed host key upon restart!")
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-
-	pemBlock := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(key),
-	}
-	privateKeyPEM := pem.EncodeToMemory(pemBlock)
-
-	return ssh.ParsePrivateKey(privateKeyPEM)
+	return ssh.NewSignerFromSigner(priv)
 }
 
 func startSSHServer(cfg *config.GatewayConfig) {
+	// Fail closed: refuse to start without an authorized_keys allowlist. Without
+	// it there is no way to authenticate agents, and accepting all connections
+	// would defeat the entire security model.
+	if cfg.AuthorizedKeysPath == "" {
+		log.Fatalf("[SECURITY] AuthorizedKeysPath is required: refusing to start the SSH gateway without an agent key allowlist")
+	}
+
+	// Fail closed: signed audit logging is only verifiable across restarts if the
+	// host key is persistent. A transient (regenerated-on-restart) key would make
+	// previously written audit signatures unverifiable.
+	if cfg.AuditLogPath != "" && cfg.HostKeyPath == "" {
+		log.Fatalf("[SECURITY] AuditLogPath is set but HostKeyPath is empty: a persistent host key is required so audit signatures remain verifiable across restarts")
+	}
+
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			// Authentication checks
-			if cfg.AuthorizedKeysPath == "" {
-				log.Printf("WARNING: AuthorizedKeysPath is empty. Accepting ALL agent connections (insecure!).")
-				return nil, nil
-			}
-
 			authBytes, err := os.ReadFile(cfg.AuthorizedKeysPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read authorized keys: %w", err)
 			}
 
-			// Parse authorized keys
+			// Parse authorized keys, capturing the comment of the matching entry.
 			authorized := false
+			matchedComment := ""
 			rest := authBytes
 			var authKey ssh.PublicKey
+			var comment string
 			for len(rest) > 0 {
-				authKey, _, _, rest, err = ssh.ParseAuthorizedKey(rest)
+				authKey, comment, _, rest, err = ssh.ParseAuthorizedKey(rest)
 				if err != nil {
 					break
 				}
 				if bytes.Equal(key.Marshal(), authKey.Marshal()) {
 					authorized = true
+					matchedComment = comment
 					break
 				}
 			}
@@ -456,9 +480,20 @@ func startSSHServer(cfg *config.GatewayConfig) {
 				return nil, fmt.Errorf("public key not authorized")
 			}
 
+			// Identity binding: the authorized_keys comment is the authoritative
+			// agent-id. It must be non-empty and must equal the SSH username the
+			// client presented. This prevents a valid key from registering as any
+			// agent-id other than the single one written in its key comment.
+			if matchedComment == "" {
+				return nil, fmt.Errorf("identity mismatch: authorized key has no agent-id comment")
+			}
+			if matchedComment != conn.User() {
+				return nil, fmt.Errorf("identity mismatch: key is bound to agent-id %q but connection requested %q", matchedComment, conn.User())
+			}
+
 			return &ssh.Permissions{
 				Extensions: map[string]string{
-					"agent-id": conn.User(),
+					"agent-id": matchedComment,
 				},
 			}, nil
 		},
@@ -539,8 +574,10 @@ func handleSSHConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
 
 		go ssh.DiscardRequests(requests)
 
-		// Register agent
-		addAgent(agentID, ip, channel)
+		// Register agent; refuse and close the channel on identity collision.
+		if !addAgent(agentID, ip, channel) {
+			channel.Close()
+		}
 	}
 }
 
@@ -1093,8 +1130,14 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	}
 
 	server := &http.Server{
-		Addr:      cfg.HTTPAddr,
-		TLSConfig: tlsConfig,
+		Addr:              cfg.HTTPAddr,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// WriteTimeout is intentionally left at 0 (unlimited): the /sse endpoint
+		// streams long-lived Server-Sent Events to clients, and any non-zero
+		// WriteTimeout would forcibly terminate those streaming responses.
 	}
 
 	log.Printf("Secure HTTPS/SSE Gateway listening on https://%s...", cfg.HTTPAddr)
@@ -1123,10 +1166,14 @@ type AuditEntry struct {
 	Command   string `json:"command,omitempty"`
 	Status    string `json:"status"` // "success" or "failure"
 	Details   string `json:"details"`
+	PrevSig   string `json:"prev_sig,omitempty"`
 	Signature string `json:"signature,omitempty"`
 }
 
-var auditLogMu sync.Mutex
+var (
+	auditLogMu   sync.Mutex
+	lastAuditSig string // chained hash of the previous audit entry; guarded by auditLogMu
+)
 
 func logAuditEvent(ctx context.Context, action, agentID, command, status, details string) {
 	token, _ := ctx.Value(contextKeyToken).(string)
@@ -1145,6 +1192,20 @@ func logAuditEvent(ctx context.Context, action, agentID, command, status, detail
 	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
+
+	currentConfigMu.RLock()
+	logPath := currentConfig.AuditLogPath
+	currentConfigMu.RUnlock()
+
+	if logPath == "" {
+		logPath = "audit.log"
+	}
+
+	// Hold auditLogMu across the whole read-chain/sign/write/advance sequence so
+	// the tamper-evident chain (PrevSig -> Signature) is updated atomically.
+	auditLogMu.Lock()
+	defer auditLogMu.Unlock()
+
 	entry := AuditEntry{
 		Timestamp: timestamp,
 		TokenID:   anonymizedToken,
@@ -1154,11 +1215,14 @@ func logAuditEvent(ctx context.Context, action, agentID, command, status, detail
 		Command:   command,
 		Status:    status,
 		Details:   details,
+		PrevSig:   lastAuditSig,
 	}
 
-	signData := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s",
+	// Include the previous entry's signature in the signed payload so that
+	// removing, reordering, or altering any entry breaks the chain.
+	signData := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s",
 		entry.Timestamp, entry.TokenID, entry.Role, entry.Action,
-		entry.AgentID, entry.Command, entry.Status, entry.Details)
+		entry.AgentID, entry.Command, entry.Status, entry.Details, entry.PrevSig)
 
 	sig, err := signAuditData(signData)
 	if err == nil {
@@ -1173,17 +1237,6 @@ func logAuditEvent(ctx context.Context, action, agentID, command, status, detail
 		return
 	}
 
-	currentConfigMu.RLock()
-	logPath := currentConfig.AuditLogPath
-	currentConfigMu.RUnlock()
-
-	if logPath == "" {
-		logPath = "audit.log"
-	}
-
-	auditLogMu.Lock()
-	defer auditLogMu.Unlock()
-
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Printf("[AUDIT ERROR] Failed to open audit log file %s: %v", logPath, err)
@@ -1193,12 +1246,66 @@ func logAuditEvent(ctx context.Context, action, agentID, command, status, detail
 
 	if _, err := f.Write(append(logBytes, '\n')); err != nil {
 		log.Printf("[AUDIT ERROR] Failed to write audit log to file: %v", err)
+		return
+	}
+
+	// Advance the chain only after the entry is durably appended.
+	if sig != "" {
+		lastAuditSig = sig
+	}
+}
+
+// seedLastAuditSig best-effort reads the last line of the existing audit log and
+// seeds lastAuditSig from its signature so the chain continues across restarts.
+func seedLastAuditSig(logPath string) {
+	if logPath == "" {
+		return
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return // no existing log (or unreadable) — start a fresh chain
+	}
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	if len(lines) == 0 {
+		return
+	}
+	last := lines[len(lines)-1]
+	if len(bytes.TrimSpace(last)) == 0 {
+		return
+	}
+	var entry AuditEntry
+	if err := json.Unmarshal(last, &entry); err != nil {
+		return
+	}
+	auditLogMu.Lock()
+	lastAuditSig = entry.Signature
+	auditLogMu.Unlock()
+}
+
+// setCORS applies a strict CORS policy based on the configured AllowedOrigins
+// allowlist. If the request Origin is in the allowlist it is echoed back;
+// otherwise no Access-Control-Allow-Origin header is set (same-origin only),
+// which is safe for the bundled same-origin portal.
+func setCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return
+	}
+	currentConfigMu.RLock()
+	allowed := currentConfig.AllowedOrigins
+	currentConfigMu.RUnlock()
+	for _, o := range allowed {
+		if o == origin {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			return
+		}
 	}
 }
 
 func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		setCORS(w, r)
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
@@ -1212,27 +1319,29 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		defaultToken := currentConfig.AuthToken
 		currentConfigMu.RUnlock()
 
-		// Get token from Auth Header or query param
+		// Get the bearer token. The ?token= query param is only honored for the
+		// SSE transport paths (/sse, /message) because browser EventSource cannot
+		// set an Authorization header. All other paths require the header and
+		// ignore any query token to avoid credentials leaking via URLs/logs.
+		path := r.URL.Path
+		isSSEPath := path == "/sse" || path == "/message"
 		var reqToken string
 		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			reqToken = strings.TrimPrefix(authHeader, "Bearer ")
-		} else {
+		} else if isSSEPath {
 			reqToken = r.URL.Query().Get("token")
 		}
 
-		// Fallback for development if no token is configured
-		if defaultToken == "" && len(tokensMap) == 0 {
-			handler(w, r)
-			return
-		}
+		// Fail closed: with no valid token there is no role and access is denied
+		// below. There is deliberately no "no auth configured" dev fallback.
 
 		// Determine the role
 		role := ""
 		if reqToken != "" {
 			if r, ok := tokensMap[reqToken]; ok {
 				role = r
-			} else if reqToken == defaultToken {
+			} else if defaultToken != "" && subtle.ConstantTimeCompare([]byte(reqToken), []byte(defaultToken)) == 1 {
 				role = "admin"
 			}
 		}
@@ -1243,7 +1352,6 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		}
 
 		// Check RBAC permissions for the request path
-		path := r.URL.Path
 		allowedPaths := rolePermissions[role]
 		if allowedPaths == nil || !allowedPaths[path] {
 			http.Error(w, fmt.Sprintf("Forbidden: Role %q has no access to %s", role, path), http.StatusForbidden)
@@ -1316,7 +1424,7 @@ func handleSse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 
@@ -1356,7 +1464,7 @@ func handleSse(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleMessage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -1815,7 +1923,7 @@ func reloadGatewaySettings(newCfg *config.GatewayConfig) {
 // HTTP API Handlers for Portal Management
 func handleApiStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -1873,7 +1981,7 @@ func handleApiStatus(w http.ResponseWriter, r *http.Request) {
 
 func handleApiConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -1882,9 +1990,31 @@ func handleApiConfig(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodGet {
 		currentConfigMu.RLock()
-		cfg := currentConfig
+		safe := *currentConfig // shallow copy so we can redact without mutating live config
+		tokenCount := len(currentConfig.Tokens)
 		currentConfigMu.RUnlock()
-		json.NewEncoder(w).Encode(cfg)
+
+		// Redact all secret material: bearer/API tokens and TLS key material must
+		// never be returned over the API. Note the keys of the Tokens map ARE the
+		// secret tokens, so the whole map is omitted (a non-secret count is
+		// surfaced separately for operators).
+		safe.AuthToken = ""
+		safe.AntigravityToken = ""
+		safe.Tokens = nil
+		safe.TLSKeyPath = ""
+
+		out, err := json.Marshal(safe)
+		if err != nil {
+			http.Error(w, "Failed to serialize configuration", http.StatusInternalServerError)
+			return
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(out, &m); err != nil {
+			http.Error(w, "Failed to serialize configuration", http.StatusInternalServerError)
+			return
+		}
+		m["tokens_count"] = tokenCount
+		json.NewEncoder(w).Encode(m)
 		return
 	}
 
@@ -1903,18 +2033,30 @@ func handleApiConfig(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Write to disk if we have a configFilePath
+		// Write to disk if we have a configFilePath. Config contains secrets
+		// (tokens, API keys) so it is written with 0600 permissions.
 		if configFilePath != "" {
 			fileBytes, err := json.MarshalIndent(newCfg, "", "  ")
 			if err != nil {
 				http.Error(w, "Failed to serialize configuration", http.StatusInternalServerError)
 				return
 			}
-			if err := os.WriteFile(configFilePath, fileBytes, 0644); err != nil {
+			if err := os.WriteFile(configFilePath, fileBytes, 0600); err != nil {
 				http.Error(w, fmt.Sprintf("Failed to write config file: %v", err), http.StatusInternalServerError)
 				return
 			}
 		}
+
+		// Audit this privileged mutation BEFORE reloading settings, so that if the
+		// change disables audit logging the still-enabled log captures the event.
+		currentConfigMu.RLock()
+		oldCfg := currentConfig
+		currentConfigMu.RUnlock()
+		auditDisabled := oldCfg.AuditLogPath != "" && newCfg.AuditLogPath == ""
+		tokensChanged := !reflect.DeepEqual(oldCfg.Tokens, newCfg.Tokens)
+		keysPathChanged := oldCfg.AuthorizedKeysPath != newCfg.AuthorizedKeysPath
+		details := fmt.Sprintf("audit_disabled=%v tokens_changed=%v authorized_keys_path_changed=%v", auditDisabled, tokensChanged, keysPathChanged)
+		logAuditEvent(r.Context(), "config_update", "", "gateway_config", "success", details)
 
 		reloadGatewaySettings(&newCfg)
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "config": newCfg})
@@ -1926,7 +2068,7 @@ func handleApiConfig(w http.ResponseWriter, r *http.Request) {
 
 func handleApiKeys(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -1966,6 +2108,8 @@ func handleApiKeys(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		logAuditEvent(r.Context(), "keys_update", "", "authorized_keys", "success", "authorized_keys file rewritten")
+
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 		return
 	}
@@ -1975,7 +2119,7 @@ func handleApiKeys(w http.ResponseWriter, r *http.Request) {
 
 func handleApiCall(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -2047,7 +2191,7 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 
 func handleApiTools(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -2092,7 +2236,7 @@ type ChatRequest struct {
 
 func handleApiChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	setCORS(w, r)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -2154,7 +2298,12 @@ func handleApiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logAuditEvent(r.Context(), "api_chat", "", req.Prompt, "success", fmt.Sprintf("Generated response: %s", replyText))
+	// Truncate the recorded response to bound sensitive data in the audit log.
+	auditResp := replyText
+	if len(auditResp) > 512 {
+		auditResp = auditResp[:512] + "...(truncated)"
+	}
+	logAuditEvent(r.Context(), "api_chat", "", req.Prompt, "success", fmt.Sprintf("Generated response: %s", auditResp))
 	json.NewEncoder(w).Encode(map[string]string{"response": replyText})
 }
 
@@ -2208,7 +2357,13 @@ func callGeminiAPI(token, systemPrompt, prompt string, history []ChatMessage) (s
 	}
 
 	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + token
-	resp, err := http.Post(apiURL, "application/json", bytes.NewReader(reqBytes))
+	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, apiURL, bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	geminiClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := geminiClient.Do(httpReq)
 	if err != nil {
 		return "", err
 	}

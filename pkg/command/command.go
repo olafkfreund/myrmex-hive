@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -45,8 +46,20 @@ func ExecuteCommand(name string, args []string, allowedCommands []config.Allowed
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Harden against silent PATH substitution: if the allowlisted command name is
+	// not already an absolute path, resolve it to one via LookPath and execute the
+	// resolved absolute path. Fail if it cannot be resolved.
+	execPath := name
+	if !filepath.IsAbs(execPath) {
+		resolved, lookErr := exec.LookPath(name)
+		if lookErr != nil {
+			return "", fmt.Errorf("failed to resolve command %q on PATH: %w", name, lookErr)
+		}
+		execPath = resolved
+	}
+
 	// Run command directly (no shell invocation, preventing injection)
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, execPath, args...)
 
 	// Capture both stdout and stderr
 	output, err := cmd.CombinedOutput()
