@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Myrmex Hive (`mcp-os-agent`) is a Go implementation of the Model Context Protocol (MCP) for securely managing distributed edge servers with **zero inbound ports on the targets**. Agents dial *out* to a central Gateway over SSH; operators reach the Gateway (never the agents) via CLI, MCP, or REST. A local LLM (Ollama/Gemma) orchestrates multi-step actions.
+Myrmex Hive (`github.com/olafkfreund/myrmex-hive`) is a Go implementation of the Model Context Protocol (MCP) for securely managing distributed edge servers with **zero inbound ports on the targets**. Agents dial *out* to a central Gateway over SSH; operators reach the Gateway (never the agents) via CLI, MCP, or REST. A local LLM (Ollama/Gemma) orchestrates multi-step actions.
 
 Three binaries from `cmd/`: **agent** (runs on targets), **gateway** (central hub), **myrmex** (operator CLI).
 

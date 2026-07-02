@@ -34,8 +34,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/olafkfreund/mcp-os-agent/pkg/config"
-	"github.com/olafkfreund/mcp-os-agent/pkg/llm"
+	"github.com/olafkfreund/myrmex-hive/pkg/config"
+	"github.com/olafkfreund/myrmex-hive/pkg/llm"
 )
 
 // UpstreamCaller defines the interface for all external/upstream MCP servers (SSE and Stdio)

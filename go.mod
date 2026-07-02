@@ -1,4 +1,4 @@
-module github.com/olafkfreund/mcp-os-agent
+module github.com/olafkfreund/myrmex-hive
 
 go 1.25.0
 

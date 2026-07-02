@@ -22,7 +22,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/olafkfreund/mcp-os-agent/pkg/config"
+	"github.com/olafkfreund/myrmex-hive/pkg/config"
 )
 
 func TestIntegrationAgentGateway(t *testing.T) {

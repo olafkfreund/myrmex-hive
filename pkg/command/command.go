@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/olafkfreund/mcp-os-agent/pkg/config"
+	"github.com/olafkfreund/myrmex-hive/pkg/config"
 )
 
 // validateCommand enforces the allowlist and argument policy for a requested

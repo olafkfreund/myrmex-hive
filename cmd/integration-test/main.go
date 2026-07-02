@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/olafkfreund/mcp-os-agent/pkg/config"
+	"github.com/olafkfreund/myrmex-hive/pkg/config"
 )
 
 type JsonRpcRequest struct {

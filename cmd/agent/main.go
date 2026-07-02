@@ -18,9 +18,9 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/olafkfreund/mcp-os-agent/pkg/command"
-	"github.com/olafkfreund/mcp-os-agent/pkg/config"
-	"github.com/olafkfreund/mcp-os-agent/pkg/metrics"
+	"github.com/olafkfreund/myrmex-hive/pkg/command"
+	"github.com/olafkfreund/myrmex-hive/pkg/config"
+	"github.com/olafkfreund/myrmex-hive/pkg/metrics"
 )
 
 type JsonRpcRequest struct {
