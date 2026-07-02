@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -50,6 +51,20 @@ type RunCommandArgs struct {
 	Name string   `json:"name"`
 	Args []string `json:"args,omitempty"`
 }
+
+// ServiceControlArgs holds the typed arguments for the service_control tool.
+// It is a structured, safer alternative to free-form run_command for
+// managing systemd services; it still delegates to command.ExecuteCommand
+// so the operator's allowlist remains the enforced security boundary.
+type ServiceControlArgs struct {
+	Action  string `json:"action"`
+	Service string `json:"service"`
+}
+
+// serviceNameRegex conservatively restricts service/unit names to avoid
+// argument injection; ExecuteCommand always passes args to os/exec directly
+// (never a shell), but this keeps inputs to a well-formed systemd unit name.
+var serviceNameRegex = regexp.MustCompile(`^[A-Za-z0-9@._-]+$`)
 
 // Build information, injected at build time via -ldflags.
 var (
@@ -287,6 +302,25 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 				"properties": map[string]interface{}{},
 			},
 		},
+		{
+			"name":        "service_control",
+			"description": "Typed, structured control of a systemd service — a safer alternative to free-form run_command. Still enforced by the agent's command allowlist.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"action": map[string]interface{}{
+						"type":        "string",
+						"description": "The service action to perform. One of: start, stop, restart, status",
+						"enum":        []string{"start", "stop", "restart", "status"},
+					},
+					"service": map[string]interface{}{
+						"type":        "string",
+						"description": "The service/unit name to control (e.g. nginx, sshd.service)",
+					},
+				},
+				"required": []string{"action", "service"},
+			},
+		},
 	}
 
 	response := JsonRpcResponse{
@@ -359,6 +393,49 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 		}
 
 		output, err := command.ExecuteCommand(cmdArgs.Name, cmdArgs.Args, cfg.AllowedCommands)
+
+		var textContent string
+		if err != nil {
+			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+		} else {
+			textContent = output
+		}
+
+		response := JsonRpcResponse{
+			JsonRpc: "2.0",
+			Result: map[string]interface{}{
+				"content": []map[string]interface{}{
+					{
+						"type": "text",
+						"text": textContent,
+					},
+				},
+			},
+			ID: req.ID,
+		}
+		sendResponse(w, response)
+
+	case "service_control":
+		var svcArgs ServiceControlArgs
+		if err := json.Unmarshal(params.Arguments, &svcArgs); err != nil {
+			sendError(w, req.ID, -32602, "Invalid service_control arguments")
+			return
+		}
+
+		switch svcArgs.Action {
+		case "start", "stop", "restart", "status":
+			// allowed
+		default:
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid action %q: must be one of start, stop, restart, status", svcArgs.Action))
+			return
+		}
+
+		if svcArgs.Service == "" || !serviceNameRegex.MatchString(svcArgs.Service) {
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid service name %q", svcArgs.Service))
+			return
+		}
+
+		output, err := command.ExecuteCommand("systemctl", []string{svcArgs.Action, svcArgs.Service}, cfg.AllowedCommands)
 
 		var textContent string
 		if err != nil {
