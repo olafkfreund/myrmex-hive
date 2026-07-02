@@ -61,7 +61,7 @@
         
         myrmexPackage = pkgs.buildGoModule {
           pname = "myrmex-hive";
-          version = "0.1";
+          version = "1.0.0";
           src = ./.;
           vendorHash = null; # uses vendor directory directly
         };

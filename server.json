@@ -6,12 +6,12 @@
     "url": "https://github.com/olafkfreund/myrmex-hive",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "1.0.0",
   "packages": [
     {
       "registry_type": "oci",
       "identifier": "ghcr.io/olafkfreund/myrmex-hive-gateway",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "runtime_hint": "docker",
       "transport": {
         "type": "stdio"
