@@ -1,3 +1,6 @@
 
 # Script-generated local test fixtures (see setup_test_env.sh)
 test_env/
+
+# runtime artifact
+audit.log
