@@ -132,6 +132,27 @@ var (
 	date    = "unknown"
 )
 
+// toolSchemaVersion identifies the shape of the tool definitions advertised
+// via tools/list (name/description/inputSchema for each tool). Bump this
+// whenever a tool's schema changes in an incompatible way so the gateway and
+// other clients can detect and adapt to the change.
+const toolSchemaVersion = "1"
+
+// supportedToolNames is the list of tool names this agent advertises via
+// tools/list. Kept in sync with handleListTools and surfaced via
+// get_system_info's SupportedTools field for capability discovery.
+var supportedToolNames = []string{
+	"get_metrics",
+	"run_command",
+	"read_logs",
+	"get_system_info",
+	"service_control",
+	"container_ps",
+	"k8s_get",
+	"package_query",
+	"file_read",
+}
+
 func main() {
 	configPath := flag.String("config", "agent_config.json", "Path to agent configuration file")
 	showVersion := flag.Bool("version", false, "Print version information and exit")
@@ -312,16 +333,18 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 	// List the tools this agent supports
 	tools := []map[string]interface{}{
 		{
-			"name":        "get_metrics",
-			"description": "Retrieve system CPU, memory, load average, and disk usage metrics",
+			"name":          "get_metrics",
+			"description":   "Retrieve system CPU, memory, load average, and disk usage metrics",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type":       "object",
 				"properties": map[string]interface{}{},
 			},
 		},
 		{
-			"name":        "run_command",
-			"description": "Run an approved command from the agent allowlist",
+			"name":          "run_command",
+			"description":   "Run an approved command from the agent allowlist",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -345,8 +368,9 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 			},
 		},
 		{
-			"name":        "read_logs",
-			"description": "Read recent system log entries",
+			"name":          "read_logs",
+			"description":   "Read recent system log entries",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -358,16 +382,18 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 			},
 		},
 		{
-			"name":        "get_system_info",
-			"description": "Retrieve agent operating system version, running services, and open TCP ports",
+			"name":          "get_system_info",
+			"description":   "Retrieve agent operating system version, running services, and open TCP ports",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type":       "object",
 				"properties": map[string]interface{}{},
 			},
 		},
 		{
-			"name":        "service_control",
-			"description": "Typed, structured control of a systemd service — a safer alternative to free-form run_command. Still enforced by the agent's command allowlist.",
+			"name":          "service_control",
+			"description":   "Typed, structured control of a systemd service — a safer alternative to free-form run_command. Still enforced by the agent's command allowlist.",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -385,8 +411,9 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 			},
 		},
 		{
-			"name":        "container_ps",
-			"description": "List Docker containers on the host (read-only). Enforced by the agent's command allowlist; requires the docker binary to be allowlisted.",
+			"name":          "container_ps",
+			"description":   "List Docker containers on the host (read-only). Enforced by the agent's command allowlist; requires the docker binary to be allowlisted.",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -398,8 +425,9 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 			},
 		},
 		{
-			"name":        "k8s_get",
-			"description": "Read-only Kubernetes resource listing via `kubectl get`. Enforced by the agent's command allowlist; requires the kubectl binary to be allowlisted.",
+			"name":          "k8s_get",
+			"description":   "Read-only Kubernetes resource listing via `kubectl get`. Enforced by the agent's command allowlist; requires the kubectl binary to be allowlisted.",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -416,8 +444,9 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 			},
 		},
 		{
-			"name":        "package_query",
-			"description": "Typed, read-only query of installed OS packages via the system package manager (dpkg, rpm, apk, pacman, or dnf). Enforced by the agent's command allowlist; requires the corresponding package manager binary to be allowlisted.",
+			"name":          "package_query",
+			"description":   "Typed, read-only query of installed OS packages via the system package manager (dpkg, rpm, apk, pacman, or dnf). Enforced by the agent's command allowlist; requires the corresponding package manager binary to be allowlisted.",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -435,8 +464,9 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 			},
 		},
 		{
-			"name":        "file_read",
-			"description": "Bounded, read-only read of a file on the agent host via `cat` (output truncated to 64KB). The agent's command allowlist — specifically the args_regex configured for the cat entry — is the actual security boundary governing which paths may be read; this tool additionally rejects non-absolute paths and path traversal (\"..\") client-side.",
+			"name":          "file_read",
+			"description":   "Bounded, read-only read of a file on the agent host via `cat` (output truncated to 64KB). The agent's command allowlist — specifically the args_regex configured for the cat entry — is the actual security boundary governing which paths may be read; this tool additionally rejects non-absolute paths and path traversal (\"..\") client-side.",
+			"schemaVersion": toolSchemaVersion,
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -471,9 +501,12 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 	switch params.Name {
 	case "get_system_info":
 		info := SystemInfo{
-			OSVersion:       getOSVersion(),
-			RunningServices: getRunningServices(),
-			OpenPorts:       getOpenPorts(),
+			OSVersion:         getOSVersion(),
+			RunningServices:   getRunningServices(),
+			OpenPorts:         getOpenPorts(),
+			AgentVersion:      version,
+			ToolSchemaVersion: toolSchemaVersion,
+			SupportedTools:    supportedToolNames,
 		}
 		infoJSON, _ := json.Marshal(info)
 		response := JsonRpcResponse{
@@ -884,6 +917,13 @@ type SystemInfo struct {
 	OSVersion       string   `json:"os_version"`
 	RunningServices []string `json:"running_services"`
 	OpenPorts       []string `json:"open_ports"`
+
+	// Capability advertisement fields — let the gateway/clients discover
+	// which agent build and tool schema version they're talking to, and
+	// which tools this agent supports, without a separate handshake.
+	AgentVersion      string   `json:"agent_version"`
+	ToolSchemaVersion string   `json:"tool_schema_version"`
+	SupportedTools    []string `json:"supported_tools"`
 }
 
 func getOSVersion() string {
