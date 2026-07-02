@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,8 +12,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -441,4 +445,193 @@ func TestAuthorizeToolCall(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestToolTier(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *config.GatewayConfig
+		tool string
+		want string
+	}{
+		{
+			name: "nil config defaults to read",
+			cfg:  nil,
+			tool: "run_command",
+			want: "read",
+		},
+		{
+			name: "unconfigured risk tiers defaults to read",
+			cfg:  &config.GatewayConfig{},
+			tool: "run_command",
+			want: "read",
+		},
+		{
+			name: "unlisted tool defaults to read",
+			cfg:  &config.GatewayConfig{RiskTiers: map[string]string{"service_control": "mutate"}},
+			tool: "get_metrics",
+			want: "read",
+		},
+		{
+			name: "listed tool returns configured tier",
+			cfg:  &config.GatewayConfig{RiskTiers: map[string]string{"run_command": "destructive"}},
+			tool: "run_command",
+			want: "destructive",
+		},
+		{
+			name: "listed mutate tier",
+			cfg:  &config.GatewayConfig{RiskTiers: map[string]string{"service_control": "mutate"}},
+			tool: "service_control",
+			want: "mutate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := toolTier(tt.cfg, tt.tool); got != tt.want {
+				t.Errorf("toolTier(%+v, %q) = %q, want %q", tt.cfg, tt.tool, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRateLimitAllow(t *testing.T) {
+	const limit = 3
+	key := "TestRateLimitAllow|token|agent|run_command"
+
+	for i := 0; i < limit; i++ {
+		if !rateLimitAllow(key, limit) {
+			t.Fatalf("call %d: expected allow within limit %d", i+1, limit)
+		}
+	}
+	if rateLimitAllow(key, limit) {
+		t.Fatalf("call %d: expected block once over limit %d", limit+1, limit)
+	}
+
+	// A distinct key gets its own independent window and is unaffected by a
+	// different key's exhausted window.
+	otherKey := "TestRateLimitAllow|other-token|agent|run_command"
+	if !rateLimitAllow(otherKey, limit) {
+		t.Errorf("expected distinct key to have its own independent window")
+	}
+
+	// perMinute <= 0 disables rate limiting entirely, regardless of history.
+	if !rateLimitAllow(key, 0) {
+		t.Errorf("expected rateLimitAllow to always allow when perMinute <= 0")
+	}
+}
+
+func TestApprovalStoreTransitions(t *testing.T) {
+	// logAuditEvent (invoked by every approval decision) reads currentConfig
+	// for the configured audit log path. Production always sets it in
+	// main() before serving requests, but this test binary never calls
+	// main(), so seed a minimal config pointed at a scratch file and restore
+	// whatever was there afterward.
+	currentConfigMu.Lock()
+	prevCfg := currentConfig
+	currentConfig = &config.GatewayConfig{AuditLogPath: filepath.Join(t.TempDir(), "audit.log")}
+	currentConfigMu.Unlock()
+	t.Cleanup(func() {
+		currentConfigMu.Lock()
+		currentConfig = prevCfg
+		currentConfigMu.Unlock()
+	})
+
+	adminCtx := context.WithValue(context.Background(), contextKeyRole, "admin")
+	adminCtx = context.WithValue(adminCtx, contextKeyToken, "admin-token-1234")
+
+	newDecisionRequest := func(ctx context.Context, id, decision string) *http.Request {
+		body := fmt.Sprintf(`{"id":%q,"decision":%q}`, id, decision)
+		req := httptest.NewRequest(http.MethodPost, "/api/approvals", strings.NewReader(body))
+		return req.WithContext(ctx)
+	}
+
+	t.Run("create then approve", func(t *testing.T) {
+		approval, err := createPendingApproval(adminCtx, "no-such-agent", "run_command", `{"name":"uptime"}`, "destructive")
+		if err != nil {
+			t.Fatalf("createPendingApproval failed: %v", err)
+		}
+		if approval.Status != "pending" {
+			t.Fatalf("expected new approval status %q, got %q", "pending", approval.Status)
+		}
+
+		rec := httptest.NewRecorder()
+		handleApiApprovalDecision(rec, newDecisionRequest(adminCtx, approval.ID, "approve"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 approving a pending request, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		approvalsMu.Lock()
+		gotStatus := approvals[approval.ID].Status
+		approvalsMu.Unlock()
+		if gotStatus != "approved" {
+			t.Errorf("expected stored status %q, got %q", "approved", gotStatus)
+		}
+
+		// Re-deciding an already-decided approval must fail, not silently
+		// re-execute the underlying tool call.
+		rec2 := httptest.NewRecorder()
+		handleApiApprovalDecision(rec2, newDecisionRequest(adminCtx, approval.ID, "approve"))
+		if rec2.Code != http.StatusConflict {
+			t.Errorf("expected 409 re-deciding an already-approved request, got %d", rec2.Code)
+		}
+	})
+
+	t.Run("create then reject", func(t *testing.T) {
+		approval, err := createPendingApproval(adminCtx, "no-such-agent", "run_command", `{"name":"rm"}`, "destructive")
+		if err != nil {
+			t.Fatalf("createPendingApproval failed: %v", err)
+		}
+
+		rec := httptest.NewRecorder()
+		handleApiApprovalDecision(rec, newDecisionRequest(adminCtx, approval.ID, "reject"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 rejecting a pending request, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response body: %v", err)
+		}
+		if resp["status"] != "rejected" {
+			t.Errorf("expected response status %q, got %q", "rejected", resp["status"])
+		}
+
+		approvalsMu.Lock()
+		gotStatus := approvals[approval.ID].Status
+		approvalsMu.Unlock()
+		if gotStatus != "rejected" {
+			t.Errorf("expected stored status %q, got %q", "rejected", gotStatus)
+		}
+	})
+
+	t.Run("unknown id returns 404", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		handleApiApprovalDecision(rec, newDecisionRequest(adminCtx, "does-not-exist", "approve"))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected 404 for unknown approval id, got %d", rec.Code)
+		}
+	})
+
+	t.Run("non-admin role forbidden", func(t *testing.T) {
+		approval, err := createPendingApproval(adminCtx, "no-such-agent", "run_command", `{}`, "destructive")
+		if err != nil {
+			t.Fatalf("createPendingApproval failed: %v", err)
+		}
+
+		operatorCtx := context.WithValue(context.Background(), contextKeyRole, "operator")
+		rec := httptest.NewRecorder()
+		handleApiApprovalDecision(rec, newDecisionRequest(operatorCtx, approval.ID, "approve"))
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("expected 403 for non-admin decision, got %d", rec.Code)
+		}
+
+		// The approval must remain untouched by the rejected attempt.
+		approvalsMu.Lock()
+		gotStatus := approvals[approval.ID].Status
+		approvalsMu.Unlock()
+		if gotStatus != "pending" {
+			t.Errorf("expected approval to remain pending after forbidden decision, got %q", gotStatus)
+		}
+	})
 }

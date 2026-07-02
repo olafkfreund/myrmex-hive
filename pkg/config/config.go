@@ -81,6 +81,20 @@ type GatewayConfig struct {
 	// AllowedOrigins is the CORS allowlist of browser origins permitted to make
 	// cross-origin requests to the gateway HTTP API. Empty means same-origin only.
 	AllowedOrigins []string `json:"allowed_origins,omitempty"`
+	// RiskTiers maps an unprefixed tool name (e.g. "run_command",
+	// "service_control", "get_metrics") to a risk tier: "read", "mutate", or
+	// "destructive". Tools not listed default to "read". Used together with
+	// RequireApprovalTiers and RateLimitPerMinute to gate risky calls.
+	RiskTiers map[string]string `json:"risk_tiers,omitempty"`
+	// RequireApprovalTiers lists the risk tiers that must be approved by an
+	// admin (via the gateway's /api/approvals endpoint) before executing.
+	// Empty/unset means no calls require approval, preserving backward
+	// compatibility.
+	RequireApprovalTiers []string `json:"require_approval_tiers,omitempty"`
+	// RateLimitPerMinute caps the number of tool calls allowed per minute for
+	// a given (token, agent, tool) combination. 0 (the default) disables rate
+	// limiting entirely.
+	RateLimitPerMinute int `json:"rate_limit_per_minute,omitempty"`
 }
 
 // resolveSecret resolves indirect secret references so secret-bearing config

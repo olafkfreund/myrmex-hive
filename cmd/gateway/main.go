@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -95,14 +96,15 @@ var hostKeySigner ssh.Signer
 
 var rolePermissions = map[string]map[string]bool{
 	"admin": {
-		"/sse":        true,
-		"/message":    true,
-		"/api/status": true,
-		"/api/config": true,
-		"/api/keys":   true,
-		"/api/call":   true,
-		"/api/tools":  true,
-		"/api/chat":   true,
+		"/sse":           true,
+		"/message":       true,
+		"/api/status":    true,
+		"/api/config":    true,
+		"/api/keys":      true,
+		"/api/call":      true,
+		"/api/tools":     true,
+		"/api/chat":      true,
+		"/api/approvals": true,
 	},
 	"operator": {
 		"/sse":        true,
@@ -111,6 +113,10 @@ var rolePermissions = map[string]map[string]bool{
 		"/api/call":   true,
 		"/api/tools":  true,
 		"/api/chat":   true,
+		// Operators may list pending approvals but deciding them (POST) is
+		// restricted to admins inside handleApiApprovalDecision, since
+		// rolePermissions only gates by path, not by HTTP method.
+		"/api/approvals": true,
 	},
 	"read-only": {
 		"/api/status": true,
@@ -171,6 +177,21 @@ func authorizeToolCall(scope *config.TokenScope, agentTags map[string][]string, 
 	}
 
 	return nil
+}
+
+// toolTier returns the configured risk tier for an unprefixed tool name
+// ("run_command", "service_control", ...), defaulting to "read" when the
+// tool is unlisted in RiskTiers or cfg is nil. Defaulting to "read" means an
+// unconfigured RiskTiers map never gates or throttles any call, preserving
+// backward compatibility.
+func toolTier(cfg *config.GatewayConfig, tool string) string {
+	if cfg == nil {
+		return "read"
+	}
+	if tier, ok := cfg.RiskTiers[tool]; ok && tier != "" {
+		return tier
+	}
+	return "read"
 }
 
 func normalizeID(id interface{}) string {
@@ -1210,6 +1231,7 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	http.HandleFunc("/api/call", requireAuth(handleApiCall))
 	http.HandleFunc("/api/tools", requireAuth(handleApiTools))
 	http.HandleFunc("/api/chat", requireAuth(handleApiChat))
+	http.HandleFunc("/api/approvals", requireAuth(handleApiApprovals))
 	http.HandleFunc("/logo.png", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "assets/images/logo.png")
 	})
@@ -1280,18 +1302,24 @@ var (
 	lastAuditSig string // chained hash of the previous audit entry; guarded by auditLogMu
 )
 
+// anonymizeToken redacts a bearer token to a short prefix/suffix so it can be
+// safely recorded in audit log entries and pending approvals without
+// exposing the full credential.
+func anonymizeToken(token string) string {
+	if token == "" {
+		return "none"
+	}
+	if len(token) > 8 {
+		return token[:4] + "..." + token[len(token)-4:]
+	}
+	return "..."
+}
+
 func logAuditEvent(ctx context.Context, action, agentID, command, status, details string) {
 	token, _ := ctx.Value(contextKeyToken).(string)
 	role, _ := ctx.Value(contextKeyRole).(string)
 
-	anonymizedToken := "none"
-	if token != "" {
-		if len(token) > 8 {
-			anonymizedToken = token[:4] + "..." + token[len(token)-4:]
-		} else {
-			anonymizedToken = "..."
-		}
-	}
+	anonymizedToken := anonymizeToken(token)
 	if role == "" {
 		role = "system"
 	}
@@ -1385,6 +1413,137 @@ func seedLastAuditSig(logPath string) {
 	auditLogMu.Lock()
 	lastAuditSig = entry.Signature
 	auditLogMu.Unlock()
+}
+
+// rateLimitWindows tracks, per key, the timestamps of recent calls within the
+// trailing 60s window. Guarded by rateLimitMu. Opt-in: only consulted when
+// GatewayConfig.RateLimitPerMinute > 0.
+var (
+	rateLimitMu      sync.Mutex
+	rateLimitWindows = map[string][]time.Time{}
+)
+
+// rateLimitAllow implements a sliding-window rate limit keyed by an arbitrary
+// caller-supplied string (typically token|agentID|tool). It records the
+// current call and returns false once more than perMinute calls have
+// occurred in the trailing 60 seconds for that key. perMinute <= 0 always
+// allows; callers are expected to only invoke this when rate limiting is
+// enabled.
+func rateLimitAllow(key string, perMinute int) bool {
+	if perMinute <= 0 {
+		return true
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	kept := rateLimitWindows[key][:0]
+	for _, ts := range rateLimitWindows[key] {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) >= perMinute {
+		rateLimitWindows[key] = kept
+		return false
+	}
+	rateLimitWindows[key] = append(kept, now)
+	return true
+}
+
+// PendingApproval represents a risky tool call parked for human-in-the-loop
+// review before it is dispatched to an agent. Args holds the raw JSON
+// arguments so an approved call can be replayed exactly as it was submitted.
+type PendingApproval struct {
+	ID        string `json:"id"`
+	TokenID   string `json:"token_id"`
+	Role      string `json:"role"`
+	AgentID   string `json:"agent_id"`
+	Tool      string `json:"tool"`
+	Args      string `json:"args"`
+	Tier      string `json:"tier"`
+	CreatedAt string `json:"created_at"`
+	Status    string `json:"status"` // "pending", "approved", or "rejected"
+}
+
+// approvalTTL bounds how long a pending approval remains actionable. Kept
+// simple: approvals older than this are treated as expired when decided
+// (approved/rejected), though they remain visible in the audit trail.
+const approvalTTL = 15 * time.Minute
+
+var (
+	approvalsMu sync.Mutex
+	approvals   = map[string]*PendingApproval{}
+)
+
+// newApprovalID generates a random hex identifier for a pending approval.
+func newApprovalID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// requiresApproval reports whether tier is one of the configured
+// RequireApprovalTiers. An empty/unset list means nothing requires approval,
+// preserving backward compatibility.
+func requiresApproval(cfg *config.GatewayConfig, tier string) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, t := range cfg.RequireApprovalTiers {
+		if t == tier {
+			return true
+		}
+	}
+	return false
+}
+
+// approvalExpired reports whether a pending approval is older than
+// approvalTTL and should no longer be approvable/rejectable.
+func approvalExpired(a *PendingApproval) bool {
+	created, err := time.Parse(time.RFC3339, a.CreatedAt)
+	if err != nil {
+		// Unparseable timestamp should never happen (we always write it via
+		// time.Now().UTC().Format(time.RFC3339)); treat as not expired rather
+		// than fail closed on a formatting bug.
+		return false
+	}
+	return time.Since(created) > approvalTTL
+}
+
+// createPendingApproval records a risky tool call for later human review.
+// The caller's token/role are pulled from ctx, which requireAuth populates.
+func createPendingApproval(ctx context.Context, agentID, tool, args, tier string) (*PendingApproval, error) {
+	id, err := newApprovalID()
+	if err != nil {
+		return nil, err
+	}
+	token, _ := ctx.Value(contextKeyToken).(string)
+	role, _ := ctx.Value(contextKeyRole).(string)
+	if role == "" {
+		role = "system"
+	}
+	approval := &PendingApproval{
+		ID:        id,
+		TokenID:   anonymizeToken(token),
+		Role:      role,
+		AgentID:   agentID,
+		Tool:      tool,
+		Args:      args,
+		Tier:      tier,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Status:    "pending",
+	}
+
+	approvalsMu.Lock()
+	approvals[id] = approval
+	approvalsMu.Unlock()
+
+	return approval, nil
 }
 
 // setCORS applies a strict CORS policy based on the configured AllowedOrigins
@@ -2269,26 +2428,59 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	parts := strings.SplitN(body.Name, "__", 2)
+	agentID := "gateway"
+	toolName := body.Name
+	if len(parts) == 2 {
+		agentID = parts[0]
+		toolName = parts[1]
+	}
+
 	// Enforce per-token agent/tool scoping (see authorizeToolCall) before
 	// dispatching the call. A nil scope (legacy Tokens/AuthToken) is
 	// unrestricted.
-	{
-		parts := strings.SplitN(body.Name, "__", 2)
-		agentID := "gateway"
-		toolName := body.Name
-		if len(parts) == 2 {
-			agentID = parts[0]
-			toolName = parts[1]
-		}
-		scope, _ := r.Context().Value(contextKeyScope).(*config.TokenScope)
-		currentConfigMu.RLock()
-		agentTags := currentConfig.AgentTags
-		currentConfigMu.RUnlock()
-		if err := authorizeToolCall(scope, agentTags, agentID, toolName); err != nil {
-			logAuditEvent(r.Context(), "authz_denied", agentID, toolName+" "+string(body.Arguments), "failure", err.Error())
-			http.Error(w, err.Error(), http.StatusForbidden)
+	scope, _ := r.Context().Value(contextKeyScope).(*config.TokenScope)
+	currentConfigMu.RLock()
+	agentTags := currentConfig.AgentTags
+	cfg := currentConfig
+	currentConfigMu.RUnlock()
+	if err := authorizeToolCall(scope, agentTags, agentID, toolName); err != nil {
+		logAuditEvent(r.Context(), "authz_denied", agentID, toolName+" "+string(body.Arguments), "failure", err.Error())
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	// Rate limiting: opt-in via RateLimitPerMinute (0, the default, disables
+	// it). Keyed by token+agent+tool so one caller hammering a single tool
+	// doesn't affect its other calls or other callers.
+	if cfg.RateLimitPerMinute > 0 {
+		token, _ := r.Context().Value(contextKeyToken).(string)
+		key := token + "|" + agentID + "|" + toolName
+		if !rateLimitAllow(key, cfg.RateLimitPerMinute) {
+			logAuditEvent(r.Context(), "rate_limited", agentID, toolName+" "+string(body.Arguments), "failure", "rate limit exceeded")
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
+	}
+
+	// Human-in-the-loop approval: opt-in via RequireApprovalTiers (empty by
+	// default). A risky call is parked instead of dispatched; an admin
+	// approves or rejects it via /api/approvals.
+	tier := toolTier(cfg, toolName)
+	if requiresApproval(cfg, tier) {
+		approval, err := createPendingApproval(r.Context(), agentID, toolName, string(body.Arguments), tier)
+		if err != nil {
+			logAuditEvent(r.Context(), "approval_requested", agentID, toolName+" "+string(body.Arguments), "failure", err.Error())
+			http.Error(w, "Failed to create approval request", http.StatusInternalServerError)
+			return
+		}
+		logAuditEvent(r.Context(), "approval_requested", agentID, toolName+" "+string(body.Arguments), "pending", "tier="+tier)
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":      "pending_approval",
+			"approval_id": approval.ID,
+		})
+		return
 	}
 
 	argsBytes, _ := json.Marshal(body.Arguments)
@@ -2319,25 +2511,129 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 			errBytes, _ := json.Marshal(resp.Error)
 			details = string(errBytes)
 		}
-		parts := strings.SplitN(body.Name, "__", 2)
-		agentID := "gateway"
-		toolName := body.Name
-		if len(parts) == 2 {
-			agentID = parts[0]
-			toolName = parts[1]
-		}
 		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), status, details)
 		json.NewEncoder(w).Encode(resp)
 	case <-time.After(35 * time.Second):
-		parts := strings.SplitN(body.Name, "__", 2)
-		agentID := "gateway"
-		toolName := body.Name
-		if len(parts) == 2 {
-			agentID = parts[0]
-			toolName = parts[1]
-		}
 		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), "failure", "Gateway timeout")
 		http.Error(w, "Request timed out", http.StatusGatewayTimeout)
+	}
+}
+
+// handleApiApprovals serves the human-in-the-loop approval queue: GET lists
+// pending approvals (admin and operator, per rolePermissions), POST records
+// an admin's approve/reject decision (enforced inside
+// handleApiApprovalDecision since rolePermissions only gates by path).
+func handleApiApprovals(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	setCORS(w, r)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		approvalsMu.Lock()
+		list := make([]*PendingApproval, 0, len(approvals))
+		for _, a := range approvals {
+			if a.Status == "pending" {
+				list = append(list, a)
+			}
+		}
+		approvalsMu.Unlock()
+		json.NewEncoder(w).Encode(list)
+	case http.MethodPost:
+		handleApiApprovalDecision(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleApiApprovalDecision applies an admin's approve/reject decision to a
+// pending approval identified by body.ID. On approve, it replays the stored
+// call through the same handleClientRequest/done-channel dispatch path
+// handleApiCall uses. Admin-only: this is the actual enforcement point,
+// since rolePermissions only gates /api/approvals by path (both admin and
+// operator may reach this handler for GET).
+func handleApiApprovalDecision(w http.ResponseWriter, r *http.Request) {
+	role, _ := r.Context().Value(contextKeyRole).(string)
+	if role != "admin" {
+		http.Error(w, "Forbidden: only admins may decide approvals", http.StatusForbidden)
+		return
+	}
+
+	var body struct {
+		ID       string `json:"id"`
+		Decision string `json:"decision"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	approvalsMu.Lock()
+	approval, ok := approvals[body.ID]
+	if !ok {
+		approvalsMu.Unlock()
+		http.Error(w, "Approval not found", http.StatusNotFound)
+		return
+	}
+	if approval.Status != "pending" {
+		status := approval.Status
+		approvalsMu.Unlock()
+		http.Error(w, fmt.Sprintf("Approval %s already %s", body.ID, status), http.StatusConflict)
+		return
+	}
+	if approvalExpired(approval) {
+		approvalsMu.Unlock()
+		http.Error(w, "Approval request expired", http.StatusGone)
+		return
+	}
+
+	switch body.Decision {
+	case "approve":
+		approval.Status = "approved"
+		approvalsMu.Unlock()
+
+		callParams := CallToolParams{
+			Name:      approval.AgentID + "__" + approval.Tool,
+			Arguments: json.RawMessage(approval.Args),
+		}
+		callParamsBytes, _ := json.Marshal(callParams)
+		req := JsonRpcRequest{
+			JsonRpc: "2.0",
+			Method:  "tools/call",
+			Params:  callParamsBytes,
+			ID:      "approval-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		}
+
+		done := make(chan JsonRpcResponse, 1)
+		go handleClientRequest(req, func(resp JsonRpcResponse) { done <- resp })
+
+		select {
+		case resp := <-done:
+			status := "success"
+			details := "Approved tool execution completed"
+			if resp.Error != nil {
+				status = "failure"
+				errBytes, _ := json.Marshal(resp.Error)
+				details = string(errBytes)
+			}
+			logAuditEvent(r.Context(), "approval_granted", approval.AgentID, approval.Tool+" "+approval.Args, status, details)
+			json.NewEncoder(w).Encode(resp)
+		case <-time.After(35 * time.Second):
+			logAuditEvent(r.Context(), "approval_granted", approval.AgentID, approval.Tool+" "+approval.Args, "failure", "Gateway timeout")
+			http.Error(w, "Request timed out", http.StatusGatewayTimeout)
+		}
+	case "reject":
+		approval.Status = "rejected"
+		approvalsMu.Unlock()
+		logAuditEvent(r.Context(), "approval_rejected", approval.AgentID, approval.Tool+" "+approval.Args, "success", "Approval rejected by operator")
+		json.NewEncoder(w).Encode(map[string]string{"status": "rejected"})
+	default:
+		approvalsMu.Unlock()
+		http.Error(w, "decision must be 'approve' or 'reject'", http.StatusBadRequest)
 	}
 }
 
