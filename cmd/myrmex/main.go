@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,8 +100,12 @@ func main() {
 	}
 
 	// "audit verify" runs entirely against a local log file and host key, so it
-	// does not require a Gateway auth token.
-	if cfg.Token == "" && cmd != "audit" {
+	// does not require a Gateway auth token. "enroll", "bootstrap", and
+	// "rotate" redeem a one-time join token as their credential instead of a
+	// bearer token (an admin --token is only needed if they must mint that
+	// join token themselves) — each validates its own auth requirements.
+	noBearerRequired := cmd == "audit" || cmd == "enroll" || cmd == "bootstrap" || cmd == "rotate"
+	if cfg.Token == "" && !noBearerRequired {
 		fmt.Fprintln(os.Stderr, "Error: Secure Gateway Auth Token is required. Use --token flag or set MYRMEX_TOKEN environment variable.")
 		os.Exit(1)
 	}
@@ -129,6 +136,14 @@ func main() {
 		handleAsk(client, cfg, cmdArgs)
 	case "audit":
 		handleAudit(cfg, cmdArgs)
+	case "enroll-token":
+		handleEnrollToken(client, cfg, cmdArgs)
+	case "enroll":
+		handleEnroll(client, cfg, cmdArgs)
+	case "bootstrap":
+		handleBootstrap(client, cfg, cmdArgs)
+	case "rotate":
+		handleRotate(client, cfg, cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown command %q\nRun 'myrmex --help' for details.\n", cmd)
 		os.Exit(1)
@@ -153,6 +168,10 @@ Commands:
   audit watch   Poll the audit log and alert (exit non-zero) on tamper
   audit export  Export the audit log as JSON or CSV for archival/review
   audit pubkey  Print the gateway host public key for external auditors
+  enroll-token  Mint a join token for a new agent-id (admin --token)
+  enroll        Redeem a join token to register an agent's public key
+  bootstrap     One-command onboarding: generate keypair + enroll + write config
+  rotate        Enroll a replacement public key for an existing agent-id
 
 Global Options:
   --url         Gateway API base URL (default: https://localhost:8080)
@@ -188,6 +207,16 @@ Real-Life Scenarios:
   9. Print the gateway host public key to hand to an external auditor:
      myrmex audit pubkey --host-key host_key.pub
 
+  10. Onboard a brand-new agent with one command (mints its own join token):
+      myrmex bootstrap --agent-id agent-4 --gateway-addr gateway.example.com:2222 --token <admin-token>
+
+  11. Mint a join token yourself, then redeem it on the agent host:
+      myrmex enroll-token --agent-id agent-4 --token <admin-token>
+      myrmex enroll --join-token <token> --agent-id agent-4 --public-key-file id_ed25519.pub
+
+  12. Rotate an existing agent's key after a suspected compromise:
+      myrmex rotate --agent-id agent-4 --public-key-file id_ed25519_new.pub --token <admin-token>
+
 Audit Verify Options:
   --log         Path to the audit log file (default: audit.log)
   --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
@@ -214,6 +243,42 @@ Audit Export Options:
 Audit Pubkey Options:
   --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
                 authorized-key format, e.g. host_key.pub (required)
+
+Enroll-Token Options:
+  --agent-id    Agent ID the token will be bound to (required)
+  (Requires an admin --token / MYRMEX_TOKEN.)
+
+Enroll Options:
+  --join-token       One-time join token from 'enroll-token' (required)
+  --agent-id         Agent ID being enrolled, must match the token (required)
+  --public-key-file  Path to the agent's OpenSSH PUBLIC key file (required)
+  (No bearer --token is needed: the join token IS the credential.)
+
+Bootstrap Options:
+  --agent-id       Agent ID to onboard (required)
+  --gateway-addr   Gateway SSH address, host:port (default: localhost:2222)
+  --join-token     Existing join token to redeem. If omitted, an admin
+                   --token / MYRMEX_TOKEN is used to mint one automatically.
+  --key-out        Path to write the new private key (default: ./id_ed25519)
+  --config-out     Path to write the generated agent_config.json
+                   (default: ./agent_config.json)
+
+  Generates a new Ed25519 keypair, enrolls the public half with the
+  Gateway, and writes a ready-to-run agent_config.json. One command from
+  nothing to a runnable agent.
+
+Rotate Options:
+  --agent-id         Agent ID whose key is being rotated (required)
+  --public-key-file  Path to the NEW OpenSSH PUBLIC key file (required)
+  --join-token       Existing join token to redeem. If omitted, an admin
+                     --token / MYRMEX_TOKEN is used to mint one automatically.
+  --revoke-old       After enrolling the new key, also revoke the agent's
+                     old keys via /api/agents/revoke. NOTE: revocation
+                     removes ALL authorized_keys entries for this agent-id,
+                     including the one just enrolled, and drops any live
+                     session. Only pass this once the new key is confirmed
+                     working, then re-enroll if needed — see
+                     docs/ENROLLMENT.md for the recommended sequence.
 `
 	fmt.Print(helpText)
 }
@@ -1186,6 +1251,447 @@ func handleAuditPubkey(args []string) {
 
 	fmt.Fprintf(os.Stderr, "Gateway host public key (%s) — give this to auditors to verify audit-log signatures with 'myrmex audit verify':\n", pub.Type())
 	fmt.Println(strings.TrimSpace(string(keyBytes)))
+}
+
+// --- Agent enrollment, bootstrap, and rotation (Lifecycle epics #61, #49) ---
+//
+// These commands drive the gateway's join-token enrollment endpoints
+// (POST /api/enroll/token, POST /api/enroll) and its revocation endpoint
+// (POST /api/agents/revoke). See docs/ENROLLMENT.md for the full lifecycle
+// this implements: mint token -> enroll -> connect -> rotate/revoke.
+
+// makeUnauthRequest is like makeRequest but omits the Authorization header.
+// It exists because POST /api/enroll is deliberately unauthenticated on the
+// gateway side — the join token itself is the one-time credential — so
+// sending a (possibly empty or stale) bearer token would be misleading.
+func makeUnauthRequest(client *http.Client, cfg Config, method, path string, body io.Reader) ([]byte, error) {
+	reqURL := strings.TrimRight(cfg.URL, "/") + path
+	req, err := http.NewRequest(method, reqURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
+}
+
+// mintJoinToken calls the admin-only POST /api/enroll/token and returns the
+// minted join token and its expiry timestamp.
+func mintJoinToken(client *http.Client, cfg Config, agentID string) (joinToken, expiresAt string, err error) {
+	reqBody, _ := json.Marshal(map[string]string{"agent_id": agentID})
+	data, err := makeRequest(client, cfg, "POST", "/api/enroll/token", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", "", err
+	}
+
+	var resp struct {
+		JoinToken string `json:"join_token"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", "", fmt.Errorf("parsing enroll-token response: %w", err)
+	}
+	return resp.JoinToken, resp.ExpiresAt, nil
+}
+
+// enrollPublicKey redeems a join token via the unauthenticated POST
+// /api/enroll, registering publicKey (an OpenSSH authorized-key line) under
+// agentID.
+func enrollPublicKey(client *http.Client, cfg Config, joinToken, agentID, publicKey string) (map[string]interface{}, error) {
+	reqBody, _ := json.Marshal(map[string]string{
+		"join_token": joinToken,
+		"agent_id":   agentID,
+		"public_key": strings.TrimSpace(publicKey),
+	})
+
+	data, err := makeUnauthRequest(client, cfg, "POST", "/api/enroll", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("parsing enroll response: %w", err)
+	}
+	return result, nil
+}
+
+// handleEnrollToken mints a join token for a new agent-id. Admin --token
+// required.
+func handleEnrollToken(client *http.Client, cfg Config, args []string) {
+	agentID := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--agent-id" && i+1 < len(args) {
+			agentID = args[i+1]
+			i++
+		}
+	}
+
+	if agentID == "" {
+		fmt.Fprintln(os.Stderr, "Error: --agent-id <id> is required for 'enroll-token'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex enroll-token --agent-id <id> --token <admin-token>")
+		os.Exit(1)
+	}
+
+	token, expiresAt, err := mintJoinToken(client, cfg, agentID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if cfg.Output == "json" {
+		b, _ := json.MarshalIndent(map[string]string{
+			"join_token": token,
+			"agent_id":   agentID,
+			"expires_at": expiresAt,
+		}, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+
+	fmt.Printf("Join token for agent %q (expires %s):\n%s\n", agentID, expiresAt, token)
+}
+
+// handleEnroll redeems an existing join token, registering the given public
+// key file with the gateway. No bearer --token is required — the join token
+// is the credential.
+func handleEnroll(client *http.Client, cfg Config, args []string) {
+	joinToken := ""
+	agentID := ""
+	pubKeyFile := ""
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--join-token":
+			if i+1 < len(args) {
+				joinToken = args[i+1]
+				i++
+			}
+		case "--agent-id":
+			if i+1 < len(args) {
+				agentID = args[i+1]
+				i++
+			}
+		case "--public-key-file":
+			if i+1 < len(args) {
+				pubKeyFile = args[i+1]
+				i++
+			}
+		}
+	}
+
+	if joinToken == "" || agentID == "" || pubKeyFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: --join-token, --agent-id, and --public-key-file are all required for 'enroll'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex enroll --join-token <token> --agent-id <id> --public-key-file <path>")
+		os.Exit(1)
+	}
+
+	pubKeyBytes, err := os.ReadFile(pubKeyFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to read public key file %q: %v\n", pubKeyFile, err)
+		os.Exit(1)
+	}
+
+	result, err := enrollPublicKey(client, cfg, joinToken, agentID, string(pubKeyBytes))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if cfg.Output == "json" {
+		b, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+
+	fmt.Printf("Agent %q enrolled successfully.\n", agentID)
+}
+
+// generateAgentKeypair creates a new Ed25519 keypair for an agent, returning
+// its OpenSSH authorized-key line (comment set to agentID) and its OpenSSH
+// PEM-encoded private key bytes.
+func generateAgentKeypair(agentID string) (authorizedKeyLine string, privatePEM []byte, err error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", nil, fmt.Errorf("generating ed25519 keypair: %w", err)
+	}
+
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return "", nil, fmt.Errorf("converting public key: %w", err)
+	}
+	authorizedKeyLine = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))) + " " + agentID
+
+	pemBlock, err := ssh.MarshalPrivateKey(priv, agentID)
+	if err != nil {
+		return "", nil, fmt.Errorf("marshaling private key: %w", err)
+	}
+	privatePEM = pem.EncodeToMemory(pemBlock)
+
+	return authorizedKeyLine, privatePEM, nil
+}
+
+// handleBootstrap is one-command onboarding (#61): it generates a new
+// Ed25519 keypair, enrolls the public half with the gateway (minting a join
+// token first if one wasn't supplied), and writes a ready-to-run
+// agent_config.json alongside the private key.
+func handleBootstrap(client *http.Client, cfg Config, args []string) {
+	agentID := ""
+	gatewayAddr := "localhost:2222"
+	joinToken := ""
+	keyOut := "id_ed25519"
+	configOut := "agent_config.json"
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent-id":
+			if i+1 < len(args) {
+				agentID = args[i+1]
+				i++
+			}
+		case "--gateway-addr":
+			if i+1 < len(args) {
+				gatewayAddr = args[i+1]
+				i++
+			}
+		case "--join-token":
+			if i+1 < len(args) {
+				joinToken = args[i+1]
+				i++
+			}
+		case "--key-out":
+			if i+1 < len(args) {
+				keyOut = args[i+1]
+				i++
+			}
+		case "--config-out":
+			if i+1 < len(args) {
+				configOut = args[i+1]
+				i++
+			}
+		}
+	}
+
+	if agentID == "" {
+		fmt.Fprintln(os.Stderr, "Error: --agent-id <id> is required for 'bootstrap'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex bootstrap --agent-id <id> [--gateway-addr host:2222] [--join-token T] [--key-out PATH] [--config-out PATH]")
+		os.Exit(1)
+	}
+
+	if joinToken == "" {
+		if cfg.Token == "" {
+			fmt.Fprintln(os.Stderr, "Error: 'bootstrap' needs either --join-token, or an admin --token/MYRMEX_TOKEN to mint one.")
+			os.Exit(1)
+		}
+		var expiresAt string
+		var err error
+		joinToken, expiresAt, err = mintJoinToken(client, cfg, agentID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to mint join token: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Minted join token for %q (expires %s).\n", agentID, expiresAt)
+	}
+
+	authorizedKeyLine, privatePEM, err := generateAgentKeypair(agentID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(keyOut, privatePEM, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to write private key to %q: %v\n", keyOut, err)
+		os.Exit(1)
+	}
+	pubKeyOutPath := keyOut + ".pub"
+	if err := os.WriteFile(pubKeyOutPath, []byte(authorizedKeyLine+"\n"), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to write public key to %q: %v\n", pubKeyOutPath, err)
+		os.Exit(1)
+	}
+
+	if _, err := enrollPublicKey(client, cfg, joinToken, agentID, authorizedKeyLine); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to enroll public key with gateway: %v\n", err)
+		os.Exit(1)
+	}
+
+	knownHostKeyPath := keyOut + ".gateway_hostkey"
+	agentConfig := map[string]interface{}{
+		"agent_id":            agentID,
+		"gateway_addr":        gatewayAddr,
+		"private_key_path":    keyOut,
+		"known_host_key_path": knownHostKeyPath,
+		"allowed_commands":    []interface{}{},
+	}
+	configBytes, _ := json.MarshalIndent(agentConfig, "", "  ")
+	if err := os.WriteFile(configOut, configBytes, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to write agent config to %q: %v\n", configOut, err)
+		os.Exit(1)
+	}
+
+	if cfg.Output == "json" {
+		b, _ := json.MarshalIndent(map[string]string{
+			"agent_id":    agentID,
+			"key_path":    keyOut,
+			"pubkey_path": pubKeyOutPath,
+			"config_path": configOut,
+		}, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+
+	fmt.Printf("Agent %q bootstrapped successfully.\n\n", agentID)
+	fmt.Printf("  Private key: %s (0600)\n", keyOut)
+	fmt.Printf("  Public key:  %s\n", pubKeyOutPath)
+	fmt.Printf("  Config:      %s\n", configOut)
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Printf("  1. Copy %s and %s to the target host.\n", keyOut, configOut)
+	fmt.Printf("  2. Edit allowed_commands in %s to grant this agent commands.\n", configOut)
+	fmt.Printf("  3. Run: agent --config %s\n", configOut)
+	fmt.Println("     (The agent trust-on-first-use pins the gateway host key to")
+	fmt.Printf("     %s on its first successful connect.)\n", knownHostKeyPath)
+}
+
+// handleRotate enrolls a replacement public key for an existing agent-id
+// (#49). It mints a join token if one wasn't supplied, then redeems it via
+// enrollPublicKey exactly like a fresh enrollment — the gateway's
+// authorized_keys format allows multiple keys per agent-id, so the new key
+// works immediately alongside the old one. If --revoke-old is set, it then
+// calls POST /api/agents/revoke, which removes ALL keys (old AND the one
+// just enrolled) for this agent-id and drops any live session; see
+// docs/ENROLLMENT.md for the recommended re-enroll-after-revoke sequence.
+func handleRotate(client *http.Client, cfg Config, args []string) {
+	agentID := ""
+	pubKeyFile := ""
+	joinToken := ""
+	revokeOld := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--agent-id":
+			if i+1 < len(args) {
+				agentID = args[i+1]
+				i++
+			}
+		case "--public-key-file":
+			if i+1 < len(args) {
+				pubKeyFile = args[i+1]
+				i++
+			}
+		case "--join-token":
+			if i+1 < len(args) {
+				joinToken = args[i+1]
+				i++
+			}
+		case "--revoke-old":
+			if i+1 < len(args) && (args[i+1] == "true" || args[i+1] == "false") {
+				revokeOld = args[i+1] == "true"
+				i++
+			} else {
+				revokeOld = true
+			}
+		}
+	}
+
+	if agentID == "" || pubKeyFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: --agent-id and --public-key-file are required for 'rotate'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex rotate --agent-id <id> --public-key-file <path> [--join-token T] [--revoke-old]")
+		os.Exit(1)
+	}
+
+	if joinToken == "" {
+		if cfg.Token == "" {
+			fmt.Fprintln(os.Stderr, "Error: 'rotate' needs either --join-token, or an admin --token/MYRMEX_TOKEN to mint one.")
+			os.Exit(1)
+		}
+		var expiresAt string
+		var err error
+		joinToken, expiresAt, err = mintJoinToken(client, cfg, agentID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to mint join token: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Minted join token for %q (expires %s).\n", agentID, expiresAt)
+	}
+
+	pubKeyBytes, err := os.ReadFile(pubKeyFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to read public key file %q: %v\n", pubKeyFile, err)
+		os.Exit(1)
+	}
+
+	if _, err := enrollPublicKey(client, cfg, joinToken, agentID, string(pubKeyBytes)); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to enroll new public key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "New public key enrolled for agent %q.\n", agentID)
+
+	if !revokeOld {
+		if cfg.Output == "json" {
+			b, _ := json.MarshalIndent(map[string]interface{}{
+				"agent_id":         agentID,
+				"new_key_enrolled": true,
+				"revoked":          false,
+			}, "", "  ")
+			fmt.Println(string(b))
+		} else {
+			fmt.Println("Rotation complete: new key is live alongside any existing keys for this agent.")
+			fmt.Println("(Old keys were NOT revoked; pass --revoke-old to remove them, or run")
+			fmt.Println(" 'myrmex agents revoke' manually once the new key is confirmed working.)")
+		}
+		return
+	}
+
+	if cfg.Token == "" {
+		fmt.Fprintln(os.Stderr, "Error: --revoke-old requires an admin --token/MYRMEX_TOKEN to call /api/agents/revoke.")
+		os.Exit(1)
+	}
+
+	revokeBody, _ := json.Marshal(map[string]string{"agent_id": agentID})
+	revokeData, err := makeRequest(client, cfg, "POST", "/api/agents/revoke", bytes.NewReader(revokeBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: New key enrolled, but revoking old keys failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "The agent now has BOTH old and new keys authorized. Retry revocation manually,")
+		fmt.Fprintln(os.Stderr, "then re-run 'myrmex rotate' (or 'myrmex enroll') to re-add the new key.")
+		os.Exit(1)
+	}
+
+	if cfg.Output == "json" {
+		fmt.Println(string(revokeData))
+		return
+	}
+
+	var revokeResp struct {
+		Revoked        bool `json:"revoked"`
+		KeysRemoved    int  `json:"keys_removed"`
+		SessionDropped bool `json:"session_dropped"`
+	}
+	if err := json.Unmarshal(revokeData, &revokeResp); err == nil {
+		fmt.Printf("All keys for agent %q revoked (removed %d entries, session_dropped=%v).\n",
+			agentID, revokeResp.KeysRemoved, revokeResp.SessionDropped)
+	}
+	fmt.Println()
+	fmt.Println("IMPORTANT: --revoke-old removes ALL authorized_keys entries for this")
+	fmt.Println("agent-id, including the key just enrolled above. Re-enroll the new key now:")
+	fmt.Printf("  myrmex enroll-token --agent-id %s --token <admin-token>\n", agentID)
+	fmt.Printf("  myrmex enroll --join-token <token> --agent-id %s --public-key-file %s\n", agentID, pubKeyFile)
 }
 
 func mustMarshalJSON(v interface{}) string {
