@@ -1,0 +1,183 @@
+# Default values for myrmex-hive.
+# This is a YAML-formatted file.
+# Declared values are documented below each key.
+
+# -- Global image registry/pull settings shared by both workloads.
+image:
+  registry: ghcr.io
+  # -- Image repository namespace; final image is
+  # "<registry>/<repositoryPrefix>/<gateway.image.repository|agent.image.repository>".
+  repositoryPrefix: olafkfreund
+  pullPolicy: IfNotPresent
+  # -- Overrides the tag; defaults to `.Chart.AppVersion` when empty.
+  tag: ""
+
+# -- Secrets for pulling images from a private registry, if GHCR packages
+# are made private for this repo.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# =============================================================================
+# Gateway (cmd/gateway) — central SSH receiver + MCP/REST API + web portal.
+# One Deployment + one Service exposing the agent-tunnel port (2222) and the
+# HTTP/SSE + REST API + portal port (8080). The gateway serves 8080 over
+# HTTPS ONLY (self-signed cert generated in-memory unless gateway.tls.enabled
+# is set), which is why the probes below default to `scheme: HTTPS`.
+# =============================================================================
+gateway:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: myrmex-gateway
+    # -- Overrides image.tag for the gateway image specifically.
+    tag: ""
+
+  ports:
+    ssh: 2222
+    http: 8080
+
+  service:
+    # ClusterIP by default. Agents dialing in from OUTSIDE the cluster need
+    # the ssh port reachable — flip type to LoadBalancer/NodePort, or front
+    # it with a TCP-mode Ingress/Gateway, depending on your platform.
+    type: ClusterIP
+    annotations: {}
+
+  # -- gateway_config.json contents (see pkg/config.GatewayConfig). Rendered
+  # into a Secret (not a ConfigMap) by default because this struct commonly
+  # carries auth_token/tokens/llm_api_key. Ignored when
+  # gateway.existingSecret is set.
+  config:
+    listen_addr: ":2222"
+    http_addr: ":8080"
+    host_key_path: ""
+    authorized_keys_path: "/app/secrets/authorized_keys"
+    ollama_url: ""
+    ollama_model: ""
+    llm_provider: ""
+    max_orchestration_steps: 3
+    audit_log_path: ""
+    # -- Extra raw keys merged verbatim into gateway_config.json, e.g.
+    # scoped_tokens, risk_tiers, upstream_servers. Use for fields this chart
+    # doesn't model explicitly. Example:
+    #   extra:
+    #     rate_limit_per_minute: 60
+    extra: {}
+
+  # -- Authorized SSH public keys for connecting agents (authorized_keys
+  # file format, one key per line). Mounted at
+  # gateway.config.authorized_keys_path.
+  authorizedKeys: ""
+
+  # -- Name of a pre-existing Secret providing keys "gateway_config.json"
+  # and "authorized_keys" (and "tls.crt"/"tls.key" if gateway.tls.enabled).
+  # When set, gateway.config/authorizedKeys/tls.existingSecret are ignored
+  # and this Secret is mounted directly — use this for GitOps/sealed-secrets
+  # workflows instead of putting secrets in values.
+  existingSecret: ""
+
+  tls:
+    # -- When false (default) the gateway generates a transient self-signed
+    # certificate in-memory on every restart (see cmd/gateway/main.go). Set
+    # true and provide a kubernetes.io/tls Secret to pin a real certificate.
+    enabled: false
+    existingSecret: ""
+    certPath: /app/secrets/tls/tls.crt
+    keyPath: /app/secrets/tls/tls.key
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  probes:
+    liveness:
+      path: /healthz
+      scheme: HTTPS
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      path: /readyz
+      scheme: HTTPS
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# Agent (cmd/agent) — dials OUT to the Gateway over SSH; rejects all inbound
+# channels. Runs as a DaemonSet so every node gets one, mirroring
+# k8s/agent-daemonset.yaml. hostNetwork/hostPID/privileged default to true
+# so get_metrics/get_system_info see real host state — set to false for a
+# sandboxed (less capable) agent.
+# =============================================================================
+agent:
+  enabled: true
+
+  image:
+    repository: myrmex-agent
+    tag: ""
+
+  hostNetwork: true
+  hostPID: true
+  privileged: true
+
+  # -- agent_config.json contents (see pkg/config.AgentConfig), rendered
+  # into a Secret because private_key_path points at a mounted private key
+  # and allowed_commands shapes what the gateway can execute on this node.
+  # Ignored when agent.existingSecret is set.
+  #
+  # NOTE: every DaemonSet pod shares this same config (including agent_id),
+  # matching the existing k8s/agent-daemonset.yaml example — the gateway's
+  # agent registry is keyed by agent_id, so identical IDs across nodes will
+  # collide. For distinct per-node agent_id/allowed_commands, render one
+  # Secret per node group externally and set agent.existingSecret, or fork
+  # this chart per node pool.
+  config:
+    gateway_addr: "" # defaults to "<release-name>-gateway:2222" if empty
+    agent_id: "k8s-node"
+    allowed_commands:
+      - name: uptime
+        args_regex: "^$"
+      - name: df
+        args_regex: "^-h$"
+
+  # -- PEM-encoded Ed25519 private key matching a public key line in
+  # gateway.authorizedKeys. Dev/test convenience only — prefer
+  # agent.existingSecret for anything real.
+  privateKey: ""
+
+  # -- Name of a pre-existing Secret providing keys "agent_config.json" and
+  # "id_ed25519". When set, agent.config/privateKey are ignored.
+  existingSecret: ""
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations:
+    # Run on control-plane/master nodes too, matching typical DaemonSet intent.
+    - key: node-role.kubernetes.io/control-plane
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      effect: NoSchedule
+  affinity: {}

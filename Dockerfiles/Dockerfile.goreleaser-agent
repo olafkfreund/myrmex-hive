@@ -1,0 +1,25 @@
+# Dockerfile.goreleaser-agent
+#
+# Built ONLY by GoReleaser's `dockers:` section (see .goreleaser.yaml) — it
+# does not build Go source; GoReleaser injects the prebuilt linux binary for
+# the target arch (produced by the "agent" build) into the build context
+# root before invoking `docker build`.
+#
+# Unlike Dockerfiles/Dockerfile.agent (which builds from source with
+# golang:1.21 and is broken under this repo's Go 1.25 + vendored module
+# setup), this file never invokes `go build`.
+FROM alpine:3.20
+
+# ca-certificates: agent dials out over TLS-capable gateway_addrs in some
+# deployments. openssh-client: kept for operational parity/debugging even
+# though the SSH client the agent uses is pure-Go (golang.org/x/crypto/ssh) —
+# the agent never shells out to `ssh`.
+RUN apk add --no-cache ca-certificates openssh-client
+
+WORKDIR /app
+
+# Prebuilt binary for the target GOOS/GOARCH, injected by GoReleaser.
+COPY myrmex-agent /app/myrmex-agent
+
+ENTRYPOINT ["/app/myrmex-agent"]
+CMD ["-config", "/app/agent_config.json"]

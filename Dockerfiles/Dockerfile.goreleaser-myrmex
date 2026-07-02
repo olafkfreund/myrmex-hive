@@ -1,0 +1,15 @@
+# Dockerfile.goreleaser-myrmex
+#
+# Built ONLY by GoReleaser's `dockers:` section (see .goreleaser.yaml). The
+# myrmex CLI is a pure REST client of the Gateway (cmd/myrmex/main.go) — it
+# never opens an SSH connection — so it only needs CA roots for verifying
+# the Gateway's TLS certificate. distroless/static gives us that plus a
+# minimal, shell-less attack surface.
+FROM gcr.io/distroless/static-debian12:latest
+
+WORKDIR /
+
+# Prebuilt binary for the target GOOS/GOARCH, injected by GoReleaser.
+COPY myrmex /myrmex
+
+ENTRYPOINT ["/myrmex"]

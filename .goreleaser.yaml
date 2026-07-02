@@ -63,6 +63,188 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 
+# Linux .deb/.rpm packages for the three binaries. Packages ship the binary
+# only (no bundled config) — gateway_config.json/agent_config.json at the
+# repo root are local dev configs (real Tailscale hostnames, example agent
+# IDs), not suitable as installed defaults.
+nfpms:
+  - id: gateway-nfpm
+    ids: [gateway]
+    package_name: myrmex-gateway
+    file_name_template: "myrmex-gateway_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    vendor: olafkfreund
+    homepage: https://github.com/olafkfreund/myrmex-hive
+    maintainer: "Olaf K Freund <olaf.loken@gmail.com>"
+    description: |-
+      Myrmex Hive Gateway: the central SSH tunnel receiver, MCP/REST API,
+      and web portal for the Myrmex Hive agent orchestration framework.
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+  - id: agent-nfpm
+    ids: [agent]
+    package_name: myrmex-agent
+    file_name_template: "myrmex-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    vendor: olafkfreund
+    homepage: https://github.com/olafkfreund/myrmex-hive
+    maintainer: "Olaf K Freund <olaf.loken@gmail.com>"
+    description: |-
+      Myrmex Hive Agent: dials out to a Myrmex Hive Gateway over SSH and
+      exposes system metrics/commands with zero inbound ports.
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+  - id: myrmex-nfpm
+    ids: [myrmex]
+    package_name: myrmex
+    file_name_template: "myrmex_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    vendor: olafkfreund
+    homepage: https://github.com/olafkfreund/myrmex-hive
+    maintainer: "Olaf K Freund <olaf.loken@gmail.com>"
+    description: |-
+      Myrmex Hive operator CLI: talks to a Myrmex Hive Gateway's REST API
+      to inspect agents, upstreams, and tools, and to invoke tool calls.
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+# NOTE: Homebrew (`brews:`) is intentionally NOT configured here — it
+# requires a separate homebrew-tap repository (e.g.
+# olafkfreund/homebrew-myrmex-hive) that doesn't exist yet, and would fail
+# the release step. Follow-up: create the tap repo, then add a `brews:`
+# block pointing at it.
+
+# Container images, built from the prebuilt linux binaries (not from
+# source) via the goreleaser-* Dockerfiles under Dockerfiles/. amd64 and
+# arm64 variant images are pushed separately, then joined into multi-arch
+# manifests below so `docker pull ghcr.io/olafkfreund/myrmex-gateway`
+# resolves to the right arch automatically.
+dockers:
+  - id: gateway-amd64
+    ids: [gateway]
+    goos: linux
+    goarch: amd64
+    use: buildx
+    dockerfile: Dockerfiles/Dockerfile.goreleaser-gateway
+    extra_files:
+      - assets
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-gateway:{{ .Version }}-amd64"
+      - "ghcr.io/olafkfreund/myrmex-gateway:latest-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=myrmex-gateway"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+  - id: gateway-arm64
+    ids: [gateway]
+    goos: linux
+    goarch: arm64
+    use: buildx
+    dockerfile: Dockerfiles/Dockerfile.goreleaser-gateway
+    extra_files:
+      - assets
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-gateway:{{ .Version }}-arm64"
+      - "ghcr.io/olafkfreund/myrmex-gateway:latest-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=myrmex-gateway"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+  - id: agent-amd64
+    ids: [agent]
+    goos: linux
+    goarch: amd64
+    use: buildx
+    dockerfile: Dockerfiles/Dockerfile.goreleaser-agent
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-agent:{{ .Version }}-amd64"
+      - "ghcr.io/olafkfreund/myrmex-agent:latest-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=myrmex-agent"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+  - id: agent-arm64
+    ids: [agent]
+    goos: linux
+    goarch: arm64
+    use: buildx
+    dockerfile: Dockerfiles/Dockerfile.goreleaser-agent
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-agent:{{ .Version }}-arm64"
+      - "ghcr.io/olafkfreund/myrmex-agent:latest-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=myrmex-agent"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+  - id: myrmex-amd64
+    ids: [myrmex]
+    goos: linux
+    goarch: amd64
+    use: buildx
+    dockerfile: Dockerfiles/Dockerfile.goreleaser-myrmex
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex:{{ .Version }}-amd64"
+      - "ghcr.io/olafkfreund/myrmex:latest-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=myrmex"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+  - id: myrmex-arm64
+    ids: [myrmex]
+    goos: linux
+    goarch: arm64
+    use: buildx
+    dockerfile: Dockerfiles/Dockerfile.goreleaser-myrmex
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex:{{ .Version }}-arm64"
+      - "ghcr.io/olafkfreund/myrmex:latest-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=myrmex"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/olafkfreund/myrmex-gateway:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-gateway:{{ .Version }}-amd64"
+      - "ghcr.io/olafkfreund/myrmex-gateway:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/olafkfreund/myrmex-gateway:latest"
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-gateway:latest-amd64"
+      - "ghcr.io/olafkfreund/myrmex-gateway:latest-arm64"
+  - name_template: "ghcr.io/olafkfreund/myrmex-agent:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-agent:{{ .Version }}-amd64"
+      - "ghcr.io/olafkfreund/myrmex-agent:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/olafkfreund/myrmex-agent:latest"
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex-agent:latest-amd64"
+      - "ghcr.io/olafkfreund/myrmex-agent:latest-arm64"
+  - name_template: "ghcr.io/olafkfreund/myrmex:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex:{{ .Version }}-amd64"
+      - "ghcr.io/olafkfreund/myrmex:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/olafkfreund/myrmex:latest"
+    image_templates:
+      - "ghcr.io/olafkfreund/myrmex:latest-amd64"
+      - "ghcr.io/olafkfreund/myrmex:latest-arm64"
+
 sboms:
   - id: default
     artifacts: archive

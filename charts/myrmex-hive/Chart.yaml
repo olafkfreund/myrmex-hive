@@ -1,0 +1,23 @@
+apiVersion: v2
+name: myrmex-hive
+description: >-
+  Myrmex Hive: secure, zero-inbound-port distributed agent orchestration
+  (Model Context Protocol) over a reverse SSH tunnel. Deploys the central
+  Gateway (SSH receiver + MCP/REST API + web portal) and the per-node Agent
+  (dials out to the Gateway; never listens for management traffic).
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+home: https://github.com/olafkfreund/myrmex-hive
+sources:
+  - https://github.com/olafkfreund/myrmex-hive
+keywords:
+  - mcp
+  - ssh
+  - agent
+  - orchestration
+  - edge
+maintainers:
+  - name: olafkfreund
+    url: https://github.com/olafkfreund
+icon: https://raw.githubusercontent.com/olafkfreund/myrmex-hive/main/assets/images/logo.png

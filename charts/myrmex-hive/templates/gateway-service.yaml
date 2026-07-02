@@ -1,0 +1,25 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "myrmex-hive.gateway.fullname" . }}
+  labels:
+    {{- include "myrmex-hive.gateway.labels" . | nindent 4 }}
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  selector:
+    {{- include "myrmex-hive.gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ssh-mcp
+      port: {{ .Values.gateway.ports.ssh }}
+      targetPort: ssh-mcp
+      protocol: TCP
+    - name: http
+      port: {{ .Values.gateway.ports.http }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

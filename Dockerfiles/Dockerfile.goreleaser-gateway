@@ -1,0 +1,33 @@
+# Dockerfile.goreleaser-gateway
+#
+# Built ONLY by GoReleaser's `dockers:` section (see .goreleaser.yaml) — it
+# does not build Go source. GoReleaser copies the prebuilt linux binary for
+# the target arch (produced by the "gateway" build) plus the extra_files
+# (assets/) into the build context root before invoking `docker build`, so
+# the COPY sources below are bare filenames, not repo-relative paths.
+#
+# Unlike Dockerfiles/Dockerfile.gateway (which builds from source with
+# golang:1.21 and is broken under this repo's Go 1.25 + vendored module
+# setup), this file never invokes `go build`.
+FROM alpine:3.20
+
+# ca-certificates: the gateway makes outbound HTTPS calls (Ollama/LLM
+# providers, upstream MCP servers). openssh-client: the gateway/agent are
+# built around the SSH protocol; kept here for operational parity/debugging
+# even though the SSH server itself is pure-Go (golang.org/x/crypto/ssh).
+RUN apk add --no-cache ca-certificates openssh-client
+
+WORKDIR /app
+
+# Prebuilt binary for the target GOOS/GOARCH, injected by GoReleaser.
+COPY myrmex-gateway /app/myrmex-gateway
+
+# Static web portal assets served by handleSse/http.ServeFile at relative
+# paths like "assets/images/logo.png" — must live at the process cwd (/app).
+COPY assets ./assets
+
+# SSH agent-tunnel receiver and HTTP/SSE + REST API respectively.
+EXPOSE 2222 8080
+
+ENTRYPOINT ["/app/myrmex-gateway"]
+CMD ["-config", "/app/gateway_config.json"]

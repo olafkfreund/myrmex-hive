@@ -1,0 +1,43 @@
+Myrmex Hive has been installed.
+
+{{- if .Values.gateway.enabled }}
+
+Gateway:
+  Service:    {{ include "myrmex-hive.gateway.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  SSH (agent tunnel): port {{ .Values.gateway.ports.ssh }}
+  HTTP/REST/portal:   port {{ .Values.gateway.ports.http }} (HTTPS only{{ if not .Values.gateway.tls.enabled }}, self-signed unless gateway.tls.enabled=true{{ end }})
+
+  Check status:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "myrmex-hive.gateway.fullname" . }} 8080:{{ .Values.gateway.ports.http }}
+    curl -k https://localhost:8080/healthz
+
+{{- if not .Values.gateway.authorizedKeys }}
+{{- if not .Values.gateway.existingSecret }}
+
+  WARNING: gateway.authorizedKeys is empty — no agent public keys are
+  authorized, so no myrmex-agent will be able to connect. Set
+  gateway.authorizedKeys (or provide gateway.existingSecret) with one
+  "ssh-ed25519 AAAA... agent-id" line per agent.
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.agent.enabled }}
+
+Agent:
+  DaemonSet: {{ include "myrmex-hive.agent.fullname" . }}
+  Dials out to: {{ if .Values.agent.config.gateway_addr }}{{ .Values.agent.config.gateway_addr }}{{ else }}{{ include "myrmex-hive.gateway.addr" . }}{{ end }}
+
+{{- if not .Values.agent.privateKey }}
+{{- if not .Values.agent.existingSecret }}
+
+  WARNING: agent.privateKey is empty — the agent has no SSH identity and
+  will fail to authenticate to the Gateway. Set agent.privateKey (PEM
+  Ed25519 private key) or provide agent.existingSecret.
+{{- end }}
+{{- end }}
+
+  NOTE: every DaemonSet pod currently shares the same agent_id
+  ({{ .Values.agent.config.agent_id }}) — see the comment on agent.config
+  in values.yaml for why, and how to give each node a distinct identity.
+{{- end }}
