@@ -449,6 +449,116 @@ func TestAuthorizeToolCall(t *testing.T) {
 	}
 }
 
+// TestHandleCallToolEnforcesScope covers the #91 fix: handleCallTool now
+// reads contextKeyScope off the ctx it is given and enforces
+// authorizeToolCall before dispatching, so any transport that threads its
+// caller's scope into the ctx (currently /api/call and the /message SSE MCP
+// path) gets fine-grained agent/tool enforcement, not just the coarse
+// path-level RBAC applied by requireAuth. It exercises handleCallTool
+// directly (rather than via HTTP) to isolate the context-extraction +
+// authorizeToolCall wiring without requiring a live agent SSH tunnel.
+func TestHandleCallToolEnforcesScope(t *testing.T) {
+	currentConfigMu.Lock()
+	prevCfg := currentConfig
+	currentConfig = &config.GatewayConfig{
+		AuditLogPath: filepath.Join(t.TempDir(), "audit.log"),
+		AgentTags:    map[string][]string{"agent-1": {"prod"}},
+	}
+	currentConfigMu.Unlock()
+	t.Cleanup(func() {
+		currentConfigMu.Lock()
+		currentConfig = prevCfg
+		currentConfigMu.Unlock()
+	})
+
+	call := func(ctx context.Context, toolName string) JsonRpcResponse {
+		params := CallToolParams{Name: toolName}
+		paramsBytes, err := json.Marshal(params)
+		if err != nil {
+			t.Fatalf("marshal params: %v", err)
+		}
+		req := JsonRpcRequest{JsonRpc: "2.0", Method: "tools/call", Params: paramsBytes, ID: "test-1"}
+
+		respCh := make(chan JsonRpcResponse, 1)
+		handleCallTool(ctx, req, func(resp JsonRpcResponse) { respCh <- resp })
+		select {
+		case resp := <-respCh:
+			return resp
+		case <-time.After(2 * time.Second):
+			t.Fatal("handleCallTool did not respond in time")
+			return JsonRpcResponse{}
+		}
+	}
+
+	t.Run("scoped context denies a disallowed agent before dispatch", func(t *testing.T) {
+		// Scope only permits "agent-1"; target "agent-99" is not connected
+		// (getAgent would return nil), but that must never be reached -
+		// authorizeToolCall should reject the call first. If enforcement
+		// were missing, this would instead surface as an "is not
+		// connected" error from the (unreached) agent-dispatch branch.
+		scope := &config.TokenScope{Agents: []string{"agent-1"}}
+		ctx := context.WithValue(context.Background(), contextKeyScope, scope)
+
+		resp := call(ctx, "agent-99__run_command")
+		if resp.Error == nil {
+			t.Fatalf("expected denial for out-of-scope agent, got success: %+v", resp.Result)
+		}
+		errBytes, _ := json.Marshal(resp.Error)
+		if !strings.Contains(string(errBytes), "not authorized for agent") {
+			t.Errorf("expected an authorization-denied error, got: %s", errBytes)
+		}
+	})
+
+	t.Run("scoped context denies a disallowed tool on a gateway-native call", func(t *testing.T) {
+		// agentID == "gateway" skips the agent/tag check but the Tools
+		// allowlist still applies.
+		scope := &config.TokenScope{Tools: []string{"humanize_syslog"}}
+		ctx := context.WithValue(context.Background(), contextKeyScope, scope)
+
+		resp := call(ctx, "gateway__list_agents")
+		if resp.Error == nil {
+			t.Fatalf("expected denial for out-of-scope tool, got success: %+v", resp.Result)
+		}
+		errBytes, _ := json.Marshal(resp.Error)
+		if !strings.Contains(string(errBytes), "not authorized for tool") {
+			t.Errorf("expected an authorization-denied error, got: %s", errBytes)
+		}
+	})
+
+	t.Run("scoped context allows a permitted gateway-native call through to dispatch", func(t *testing.T) {
+		scope := &config.TokenScope{Tools: []string{"list_agents"}}
+		ctx := context.WithValue(context.Background(), contextKeyScope, scope)
+
+		resp := call(ctx, "gateway__list_agents")
+		if resp.Error != nil {
+			t.Fatalf("expected the permitted call to dispatch successfully, got error: %+v", resp.Error)
+		}
+		if resp.Result == nil {
+			t.Errorf("expected a result from gateway__list_agents, got nil")
+		}
+	})
+
+	t.Run("nil scope (unrestricted) is unaffected, matching legacy/stdio behavior", func(t *testing.T) {
+		// No contextKeyScope on the context at all - e.g. stdio's
+		// context.Background(), or a legacy Tokens/AuthToken caller via
+		// requireAuth. authorizeToolCall must treat this as unrestricted
+		// and let the call fall through to the (unreached, since agent-99
+		// isn't connected) agent-dispatch branch rather than being denied
+		// by scope enforcement.
+		resp := call(context.Background(), "agent-99__run_command")
+		if resp.Error == nil {
+			t.Fatalf("expected an error (agent not connected), got success: %+v", resp.Result)
+		}
+		errBytes, _ := json.Marshal(resp.Error)
+		if strings.Contains(string(errBytes), "not authorized") {
+			t.Errorf("nil scope must not trigger scope-denial errors, got: %s", errBytes)
+		}
+		if !strings.Contains(string(errBytes), "not connected") {
+			t.Errorf("expected an 'agent not connected' error past scope enforcement, got: %s", errBytes)
+		}
+	})
+}
+
 func TestToolTier(t *testing.T) {
 	tests := []struct {
 		name string

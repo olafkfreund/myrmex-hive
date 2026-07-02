@@ -1175,18 +1175,23 @@ func startStdioMCPServer() {
 		sendCallback := func(resp JsonRpcResponse) {
 			sendResponse(os.Stdout, resp)
 		}
-		go handleClientRequest(req, sendCallback)
+		// Stdio is a local, trusted transport (no HTTP request, no bearer
+		// token) so it carries no scope: context.Background() yields a nil
+		// contextKeyScope, and authorizeToolCall treats a nil scope as
+		// unrestricted. This preserves stdio's existing unrestricted
+		// behavior.
+		go handleClientRequest(context.Background(), req, sendCallback)
 	}
 }
 
-func handleClientRequest(req JsonRpcRequest, send ResponseSender) {
+func handleClientRequest(ctx context.Context, req JsonRpcRequest, send ResponseSender) {
 	switch req.Method {
 	case "initialize":
 		handleInitialize(req, send)
 	case "tools/list":
 		handleListTools(req, send)
 	case "tools/call":
-		handleCallTool(req, send)
+		handleCallTool(ctx, req, send)
 	default:
 		sendErrorDirect(send, req.ID, -32601, fmt.Sprintf("Method not found: %s", req.Method))
 	}
@@ -1326,21 +1331,47 @@ func handleListTools(req JsonRpcRequest, send ResponseSender) {
 	send(response)
 }
 
-func handleCallTool(req JsonRpcRequest, send ResponseSender) {
+func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender) {
 	var params CallToolParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		sendErrorDirect(send, req.ID, -32602, "Invalid params")
 		return
 	}
 
+	// Enforce per-token agent/tool scoping (see authorizeToolCall) before
+	// dispatching the call, mirroring handleApiCall's enforcement of the
+	// same check on the REST transport (issue #91). scope is nil for
+	// callers with no restricted TokenScope (stdio, legacy Tokens/AuthToken,
+	// mTLS, trusted-proxy), in which case authorizeToolCall always allows.
+	//
+	// Parse the (agentID, tool) pair the same way handleApiCall does:
+	// gateway-native tools ("gateway__foo") yield agentID == "gateway",
+	// which authorizeToolCall special-cases to skip the agent/tag check.
+	parts := strings.SplitN(params.Name, "__", 2)
+	authzAgentID := "gateway"
+	authzToolName := params.Name
+	if len(parts) == 2 {
+		authzAgentID = parts[0]
+		authzToolName = parts[1]
+	}
+
+	scope, _ := ctx.Value(contextKeyScope).(*config.TokenScope)
+	currentConfigMu.RLock()
+	agentTags := currentConfig.AgentTags
+	currentConfigMu.RUnlock()
+	if err := authorizeToolCall(scope, agentTags, authzAgentID, authzToolName); err != nil {
+		logAuditEvent(ctx, "authz_denied", authzAgentID, authzToolName+" "+string(params.Arguments), "failure", err.Error())
+		sendErrorDirect(send, req.ID, -32603, err.Error())
+		return
+	}
+
 	// 1. Check if it's a Gateway tool
 	if strings.HasPrefix(params.Name, "gateway__") {
-		handleGatewayToolCall(params.Name, params.Arguments, req.ID, send)
+		handleGatewayToolCall(ctx, params.Name, params.Arguments, req.ID, send)
 		return
 	}
 
 	// 2. Otherwise route to the appropriate Agent
-	parts := strings.SplitN(params.Name, "__", 2)
 	if len(parts) < 2 {
 		sendErrorDirect(send, req.ID, -32601, fmt.Sprintf("Invalid tool name format: %s", params.Name))
 		return
@@ -1401,7 +1432,12 @@ func handleCallTool(req JsonRpcRequest, send ResponseSender) {
 	send(resp)
 }
 
-func handleGatewayToolCall(name string, argsRaw json.RawMessage, reqID interface{}, send ResponseSender) {
+// handleGatewayToolCall dispatches a gateway__-prefixed tool. Scope
+// enforcement for the call already happened in handleCallTool before this
+// was invoked; ctx is threaded through for consistency and so any future
+// audit/observability calls made from here (e.g. around executeGemmaOrchestration)
+// have access to the caller's token/role/scope.
+func handleGatewayToolCall(ctx context.Context, name string, argsRaw json.RawMessage, reqID interface{}, send ResponseSender) {
 	switch name {
 	case "gateway__list_agents":
 		list := listAgentIDs()
@@ -2715,6 +2751,14 @@ func handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the request context (populated by requireAuth with
+	// contextKeyScope, among others) before handing off to the goroutine —
+	// r itself must not be retained/read after the handler returns, but its
+	// context is safe to carry forward. This is the fix for #91/#27:
+	// handleClientRequest/handleCallTool are now context-aware, so the
+	// caller's scope reaches authorizeToolCall for tools/call dispatched
+	// over this SSE MCP transport, matching /api/call's enforcement.
+	ctx := r.Context()
 	go func() {
 		sendCallback := func(resp JsonRpcResponse) {
 			respBytes, err := json.Marshal(resp)
@@ -2722,15 +2766,7 @@ func handleMessage(w http.ResponseWriter, r *http.Request) {
 				session.writeChan <- respBytes
 			}
 		}
-		// TODO(#27): enforce scope on the /message MCP path. handleClientRequest
-		// and handleCallTool are not context-aware (and this dispatch is async,
-		// decoupled from the originating *http.Request), so the caller's
-		// contextKeyScope from requireAuth cannot be threaded through here
-		// without a broader refactor of the JSON-RPC handler signatures. Only
-		// the RBAC path check (role -> path) applies to this transport today;
-		// per-agent/per-tool scoping (authorizeToolCall) is enforced on
-		// /api/call only.
-		handleClientRequest(req, sendCallback)
+		handleClientRequest(ctx, req, sendCallback)
 	}()
 
 	w.WriteHeader(http.StatusAccepted)
@@ -3829,7 +3865,10 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 	sendCallback := func(resp JsonRpcResponse) {
 		done <- resp
 	}
-	go handleClientRequest(req, sendCallback)
+	// handleCallTool re-checks authorizeToolCall against r.Context()'s scope;
+	// this call already passed the same check above, so the re-check is a
+	// harmless no-op here (same scope, same target, same result).
+	go handleClientRequest(r.Context(), req, sendCallback)
 
 	select {
 	case resp := <-done:
@@ -3938,7 +3977,17 @@ func handleApiApprovalDecision(w http.ResponseWriter, r *http.Request) {
 		}
 
 		done := make(chan JsonRpcResponse, 1)
-		go handleClientRequest(req, func(resp JsonRpcResponse) { done <- resp })
+		// Deliberately context.Background(), not r.Context(): r here is the
+		// approving admin's request, and the pending call was already
+		// authorized against the original submitter's scope by
+		// authorizeToolCall inside handleApiCall at creation time (see
+		// createPendingApproval). Threading the *approver's* scope through
+		// authorizeToolCall here would re-gate an already-vetted call
+		// against the wrong token and could spuriously deny an approval an
+		// admin is entitled to grant but whose own scoped token doesn't
+		// cover the target agent/tool. Admin-only access to this endpoint
+		// is already enforced above.
+		go handleClientRequest(context.Background(), req, func(resp JsonRpcResponse) { done <- resp })
 
 		select {
 		case resp := <-done:
