@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 type Config struct {
@@ -90,7 +94,9 @@ func main() {
 		}
 	}
 
-	if cfg.Token == "" {
+	// "audit verify" runs entirely against a local log file and host key, so it
+	// does not require a Gateway auth token.
+	if cfg.Token == "" && cmd != "audit" {
 		fmt.Fprintln(os.Stderr, "Error: Secure Gateway Auth Token is required. Use --token flag or set MYRMEX_TOKEN environment variable.")
 		os.Exit(1)
 	}
@@ -119,6 +125,8 @@ func main() {
 		handleCall(client, cfg, cmdArgs)
 	case "ask":
 		handleAsk(client, cfg, cmdArgs)
+	case "audit":
+		handleAudit(cfg, cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown command %q\nRun 'myrmex --help' for details.\n", cmd)
 		os.Exit(1)
@@ -139,6 +147,7 @@ Commands:
   call          Execute an MCP tool on an agent or upstream
   config        View the current gateway configuration
   ask           Ask the Myrmex AI Assistant to perform a task
+  audit verify  Verify a signed, hash-chained gateway audit log
 
 Global Options:
   --url         Gateway API base URL (default: https://localhost:8080)
@@ -161,6 +170,14 @@ Real-Life Scenarios:
 
   5. Ask the AI assistant to inspect memory usage:
      myrmex ask "Check memory usage on agent-nginx and explain it" --token <token>
+
+  6. Verify the integrity of the gateway's signed audit log:
+     myrmex audit verify --log audit.log --host-key host_key.pub
+
+Audit Verify Options:
+  --log         Path to the audit log file (default: audit.log)
+  --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
+                authorized-key format, e.g. host_key.pub (required)
 `
 	fmt.Print(helpText)
 }
@@ -645,6 +662,215 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 	}
 
 	fmt.Println(renderMarkdown(finalResponse))
+}
+
+// auditEntry mirrors the gateway's AuditEntry JSON shape (cmd/gateway/main.go).
+type auditEntry struct {
+	Timestamp string `json:"timestamp"`
+	TokenID   string `json:"token_id"`
+	Role      string `json:"role"`
+	Action    string `json:"action"`
+	AgentID   string `json:"agent_id,omitempty"`
+	Command   string `json:"command,omitempty"`
+	Status    string `json:"status"`
+	Details   string `json:"details"`
+	PrevSig   string `json:"prev_sig,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+type auditLineResult struct {
+	Line       int    `json:"line"`
+	Timestamp  string `json:"timestamp"`
+	Action     string `json:"action"`
+	SigValid   bool   `json:"signature_valid"`
+	ChainValid bool   `json:"chain_valid"`
+	Error      string `json:"error,omitempty"`
+}
+
+// handleAudit dispatches "audit" subcommands. Currently only "verify" is
+// supported.
+func handleAudit(cfg Config, args []string) {
+	if len(args) == 0 || args[0] != "verify" {
+		fmt.Fprintln(os.Stderr, "Error: Unknown or missing 'audit' subcommand.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit verify --log <path> --host-key <path>")
+		os.Exit(1)
+	}
+	handleAuditVerify(cfg, args[1:])
+}
+
+// handleAuditVerify validates a gateway audit log: every entry's SSH
+// signature over its own fields, and the PrevSig -> Signature hash chain
+// linking each entry to the one before it.
+func handleAuditVerify(cfg Config, args []string) {
+	logPath := "audit.log"
+	hostKeyPath := ""
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--log":
+			if i+1 < len(args) {
+				logPath = args[i+1]
+				i++
+			}
+		case "--host-key":
+			if i+1 < len(args) {
+				hostKeyPath = args[i+1]
+				i++
+			}
+		}
+	}
+
+	if hostKeyPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: --host-key <path> is required for 'audit verify'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit verify --log <path> --host-key <path>")
+		os.Exit(1)
+	}
+
+	keyBytes, err := os.ReadFile(hostKeyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to read host key %q: %v\n", hostKeyPath, err)
+		os.Exit(1)
+	}
+
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to parse host public key %q: %v\n", hostKeyPath, err)
+		os.Exit(1)
+	}
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to open audit log %q: %v\n", logPath, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	var results []auditLineResult
+	var prevSig string
+	lineNum := 0
+	total := 0
+	sigFailures := 0
+	chainFailures := 0
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		total++
+
+		res := auditLineResult{Line: lineNum}
+
+		var entry auditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			res.Error = fmt.Sprintf("invalid JSON: %v", err)
+			sigFailures++
+			chainFailures++
+			results = append(results, res)
+			// Leave prevSig untouched: we cannot trust anything derived from
+			// this line, but subsequent entries may still chain correctly
+			// from the last entry we could parse.
+			continue
+		}
+
+		res.Timestamp = entry.Timestamp
+		res.Action = entry.Action
+
+		if entry.PrevSig == prevSig {
+			res.ChainValid = true
+		} else {
+			chainFailures++
+			res.Error = fmt.Sprintf("chain break: prev_sig %q does not match previous entry's signature %q", entry.PrevSig, prevSig)
+		}
+
+		payload := strings.Join([]string{
+			entry.Timestamp, entry.TokenID, entry.Role, entry.Action,
+			entry.AgentID, entry.Command, entry.Status, entry.Details, entry.PrevSig,
+		}, "|")
+
+		blob, err := hex.DecodeString(entry.Signature)
+		if err != nil {
+			sigFailures++
+			if res.Error != "" {
+				res.Error += "; "
+			}
+			res.Error += fmt.Sprintf("invalid signature encoding: %v", err)
+		} else {
+			sig := &ssh.Signature{Format: pub.Type(), Blob: blob}
+			if err := pub.Verify([]byte(payload), sig); err != nil {
+				sigFailures++
+				if res.Error != "" {
+					res.Error += "; "
+				}
+				res.Error += fmt.Sprintf("signature verification failed: %v", err)
+			} else {
+				res.SigValid = true
+			}
+		}
+
+		results = append(results, res)
+		prevSig = entry.Signature
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to read audit log %q: %v\n", logPath, err)
+		os.Exit(1)
+	}
+
+	valid := 0
+	for _, r := range results {
+		if r.SigValid && r.ChainValid {
+			valid++
+		}
+	}
+
+	if cfg.Output == "json" {
+		out := map[string]interface{}{
+			"log":                logPath,
+			"host_key":           hostKeyPath,
+			"total_entries":      total,
+			"valid_entries":      valid,
+			"signature_failures": sigFailures,
+			"chain_failures":     chainFailures,
+			"entries":            results,
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+	} else {
+		fmt.Printf("Verifying audit log %q against host key %q\n\n", logPath, hostKeyPath)
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "LINE\tTIMESTAMP\tACTION\tSIGNATURE\tCHAIN\tNOTE")
+		for _, r := range results {
+			sigStatus := "PASS"
+			if !r.SigValid {
+				sigStatus = "FAIL"
+			}
+			chainStatus := "PASS"
+			if !r.ChainValid {
+				chainStatus = "FAIL"
+			}
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", r.Line, r.Timestamp, r.Action, sigStatus, chainStatus, r.Error)
+		}
+		w.Flush()
+
+		fmt.Println()
+		fmt.Printf("Total entries: %d, Valid: %d, Signature failures: %d, Chain breaks: %d\n",
+			total, valid, sigFailures, chainFailures)
+	}
+
+	if sigFailures > 0 || chainFailures > 0 {
+		if cfg.Output != "json" {
+			fmt.Println("Result: AUDIT LOG VERIFICATION FAILED")
+		}
+		os.Exit(1)
+	}
+
+	if cfg.Output != "json" {
+		fmt.Println("Result: AUDIT LOG VERIFICATION PASSED")
+	}
 }
 
 func mustMarshalJSON(v interface{}) string {
