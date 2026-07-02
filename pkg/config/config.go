@@ -8,9 +8,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// agenixNameRe validates agenix secret names ("agenix:<name>") so the derived
+// path /run/agenix/<name> cannot be used for directory traversal.
+var agenixNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 type AllowedCommand struct {
 	Name      string `json:"name"`
@@ -202,6 +207,9 @@ func (c *GatewayConfig) Validate() error {
 //
 //   - "env:NAME"          -> the value of environment variable NAME
 //   - "file:/path/to/f"   -> the trimmed contents of that file
+//   - "agenix:<name>"     -> the trimmed contents of /run/agenix/<name>; a
+//     convenience form over "file:/run/agenix/<name>" for agenix-managed
+//     secrets. <name> must match ^[A-Za-z0-9._-]+$ (no path traversal).
 //   - "${NAME}"           -> the value of environment variable NAME (whole-string form)
 //   - "vault:<path>#field" -> the named field read from HashiCorp Vault's KV
 //     secret engine at <path> (e.g. "vault:secret/data/myrmex#auth_token"),
@@ -209,6 +217,11 @@ func (c *GatewayConfig) Validate() error {
 //     the environment. Supports both KV v2 (.data.data.<field>) and KV v1
 //     (.data.<field>) response shapes.
 //   - anything else       -> returned unchanged, preserving backward compatibility
+//
+// agenix and sops-nix both decrypt secrets to files at runtime (e.g. under
+// /run/agenix or /run/secrets), so their secrets are consumed via the "file:"
+// form (or the "agenix:" convenience form) — no in-process decryption is done
+// here.
 //
 // File read errors and Vault errors are logged to stderr and resolve to ""
 // rather than panicking.
@@ -223,6 +236,15 @@ func resolveSecret(s string) string {
 			return ""
 		}
 		return strings.TrimSpace(string(data))
+	case strings.HasPrefix(s, "agenix:"):
+		name := strings.TrimPrefix(s, "agenix:")
+		if !agenixNameRe.MatchString(name) {
+			log.Printf("resolveSecret: invalid agenix secret name %q: must match %s", name, agenixNameRe.String())
+			return ""
+		}
+		// Sugar over "file:/run/agenix/<name>"; agenix decrypts secrets to
+		// this path at runtime.
+		return resolveSecret("file:/run/agenix/" + name)
 	case strings.HasPrefix(s, "vault:"):
 		val, err := resolveVault(strings.TrimPrefix(s, "vault:"))
 		if err != nil {
