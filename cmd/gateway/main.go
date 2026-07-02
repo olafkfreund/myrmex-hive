@@ -3590,13 +3590,17 @@ func callGeminiAPI(token, systemPrompt, prompt string, history []ChatMessage) (s
 	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + token
 	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, apiURL, bytes.NewReader(reqBytes))
 	if err != nil {
-		return "", err
+		// net/url errors embed the full request URL, which carries the API key in
+		// the ?key= query param; scrub the token so it never reaches a log or client.
+		return "", fmt.Errorf("failed to build Gemini request: %s", strings.ReplaceAll(err.Error(), token, "REDACTED"))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	geminiClient := &http.Client{Timeout: 30 * time.Second}
 	resp, err := geminiClient.Do(httpReq)
 	if err != nil {
-		return "", err
+		// *url.Error from Do embeds the request URL (and thus the ?key= API key);
+		// scrub the token before the error is logged or returned to the client.
+		return "", fmt.Errorf("Gemini API request failed: %s", strings.ReplaceAll(err.Error(), token, "REDACTED"))
 	}
 	defer resp.Body.Close()
 
