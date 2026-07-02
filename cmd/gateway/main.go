@@ -712,6 +712,19 @@ var (
 	// mergeFleet). Guarded by lastKnownMu.
 	lastKnownAgents = make(map[string]store.AgentRecord)
 	lastKnownMu     sync.RWMutex
+
+	// peerRegistry and peerAgentDetails implement the HA symmetric peer mesh
+	// (#47/#56/#63): they record which agents are connected to OTHER
+	// gateways in this gateway's cluster, learned by polling each peer's
+	// /internal/agents (see startPeerSync). Both are always replaced
+	// wholesale with a freshly-built map (never mutated in place), so a
+	// reader that captures the map reference under RLock may safely keep
+	// reading it after releasing the lock — see handleApiCall/handleApiFleet.
+	// Empty (the default) whenever PeerGateways is unset, so routing and
+	// fleet-view behavior are unchanged for a standalone gateway.
+	peerRegistry     = make(map[string]string)
+	peerAgentDetails = make(map[string]InternalAgentInfo)
+	peerRegistryMu   sync.RWMutex
 )
 
 // addAgent registers a newly connected agent. It refuses to overwrite an
@@ -750,6 +763,423 @@ func listAgentIDs() []string {
 		list = append(list, id)
 	}
 	return list
+}
+
+// InternalAgentInfo is the wire shape returned by GET /internal/agents (the
+// peer-sync source of truth, #47/#56/#63): the agents currently connected to
+// the responding gateway. Gateway is deliberately not marshaled - it is
+// filled in locally by the polling gateway (to the peer's base URL) once the
+// response is decoded, for fleet-view attribution; it is meaningless on the
+// wire since a gateway always reports its OWN agents as Online: true.
+type InternalAgentInfo struct {
+	ID      string   `json:"id"`
+	Online  bool     `json:"online"`
+	OS      string   `json:"os"`
+	Tags    []string `json:"tags,omitempty"`
+	Gateway string   `json:"-"`
+}
+
+// resolveGatewayID returns the cluster-visible identifier for this gateway
+// instance: cfg.GatewayID if set, otherwise the OS hostname, otherwise
+// cfg.ListenAddr as a last-resort so it is never empty. Used to attribute
+// locally-connected agents in /api/fleet responses (#47) once clustering is
+// active; harmless (just an extra label) when it isn't.
+func resolveGatewayID(cfg *config.GatewayConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	if cfg.GatewayID != "" {
+		return cfg.GatewayID
+	}
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		return hostname
+	}
+	return cfg.ListenAddr
+}
+
+// routeForAgent decides how handleApiCall should dispatch a tool call
+// targeting agentID (#47/#56/#63): locally, if the agent is connected to
+// this gateway; forwarded to a peer, if the peer registry has learned it
+// lives elsewhere in the cluster; or neither, preserving today's "agent not
+// connected" behavior when it is not known to be reachable anywhere. Pure
+// function (no I/O, no locking) so the routing policy is directly
+// unit-testable against a plain map without a real registry/HTTP server.
+func routeForAgent(agentID string, localConnected bool, registry map[string]string) (local bool, peerURL string) {
+	if localConnected {
+		return true, ""
+	}
+	if url, ok := registry[agentID]; ok && url != "" {
+		return false, url
+	}
+	return false, ""
+}
+
+// mergePeerFleet adds agents known only via peer sync (i.e. not already
+// present in full - not connected locally, and not previously persisted
+// locally either) to an /api/fleet response (#47). Pure function so the
+// merge policy is directly unit-testable. full's existing entries always
+// take precedence: an agent connected locally, or previously seen and
+// persisted by THIS gateway, is never duplicated from the peer registry.
+func mergePeerFleet(full []FleetAgentInfo, peerAgents map[string]InternalAgentInfo) []FleetAgentInfo {
+	if len(peerAgents) == 0 {
+		return full
+	}
+
+	known := make(map[string]bool, len(full))
+	for _, info := range full {
+		known[info.ID] = true
+	}
+
+	merged := make([]FleetAgentInfo, len(full), len(full)+len(peerAgents))
+	copy(merged, full)
+
+	for id, agent := range peerAgents {
+		if known[id] {
+			continue
+		}
+		merged = append(merged, FleetAgentInfo{
+			ID:      id,
+			OS:      agent.OS,
+			Tags:    agent.Tags,
+			Online:  agent.Online,
+			Gateway: agent.Gateway,
+		})
+	}
+	return merged
+}
+
+// fetchPeerAgents calls one peer's GET /internal/agents and returns its
+// reported agents. Network/decode/non-200 errors are all returned
+// (uniformly) to the caller, which treats any error identically: keep the
+// peer's last-known entries rather than dropping them (see syncPeersOnce).
+func fetchPeerAgents(ctx context.Context, client *http.Client, peerURL, clusterSecret string) ([]InternalAgentInfo, error) {
+	url := strings.TrimRight(peerURL, "/") + "/internal/agents"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+clusterSecret)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("peer %s returned status %d", peerURL, resp.StatusCode)
+	}
+
+	var list []InternalAgentInfo
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// syncPeersOnce polls every peer in cfg.PeerGateways' /internal/agents once
+// and atomically replaces the shared peer registry/detail maps with what it
+// learned (see the doc comment on startPeerSync for the consistency model
+// this implements, including the honest limits of the design). A peer that
+// answers has ALL of its previously-known entries replaced by what it just
+// reported (so agents that disconnected from it are dropped and freshly
+// reported ones are added); a peer that errors keeps its previous entries
+// untouched (stale-but-best-effort) rather than being dropped, so a
+// transient network blip doesn't instantly break forwarding to it.
+func syncPeersOnce(cfg *config.GatewayConfig, client *http.Client) {
+	if cfg == nil || len(cfg.PeerGateways) == 0 {
+		return
+	}
+
+	peerRegistryMu.RLock()
+	newRegistry := make(map[string]string, len(peerRegistry))
+	for id, url := range peerRegistry {
+		newRegistry[id] = url
+	}
+	newDetails := make(map[string]InternalAgentInfo, len(peerAgentDetails))
+	for id, info := range peerAgentDetails {
+		newDetails[id] = info
+	}
+	peerRegistryMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	for _, peerURL := range cfg.PeerGateways {
+		agentsList, err := fetchPeerAgents(ctx, client, peerURL, cfg.ClusterSecret)
+		if err != nil {
+			log.Printf("[CLUSTER] peer %s unreachable, keeping last-known entries: %v", peerURL, err)
+			continue
+		}
+
+		for id, url := range newRegistry {
+			if url == peerURL {
+				delete(newRegistry, id)
+				delete(newDetails, id)
+			}
+		}
+		for _, a := range agentsList {
+			a.Gateway = peerURL
+			newRegistry[a.ID] = peerURL
+			newDetails[a.ID] = a
+		}
+	}
+
+	peerRegistryMu.Lock()
+	peerRegistry = newRegistry
+	peerAgentDetails = newDetails
+	peerRegistryMu.Unlock()
+}
+
+// startPeerSync launches the background goroutine implementing the HA
+// symmetric peer mesh (#47/#56/#63): a small set of gateway instances that
+// share their agent registries and forward operator API calls to whichever
+// peer holds the target agent, with NO external infrastructure and NO
+// leader election. Agents are entirely unaffected - each still tunnels to
+// exactly one gateway (its home), and that gateway remains the sole,
+// authoritative source of truth for that agent's liveness. Every other
+// gateway merely learns, via polling, "agent X is currently reachable via
+// peer Y" so /api/call can forward there instead of failing with "agent not
+// connected".
+//
+// Honest limits of this design:
+//   - Consistency is eventually-consistent, not linearizable: the registry
+//     reflects state as of the last successful poll of each peer, so there
+//     is a window (up to PeerSyncSeconds) after an agent connects to or
+//     disconnects from a peer where a forwarded call can be misrouted or
+//     receive a 404/"not connected"-style error. Callers should treat that
+//     as retryable rather than a hard failure.
+//   - Peer polling is O(N^2) in the number of gateways (every gateway polls
+//     every other gateway directly, unbatched), which is fine for small
+//     clusters (a handful of gateways) but would need a shared registry
+//     (e.g. etcd, Consul, Redis) to scale to a large fleet of gateways.
+//   - No leader election or distributed locking is needed, precisely
+//     because ownership never moves at the gateway layer: an agent has
+//     exactly one home gateway, so there is nothing to coordinate access to
+//   - only something to broadcast (which peer currently holds it).
+//   - If a peer is unreachable, its previously-learned entries are left in
+//     place rather than dropped immediately (see syncPeersOnce), so a
+//     transient network blip doesn't instantly break forwarding to agents
+//     that are still, in fact, connected there.
+func startPeerSync(cfg *config.GatewayConfig) {
+	if len(cfg.PeerGateways) == 0 {
+		return
+	}
+
+	interval := cfg.PeerSyncSeconds
+	if interval <= 0 {
+		interval = 10
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.PeerInsecureSkipVerify},
+		},
+	}
+
+	log.Printf("[CLUSTER] peer mesh sync starting: gateway_id=%q, %d peer(s), interval=%ds", resolveGatewayID(cfg), len(cfg.PeerGateways), interval)
+
+	go func() {
+		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+		defer ticker.Stop()
+
+		// Sync once immediately so the registry isn't empty for the first
+		// `interval` seconds after startup.
+		currentConfigMu.RLock()
+		liveCfg := currentConfig
+		currentConfigMu.RUnlock()
+		syncPeersOnce(liveCfg, client)
+
+		for range ticker.C {
+			currentConfigMu.RLock()
+			liveCfg := currentConfig
+			currentConfigMu.RUnlock()
+			syncPeersOnce(liveCfg, client)
+		}
+	}()
+}
+
+// forwardToPeer POSTs a tool call to a peer gateway's /internal/call and
+// returns its JsonRpcResponse (#47/#56/#63). It is the counterpart to
+// handleInternalCall on the peer side, and is used by handleApiCall when
+// routeForAgent decides the target agent lives on a peer rather than
+// locally.
+func forwardToPeer(ctx context.Context, peerURL, clusterSecret string, insecureSkipVerify bool, name string, arguments json.RawMessage) (*JsonRpcResponse, error) {
+	callParams := CallToolParams{Name: name, Arguments: arguments}
+	bodyBytes, err := json.Marshal(callParams)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(peerURL, "/")+"/internal/call", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+clusterSecret)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 40 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+		},
+	}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("peer %s returned status %d", peerURL, resp.StatusCode)
+	}
+
+	var rpcResp JsonRpcResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return nil, err
+	}
+	return &rpcResp, nil
+}
+
+// internalAuthOK reports whether a peer-to-peer /internal/* request carries
+// the correct ClusterSecret bearer token, compared in constant time.
+// wantSecret == "" means clustering is disabled and this always fails
+// closed, matching requireClusterSecret's 404-when-unconfigured behavior at
+// the HTTP layer.
+func internalAuthOK(gotSecret, wantSecret string) bool {
+	if wantSecret == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(gotSecret), []byte(wantSecret)) == 1
+}
+
+// requireClusterSecret gates the peer-to-peer /internal/* endpoints
+// (#47/#56/#63). Unlike requireAuth (operator-facing bearer
+// tokens/mTLS/RBAC), this is a single shared secret between gateway
+// instances in the same cluster, and is NOT registered under requireAuth.
+// When ClusterSecret is unset (clustering disabled, the default), these
+// endpoints 404 rather than 401 - they do not exist at all on a
+// non-clustered gateway.
+func requireClusterSecret(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		currentConfigMu.RLock()
+		wantSecret := currentConfig.ClusterSecret
+		currentConfigMu.RUnlock()
+
+		if wantSecret == "" {
+			http.NotFound(w, r)
+			return
+		}
+
+		var gotSecret string
+		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+			gotSecret = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+
+		if !internalAuthOK(gotSecret, wantSecret) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		handler(w, r)
+	}
+}
+
+// handleInternalAgents serves the peer-sync source of truth (#47/#56/#63):
+// the set of agent IDs currently connected to THIS gateway, with minimal
+// metadata for fleet-view attribution. Gated by requireClusterSecret, never
+// by requireAuth - this is a gateway-to-gateway endpoint, not an
+// operator-facing one.
+func handleInternalAgents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	currentConfigMu.RLock()
+	agentTags := currentConfig.AgentTags
+	currentConfigMu.RUnlock()
+
+	agentsMu.RLock()
+	list := make([]InternalAgentInfo, 0, len(agents))
+	for id, client := range agents {
+		client.mu.Lock()
+		osVersion := client.osVersion
+		client.mu.Unlock()
+		list = append(list, InternalAgentInfo{
+			ID:     id,
+			Online: true,
+			OS:     osVersion,
+			Tags:   agentTags[id],
+		})
+	}
+	agentsMu.RUnlock()
+
+	json.NewEncoder(w).Encode(list)
+}
+
+// handleInternalCall is the peer-to-peer forward target for /api/call
+// (#47/#56/#63): it executes a tool call against a LOCAL agent exactly as
+// /api/call does, but trusts the ClusterSecret bearer instead of re-running
+// authorizeToolCall, because the origin gateway already authorized the
+// caller's token/scope before deciding to forward here (see
+// routeForAgent/handleApiCall). The real safety boundary for a forwarded
+// call is unchanged: the target agent's own command allowlist
+// (pkg/command) still applies exactly as it would for a purely local call.
+func handleInternalCall(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	parts := strings.SplitN(body.Name, "__", 2)
+	agentID := "gateway"
+	if len(parts) == 2 {
+		agentID = parts[0]
+	}
+
+	argsBytes, _ := json.Marshal(body.Arguments)
+	callParams := CallToolParams{
+		Name:      body.Name,
+		Arguments: argsBytes,
+	}
+	callParamsBytes, _ := json.Marshal(callParams)
+	req := JsonRpcRequest{
+		JsonRpc: "2.0",
+		Method:  "tools/call",
+		Params:  callParamsBytes,
+		ID:      "peer-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+	}
+
+	done := make(chan JsonRpcResponse, 1)
+	go handleClientRequest(context.Background(), req, func(resp JsonRpcResponse) { done <- resp })
+
+	select {
+	case resp := <-done:
+		status := "success"
+		details := "Peer tool execution completed"
+		if resp.Error != nil {
+			status = "failure"
+			errBytes, _ := json.Marshal(resp.Error)
+			details = string(errBytes)
+		}
+		logAuditEvent(context.Background(), "peer_call", agentID, body.Name+" "+string(body.Arguments), status, details)
+		json.NewEncoder(w).Encode(resp)
+	case <-time.After(35 * time.Second):
+		logAuditEvent(context.Background(), "peer_call", agentID, body.Name+" "+string(body.Arguments), "failure", "Gateway timeout")
+		http.Error(w, "Request timed out", http.StatusGatewayTimeout)
+	}
 }
 
 // snapshotState builds a store.Snapshot from the currently-connected agent
@@ -976,6 +1406,13 @@ func main() {
 				snapshotState()
 			}
 		}()
+	}
+
+	// 0. Start HA peer-mesh sync if clustering is configured (#47/#56/#63).
+	// Opt-in via PeerGateways; startPeerSync itself is a no-op guard when
+	// it's empty, but skip the call entirely so nothing is logged either.
+	if len(cfg.PeerGateways) > 0 {
+		startPeerSync(cfg)
 	}
 
 	// 1. Start SSH Server in background
@@ -1928,6 +2365,11 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	// handleApiEnroll), the same pattern as the unauthenticated /healthz.
 	http.HandleFunc("/api/enroll", handleApiEnroll)
 	http.HandleFunc("/api/agents/revoke", requireAuth(handleApiAgentsRevoke))
+	// /internal/* are the HA peer-mesh endpoints (#47/#56/#63): gateway-to-
+	// gateway only, gated by requireClusterSecret (a shared ClusterSecret
+	// bearer), never by requireAuth's operator-facing RBAC.
+	http.HandleFunc("/internal/agents", requireClusterSecret(handleInternalAgents))
+	http.HandleFunc("/internal/call", requireClusterSecret(handleInternalCall))
 	http.HandleFunc("/logo.png", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "assets/images/logo.png")
 	})
@@ -3272,6 +3714,15 @@ type FleetAgentInfo struct {
 	LastSeen      string          `json:"last_seen,omitempty"`
 	LatestMetrics json.RawMessage `json:"latest_metrics"`
 	HistoryLen    int             `json:"history_len"`
+	// Gateway identifies which gateway instance in the cluster this agent is
+	// connected to (#47/#56/#63): the local GatewayID for agents connected
+	// to this gateway, or a peer's base URL for agents learned via peer
+	// sync (see mergePeerFleet). Empty when clustering is not configured, or
+	// for last-known-only entries restored from local persisted state
+	// (issue #50) that predate attribution and were always local anyway.
+	// Additive field - existing callers that decode only the fields above
+	// are unaffected.
+	Gateway string `json:"gateway,omitempty"`
 }
 
 // fleetMatches applies the /api/fleet query-param filters to one agent's
@@ -3374,9 +3825,11 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 	currentConfigMu.RLock()
 	var agentTags map[string][]string
 	pollSeconds := 0
+	gatewayID := ""
 	if currentConfig != nil {
 		agentTags = currentConfig.AgentTags
 		pollSeconds = currentConfig.MetricsPollSeconds
+		gatewayID = resolveGatewayID(currentConfig)
 	}
 	currentConfigMu.RUnlock()
 
@@ -3401,6 +3854,7 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 			Online:     isOnline(client.lastSeen, now, pollSeconds),
 			LastSeen:   formatLastSeen(client.lastSeen),
 			HistoryLen: len(client.metricsHistory),
+			Gateway:    gatewayID,
 		}
 		if n := len(client.metricsHistory); n > 0 {
 			info.LatestMetrics = client.metricsHistory[n-1].Raw
@@ -3420,6 +3874,16 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 	}
 	lastKnownMu.RUnlock()
 	full := mergeFleet(live, lastKnownCopy)
+
+	// Merge in agents known only via HA peer sync (#47/#56/#63): connected
+	// to a peer gateway in this cluster rather than to this one. No-op when
+	// clustering isn't configured (peerAgentDetails stays empty). Live and
+	// last-known-local entries above always take precedence - see
+	// mergePeerFleet.
+	peerRegistryMu.RLock()
+	peerAgentsSnapshot := peerAgentDetails
+	peerRegistryMu.RUnlock()
+	full = mergePeerFleet(full, peerAgentsSnapshot)
 
 	fleet := make([]FleetAgentInfo, 0, len(full))
 	for _, info := range full {
@@ -3849,6 +4313,43 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	argsBytes, _ := json.Marshal(body.Arguments)
+
+	// HA peer forwarding (#47/#56/#63): if the target agent isn't connected
+	// to THIS gateway, but the peer registry has learned it's connected to a
+	// peer gateway in the cluster, forward the call there instead of
+	// failing with "agent not connected". authorizeToolCall (above) has
+	// already gated this call against the caller's scope on the ORIGIN
+	// gateway (this one), so the peer's /internal/call trusts ClusterSecret
+	// and does not re-run per-token scoping - see routeForAgent and the
+	// design-limits comment on startPeerSync. registrySnapshot is read once
+	// under lock and then used lock-free: syncPeersOnce always replaces the
+	// map wholesale rather than mutating it in place, so the snapshot is
+	// safe to read after unlocking.
+	localConnected := getAgent(agentID) != nil
+	peerRegistryMu.RLock()
+	registrySnapshot := peerRegistry
+	peerRegistryMu.RUnlock()
+	local, peerURL := routeForAgent(agentID, localConnected, registrySnapshot)
+
+	if !local && peerURL != "" {
+		resp, err := forwardToPeer(r.Context(), peerURL, cfg.ClusterSecret, cfg.PeerInsecureSkipVerify, body.Name, argsBytes)
+		if err != nil {
+			logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), "failure", fmt.Sprintf("forward to peer %s failed: %v", peerURL, err))
+			http.Error(w, "Failed to reach peer gateway holding this agent", http.StatusBadGateway)
+			return
+		}
+		status := "success"
+		details := "Forwarded to peer " + peerURL
+		if resp.Error != nil {
+			status = "failure"
+			errBytes, _ := json.Marshal(resp.Error)
+			details = string(errBytes)
+		}
+		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), status, details)
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
 	callParams := CallToolParams{
 		Name:      body.Name,
 		Arguments: argsBytes,

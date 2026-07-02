@@ -242,6 +242,42 @@ type GatewayConfig struct {
 	// when StatePath is set; a value <= 0 (including unset) defaults to 30
 	// once persistence is active.
 	StateSaveSeconds int `json:"state_save_seconds,omitempty"`
+
+	// --- HA: symmetric peer mesh clustering (#47/#56/#63) ---
+	//
+	// Multiple gateway instances can share their agent registries and
+	// forward tool calls to whichever peer holds the target agent. Agents
+	// are unaffected: each still connects to exactly one gateway (its home)
+	// via the existing GatewayAddrs failover; clustering only changes how
+	// operator-facing API calls are routed once they reach a gateway. Empty
+	// PeerGateways (the default) disables clustering entirely: no peer-sync
+	// goroutine starts, the /internal/* endpoints 404, and behavior is
+	// byte-for-byte identical to a standalone gateway.
+	//
+	// GatewayID identifies this gateway instance within the cluster (surfaced
+	// in /api/fleet responses so operators can see which gateway holds each
+	// agent). Empty (the default) is resolved at runtime to the OS hostname,
+	// falling back to ListenAddr if the hostname cannot be determined.
+	GatewayID string `json:"gateway_id,omitempty"`
+	// PeerGateways lists the base HTTPS URLs of the other gateway instances
+	// in this gateway's cluster (e.g. "https://gw-b:8080").
+	PeerGateways []string `json:"peer_gateways,omitempty"`
+	// ClusterSecret is the shared bearer token peer gateways present to each
+	// other's /internal/* endpoints. Resolved via resolveSecret like other
+	// secret fields (env:/file:/agenix:/vault:). Required whenever
+	// PeerGateways is non-empty (see Validate).
+	ClusterSecret string `json:"cluster_secret,omitempty"`
+	// PeerSyncSeconds sets how often (in seconds) this gateway polls each
+	// peer's /internal/agents to refresh its view of which agents are
+	// connected elsewhere in the cluster. A value <= 0 (including unset)
+	// defaults to 10 once clustering is active.
+	PeerSyncSeconds int `json:"peer_sync_seconds,omitempty"`
+	// PeerInsecureSkipVerify disables TLS certificate verification when this
+	// gateway calls its peers' /internal/* endpoints. Gateways use
+	// self-signed certificates by default (see startHTTPServer), so this is
+	// commonly needed in test/dev clusters unless peers share a common CA.
+	// Defaults to false (verify).
+	PeerInsecureSkipVerify bool `json:"peer_insecure_skip_verify,omitempty"`
 }
 
 // AlertThresholds defines the percentage thresholds that trigger a threshold
@@ -277,6 +313,14 @@ func (c *GatewayConfig) Validate() error {
 		if st.Role == "" {
 			errs = append(errs, fmt.Errorf("scoped_tokens[%d]: role must not be empty", i))
 		}
+	}
+
+	// Fail closed: without a ClusterSecret the /internal/* peer endpoints
+	// are disabled entirely (see requireClusterSecret), which would make a
+	// configured peer mesh silently non-functional rather than insecure —
+	// but that's still a misconfiguration worth catching at load time.
+	if len(c.PeerGateways) > 0 && c.ClusterSecret == "" {
+		errs = append(errs, fmt.Errorf("cluster_secret must be set when peer_gateways is non-empty"))
 	}
 
 	return errors.Join(errs...)
@@ -455,6 +499,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	cfg.AntigravityToken = resolveSecret(cfg.AntigravityToken)
 	cfg.LLMAPIKey = resolveSecret(cfg.LLMAPIKey)
 	cfg.TrustedProxySecret = resolveSecret(cfg.TrustedProxySecret)
+	cfg.ClusterSecret = resolveSecret(cfg.ClusterSecret)
 	if cfg.Tokens != nil {
 		resolvedTokens := make(map[string]string, len(cfg.Tokens))
 		for token, role := range cfg.Tokens {

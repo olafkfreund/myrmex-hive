@@ -1585,3 +1585,339 @@ func TestProxyAuthOK(t *testing.T) {
 		})
 	}
 }
+
+// --- HA symmetric peer mesh (#47/#56/#63) ---
+
+func TestInternalAuthOK(t *testing.T) {
+	tests := []struct {
+		name       string
+		gotSecret  string
+		wantSecret string
+		want       bool
+	}{
+		{
+			name:       "matching secret",
+			gotSecret:  "cluster-s3cr3t",
+			wantSecret: "cluster-s3cr3t",
+			want:       true,
+		},
+		{
+			name:       "mismatched secret",
+			gotSecret:  "wrong",
+			wantSecret: "cluster-s3cr3t",
+			want:       false,
+		},
+		{
+			name:       "empty configured secret disables clustering entirely",
+			gotSecret:  "cluster-s3cr3t",
+			wantSecret: "",
+			want:       false,
+		},
+		{
+			name:       "both empty still fails closed",
+			gotSecret:  "",
+			wantSecret: "",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := internalAuthOK(tt.gotSecret, tt.wantSecret)
+			if got != tt.want {
+				t.Errorf("internalAuthOK(%q, %q) = %v, want %v", tt.gotSecret, tt.wantSecret, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequireClusterSecretDisabledWhenUnconfigured(t *testing.T) {
+	orig := currentConfig
+	defer func() { currentConfig = orig }()
+	currentConfig = &config.GatewayConfig{} // ClusterSecret unset -> clustering off
+
+	called := false
+	handler := requireClusterSecret(func(w http.ResponseWriter, r *http.Request) { called = true })
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/agents", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("requireClusterSecret with no ClusterSecret configured: status = %d, want 404 (endpoint must not exist)", rec.Code)
+	}
+	if called {
+		t.Errorf("requireClusterSecret must not invoke the handler when clustering is disabled")
+	}
+}
+
+func TestRequireClusterSecretGating(t *testing.T) {
+	orig := currentConfig
+	defer func() { currentConfig = orig }()
+	currentConfig = &config.GatewayConfig{ClusterSecret: "cluster-s3cr3t"}
+
+	handler := requireClusterSecret(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	t.Run("missing bearer token is unauthorized", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/internal/agents", nil)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", rec.Code)
+		}
+	})
+
+	t.Run("wrong bearer token is unauthorized", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/internal/agents", nil)
+		req.Header.Set("Authorization", "Bearer wrong-secret")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", rec.Code)
+		}
+	})
+
+	t.Run("correct bearer token is authorized", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/internal/agents", nil)
+		req.Header.Set("Authorization", "Bearer cluster-s3cr3t")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200", rec.Code)
+		}
+	})
+}
+
+func TestRouteForAgent(t *testing.T) {
+	populated := map[string]string{
+		"agent-remote": "https://peer-b:8080",
+	}
+
+	tests := []struct {
+		name           string
+		agentID        string
+		localConnected bool
+		registry       map[string]string
+		wantLocal      bool
+		wantPeerURL    string
+	}{
+		{
+			name:           "locally connected always wins, even if also in registry",
+			agentID:        "agent-remote",
+			localConnected: true,
+			registry:       populated,
+			wantLocal:      true,
+			wantPeerURL:    "",
+		},
+		{
+			name:           "not local, known to a peer -> forward",
+			agentID:        "agent-remote",
+			localConnected: false,
+			registry:       populated,
+			wantLocal:      false,
+			wantPeerURL:    "https://peer-b:8080",
+		},
+		{
+			name:           "not local, not in registry -> neither (existing not-connected behavior)",
+			agentID:        "agent-unknown",
+			localConnected: false,
+			registry:       populated,
+			wantLocal:      false,
+			wantPeerURL:    "",
+		},
+		{
+			name:           "nil registry behaves like empty",
+			agentID:        "agent-remote",
+			localConnected: false,
+			registry:       nil,
+			wantLocal:      false,
+			wantPeerURL:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local, peerURL := routeForAgent(tt.agentID, tt.localConnected, tt.registry)
+			if local != tt.wantLocal || peerURL != tt.wantPeerURL {
+				t.Errorf("routeForAgent(%q, %v, ...) = (%v, %q), want (%v, %q)",
+					tt.agentID, tt.localConnected, local, peerURL, tt.wantLocal, tt.wantPeerURL)
+			}
+		})
+	}
+}
+
+func TestMergePeerFleet(t *testing.T) {
+	t.Run("empty peer agents returns full unchanged", func(t *testing.T) {
+		full := []FleetAgentInfo{{ID: "agent-1", Online: true}}
+		got := mergePeerFleet(full, nil)
+		if len(got) != 1 || got[0].ID != "agent-1" {
+			t.Errorf("mergePeerFleet(full, nil) = %+v, want full unchanged", got)
+		}
+	})
+
+	t.Run("peer-only agent is appended with gateway attribution", func(t *testing.T) {
+		full := []FleetAgentInfo{{ID: "agent-1", Online: true, Gateway: "gw-a"}}
+		peerAgents := map[string]InternalAgentInfo{
+			"agent-2": {ID: "agent-2", Online: true, OS: "Ubuntu 24.04", Tags: []string{"prod"}, Gateway: "https://peer-b:8080"},
+		}
+
+		got := mergePeerFleet(full, peerAgents)
+		if len(got) != 2 {
+			t.Fatalf("mergePeerFleet() returned %d entries, want 2: %+v", len(got), got)
+		}
+
+		byID := map[string]FleetAgentInfo{}
+		for _, info := range got {
+			byID[info.ID] = info
+		}
+
+		peerInfo, ok := byID["agent-2"]
+		if !ok {
+			t.Fatalf("expected peer agent-2 in merged result: %+v", got)
+		}
+		if peerInfo.Gateway != "https://peer-b:8080" {
+			t.Errorf("peer agent-2 Gateway = %q, want peer URL", peerInfo.Gateway)
+		}
+		if peerInfo.OS != "Ubuntu 24.04" || len(peerInfo.Tags) != 1 || peerInfo.Tags[0] != "prod" {
+			t.Errorf("peer agent-2 fields = %+v, want OS=Ubuntu 24.04 Tags=[prod]", peerInfo)
+		}
+		if !peerInfo.Online {
+			t.Errorf("peer agent-2 should be reported online (peer reported it as connected)")
+		}
+	})
+
+	t.Run("local/last-known entry takes precedence over peer duplicate", func(t *testing.T) {
+		full := []FleetAgentInfo{{ID: "agent-1", IP: "10.0.0.5", Online: true, Gateway: "gw-a"}}
+		peerAgents := map[string]InternalAgentInfo{
+			// Stale/incorrect report for an agent that is actually local here;
+			// local must win and it must not be duplicated.
+			"agent-1": {ID: "agent-1", Online: true, Gateway: "https://peer-b:8080"},
+		}
+
+		got := mergePeerFleet(full, peerAgents)
+		if len(got) != 1 {
+			t.Fatalf("mergePeerFleet() returned %d entries, want 1 (no duplicate): %+v", len(got), got)
+		}
+		if got[0].Gateway != "gw-a" || got[0].IP != "10.0.0.5" {
+			t.Errorf("mergePeerFleet() = %+v, want local entry (Gateway=gw-a) to win", got[0])
+		}
+	})
+
+	t.Run("multiple peer-only agents all appended", func(t *testing.T) {
+		peerAgents := map[string]InternalAgentInfo{
+			"agent-a": {ID: "agent-a", Gateway: "https://peer-b:8080"},
+			"agent-b": {ID: "agent-b", Gateway: "https://peer-b:8080"},
+			"agent-c": {ID: "agent-c", Gateway: "https://peer-c:8080"},
+		}
+		got := mergePeerFleet(nil, peerAgents)
+		if len(got) != 3 {
+			t.Fatalf("mergePeerFleet(nil, 3 peerAgents) returned %d entries, want 3: %+v", len(got), got)
+		}
+	})
+}
+
+func TestResolveGatewayID(t *testing.T) {
+	t.Run("nil config returns empty", func(t *testing.T) {
+		if got := resolveGatewayID(nil); got != "" {
+			t.Errorf("resolveGatewayID(nil) = %q, want empty", got)
+		}
+	})
+
+	t.Run("explicit GatewayID takes precedence", func(t *testing.T) {
+		cfg := &config.GatewayConfig{GatewayID: "gw-explicit", ListenAddr: ":2222"}
+		if got := resolveGatewayID(cfg); got != "gw-explicit" {
+			t.Errorf("resolveGatewayID() = %q, want %q", got, "gw-explicit")
+		}
+	})
+
+	t.Run("falls back to hostname or listen_addr when unset", func(t *testing.T) {
+		cfg := &config.GatewayConfig{ListenAddr: ":2222"}
+		got := resolveGatewayID(cfg)
+		if got == "" {
+			t.Errorf("resolveGatewayID() with no GatewayID = %q, want non-empty fallback", got)
+		}
+	})
+}
+
+func TestSyncPeersOnceKeepsStaleEntriesOnUnreachablePeer(t *testing.T) {
+	// A peer that never answers should not wipe out previously-learned
+	// entries for its agents (the "stale-but-best-effort" design documented
+	// on startPeerSync).
+	origRegistry, origDetails := peerRegistry, peerAgentDetails
+	defer func() {
+		peerRegistryMu.Lock()
+		peerRegistry, peerAgentDetails = origRegistry, origDetails
+		peerRegistryMu.Unlock()
+	}()
+
+	peerRegistryMu.Lock()
+	peerRegistry = map[string]string{"agent-x": "https://unreachable-peer:8080"}
+	peerAgentDetails = map[string]InternalAgentInfo{
+		"agent-x": {ID: "agent-x", Online: true, Gateway: "https://unreachable-peer:8080"},
+	}
+	peerRegistryMu.Unlock()
+
+	cfg := &config.GatewayConfig{
+		PeerGateways:  []string{"https://unreachable-peer:8080"},
+		ClusterSecret: "s3cr3t",
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+
+	syncPeersOnce(cfg, client)
+
+	peerRegistryMu.RLock()
+	defer peerRegistryMu.RUnlock()
+	if url, ok := peerRegistry["agent-x"]; !ok || url != "https://unreachable-peer:8080" {
+		t.Errorf("syncPeersOnce dropped stale entry for unreachable peer: registry = %+v", peerRegistry)
+	}
+}
+
+func TestHandleInternalCallRequiresPost(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/internal/call", nil)
+	rec := httptest.NewRecorder()
+	handleInternalCall(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("handleInternalCall with GET: status = %d, want 405", rec.Code)
+	}
+}
+
+func TestHandleInternalAgentsReportsConnectedAgents(t *testing.T) {
+	origConfig := currentConfig
+	defer func() { currentConfig = origConfig }()
+	currentConfig = &config.GatewayConfig{
+		AgentTags: map[string][]string{"agent-1": {"prod", "web"}},
+	}
+
+	agentsMu.Lock()
+	agents["agent-1"] = &AgentClient{agentID: "agent-1", osVersion: "Ubuntu 24.04"}
+	agentsMu.Unlock()
+	defer func() {
+		agentsMu.Lock()
+		delete(agents, "agent-1")
+		agentsMu.Unlock()
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/agents", nil)
+	rec := httptest.NewRecorder()
+	handleInternalAgents(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handleInternalAgents: status = %d, want 200", rec.Code)
+	}
+
+	var got []InternalAgentInfo
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("handleInternalAgents returned %d agents, want 1: %+v", len(got), got)
+	}
+	if got[0].ID != "agent-1" || !got[0].Online || got[0].OS != "Ubuntu 24.04" {
+		t.Errorf("handleInternalAgents entry = %+v, want ID=agent-1 Online=true OS=Ubuntu 24.04", got[0])
+	}
+	if len(got[0].Tags) != 2 {
+		t.Errorf("handleInternalAgents entry Tags = %+v, want 2 tags", got[0].Tags)
+	}
+}
