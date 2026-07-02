@@ -178,6 +178,52 @@ type GatewayConfig struct {
 	// it expires. A value <= 0 (including unset) defaults to 900 (15
 	// minutes) at the point the gateway issues a token.
 	EnrollmentTokenTTLSeconds int `json:"enrollment_token_ttl_seconds,omitempty"`
+
+	// --- Operator authentication: mTLS (#59) ---
+	//
+	// ClientCACertPath is the path to a PEM-encoded CA bundle used to verify
+	// operator client certificates presented over TLS. When set, the HTTP
+	// server accepts (but does not require) a client certificate and, if one
+	// is presented and verifies against this pool, requireAuth resolves a
+	// role from it (see MTLSRole/MTLSCNRoles) without requiring a bearer
+	// token. Leaving this unset preserves today's bearer-token-only behavior
+	// byte-for-byte.
+	ClientCACertPath string `json:"client_ca_cert_path,omitempty"`
+	// MTLSRole is the role granted to a request bearing a client certificate
+	// that verifies against ClientCACertPath, when its CommonName has no
+	// entry in MTLSCNRoles. Defaults to "operator" when empty. Only
+	// consulted when ClientCACertPath is set.
+	MTLSRole string `json:"mtls_role,omitempty"`
+	// MTLSCNRoles maps a verified client certificate's CommonName to a role,
+	// overriding MTLSRole for that CommonName. Only consulted when
+	// ClientCACertPath is set.
+	MTLSCNRoles map[string]string `json:"mtls_cn_roles,omitempty"`
+
+	// --- Operator authentication: OIDC/SSO via a trusted authenticating
+	// proxy (#55) ---
+	//
+	// These fields let a reverse proxy (e.g. oauth2-proxy, Pomerium) perform
+	// OIDC/SSO login and forward the authenticated identity to the gateway
+	// in a header, alongside a shared secret proving the request actually
+	// came through the proxy (and not directly from an untrusted client
+	// spoofing the identity header). Both TrustedProxySecret and a non-empty
+	// identity header are required for this auth method to grant a role;
+	// leaving TrustedProxySecret unset preserves today's behavior.
+	//
+	// TrustedProxyIdentityHeader is the header name the proxy sets to the
+	// authenticated user's identity (e.g. "X-Auth-Request-Email").
+	TrustedProxyIdentityHeader string `json:"trusted_proxy_identity_header,omitempty"`
+	// TrustedProxySecretHeader is the header name the proxy sets to the
+	// shared secret (e.g. "X-Proxy-Secret").
+	TrustedProxySecretHeader string `json:"trusted_proxy_secret_header,omitempty"`
+	// TrustedProxySecret is the shared secret the proxy must send in
+	// TrustedProxySecretHeader. Resolved via resolveSecret like other secret
+	// fields (env:/file:/agenix:/vault:). Empty (the default) disables this
+	// auth method entirely.
+	TrustedProxySecret string `json:"trusted_proxy_secret,omitempty"`
+	// TrustedProxyRole is the role granted to requests authenticated via the
+	// trusted proxy. Defaults to "operator" when empty.
+	TrustedProxyRole string `json:"trusted_proxy_role,omitempty"`
 }
 
 // AlertThresholds defines the percentage thresholds that trigger a threshold
@@ -390,6 +436,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	cfg.AuthToken = resolveSecret(cfg.AuthToken)
 	cfg.AntigravityToken = resolveSecret(cfg.AntigravityToken)
 	cfg.LLMAPIKey = resolveSecret(cfg.LLMAPIKey)
+	cfg.TrustedProxySecret = resolveSecret(cfg.TrustedProxySecret)
 	if cfg.Tokens != nil {
 		resolvedTokens := make(map[string]string, len(cfg.Tokens))
 		for token, role := range cfg.Tokens {

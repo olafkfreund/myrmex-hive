@@ -1285,3 +1285,113 @@ func TestWrapUntrustedOutputAndPrompts(t *testing.T) {
 		}
 	})
 }
+
+func TestRoleForClientCert(t *testing.T) {
+	tests := []struct {
+		name        string
+		cn          string
+		cnRoles     map[string]string
+		defaultRole string
+		want        string
+	}{
+		{
+			name:        "cn match takes precedence over default",
+			cn:          "alice",
+			cnRoles:     map[string]string{"alice": "admin", "bob": "read-only"},
+			defaultRole: "operator",
+			want:        "admin",
+		},
+		{
+			name:        "no cn match falls back to default",
+			cn:          "carol",
+			cnRoles:     map[string]string{"alice": "admin"},
+			defaultRole: "operator",
+			want:        "operator",
+		},
+		{
+			name:        "no cn match and empty default falls back to operator",
+			cn:          "carol",
+			cnRoles:     map[string]string{"alice": "admin"},
+			defaultRole: "",
+			want:        "operator",
+		},
+		{
+			name:        "nil cnRoles falls back to default",
+			cn:          "alice",
+			cnRoles:     nil,
+			defaultRole: "read-only",
+			want:        "read-only",
+		},
+		{
+			name:        "empty-string cn role entry is ignored, falls back to default",
+			cn:          "alice",
+			cnRoles:     map[string]string{"alice": ""},
+			defaultRole: "operator",
+			want:        "operator",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := roleForClientCert(tt.cn, tt.cnRoles, tt.defaultRole)
+			if got != tt.want {
+				t.Errorf("roleForClientCert(%q, %v, %q) = %q, want %q", tt.cn, tt.cnRoles, tt.defaultRole, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProxyAuthOK(t *testing.T) {
+	tests := []struct {
+		name       string
+		gotSecret  string
+		wantSecret string
+		identity   string
+		want       bool
+	}{
+		{
+			name:       "matching secret and non-empty identity",
+			gotSecret:  "s3cr3t",
+			wantSecret: "s3cr3t",
+			identity:   "alice@example.com",
+			want:       true,
+		},
+		{
+			name:       "mismatched secret",
+			gotSecret:  "wrong",
+			wantSecret: "s3cr3t",
+			identity:   "alice@example.com",
+			want:       false,
+		},
+		{
+			name:       "empty identity fails closed even with matching secret",
+			gotSecret:  "s3cr3t",
+			wantSecret: "s3cr3t",
+			identity:   "",
+			want:       false,
+		},
+		{
+			name:       "empty configured secret disables the method entirely",
+			gotSecret:  "",
+			wantSecret: "",
+			identity:   "alice@example.com",
+			want:       false,
+		},
+		{
+			name:       "empty got secret against configured secret",
+			gotSecret:  "",
+			wantSecret: "s3cr3t",
+			identity:   "alice@example.com",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := proxyAuthOK(tt.gotSecret, tt.wantSecret, tt.identity)
+			if got != tt.want {
+				t.Errorf("proxyAuthOK(%q, %q, %q) = %v, want %v", tt.gotSecret, tt.wantSecret, tt.identity, got, tt.want)
+			}
+		})
+	}
+}

@@ -1779,6 +1779,27 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 	}
 
+	// Optional mTLS for operator authentication (#59): when ClientCACertPath
+	// is configured, verify any client certificate presented against that CA
+	// pool. VerifyClientCertIfGiven (not RequireAndVerifyClientCert) so
+	// bearer-token and trusted-proxy clients that present no certificate at
+	// all can still connect - requireAuth treats a verified client cert as
+	// one more way to establish a role, alongside the existing token-based
+	// methods, not a hard requirement. Leaving ClientCACertPath unset leaves
+	// tlsConfig unchanged from today's behavior.
+	if cfg.ClientCACertPath != "" {
+		caPEM, err := os.ReadFile(cfg.ClientCACertPath)
+		if err != nil {
+			log.Fatalf("Failed to read client CA cert %q: %v", cfg.ClientCACertPath, err)
+		}
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caPEM) {
+			log.Fatalf("Failed to parse any certificates from client CA cert %q", cfg.ClientCACertPath)
+		}
+		tlsConfig.ClientCAs = caPool
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		TLSConfig:         tlsConfig,
@@ -2249,6 +2270,34 @@ func setCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// roleForClientCert resolves the RBAC role for a verified mTLS client
+// certificate's CommonName (#59). cnRoles takes precedence when it has an
+// entry for cn; otherwise defaultRole is used, falling back to "operator"
+// when defaultRole is itself empty. Pure/deterministic so it is unit
+// testable without a real TLS handshake.
+func roleForClientCert(cn string, cnRoles map[string]string, defaultRole string) string {
+	if role, ok := cnRoles[cn]; ok && role != "" {
+		return role
+	}
+	if defaultRole != "" {
+		return defaultRole
+	}
+	return "operator"
+}
+
+// proxyAuthOK reports whether a trusted-proxy-authenticated request (#55) is
+// valid: the proxy must have sent the configured shared secret (compared in
+// constant time to avoid timing side channels) and must have forwarded a
+// non-empty caller identity. wantSecret == "" means trusted-proxy auth is
+// not configured at all, so it always fails closed in that case regardless
+// of what gotSecret/identity contain.
+func proxyAuthOK(gotSecret, wantSecret, identity string) bool {
+	if wantSecret == "" || identity == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(gotSecret), []byte(wantSecret)) == 1
+}
+
 func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		setCORS(w, r)
@@ -2264,6 +2313,13 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		tokensMap := currentConfig.Tokens
 		defaultToken := currentConfig.AuthToken
 		scopedTokens := currentConfig.ScopedTokens
+		clientCACertPath := currentConfig.ClientCACertPath
+		mtlsRole := currentConfig.MTLSRole
+		mtlsCNRoles := currentConfig.MTLSCNRoles
+		trustedProxyIdentityHeader := currentConfig.TrustedProxyIdentityHeader
+		trustedProxySecretHeader := currentConfig.TrustedProxySecretHeader
+		trustedProxySecret := currentConfig.TrustedProxySecret
+		trustedProxyRole := currentConfig.TrustedProxyRole
 		currentConfigMu.RUnlock()
 
 		// Get the bearer token. The ?token= query param is only honored for the
@@ -2280,17 +2336,44 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 			reqToken = r.URL.Query().Get("token")
 		}
 
-		// Fail closed: with no valid token there is no role and access is denied
-		// below. There is deliberately no "no auth configured" dev fallback.
+		// Fail closed: with no valid token/cert/proxy-secret there is no role
+		// and access is denied below. There is deliberately no "no auth
+		// configured" dev fallback.
 
 		// Determine the role and, where applicable, the fine-grained scope that
-		// restricts which agents/tools the token may act on. Resolution order:
-		//  1. ScopedTokens (per-token role + agent/tag/tool restrictions)
-		//  2. legacy Tokens map (role only, unrestricted)
-		//  3. legacy default AuthToken (implicit admin, unrestricted)
+		// restricts which agents/tools the caller may act on. Resolution order:
+		//  1. mTLS (#59): a client certificate that verifies against
+		//     ClientCACertPath, when configured.
+		//  2. Trusted authenticating proxy (#55): a shared secret + forwarded
+		//     identity header, when TrustedProxySecret is configured.
+		//  3. ScopedTokens (per-token role + agent/tag/tool restrictions)
+		//  4. legacy Tokens map (role only, unrestricted)
+		//  5. legacy default AuthToken (implicit admin, unrestricted)
+		// mTLS and trusted-proxy auth always resolve an unrestricted scope
+		// (nil), matching the legacy Tokens/AuthToken behavior - neither of
+		// them carries a TokenScope.
 		role := ""
 		var scope *config.TokenScope
-		if reqToken != "" {
+
+		if clientCACertPath != "" && r.TLS != nil && len(r.TLS.VerifiedChains) > 0 {
+			cn := r.TLS.VerifiedChains[0][0].Subject.CommonName
+			role = roleForClientCert(cn, mtlsCNRoles, mtlsRole)
+			reqToken = cn // carried into context below for the audit trail
+		}
+
+		if role == "" && trustedProxySecret != "" {
+			gotSecret := r.Header.Get(trustedProxySecretHeader)
+			identity := r.Header.Get(trustedProxyIdentityHeader)
+			if proxyAuthOK(gotSecret, trustedProxySecret, identity) {
+				role = trustedProxyRole
+				if role == "" {
+					role = "operator"
+				}
+				reqToken = identity // carried into context below for the audit trail
+			}
+		}
+
+		if role == "" && reqToken != "" {
 			for i := range scopedTokens {
 				if scopedTokens[i].Token != "" && subtle.ConstantTimeCompare([]byte(reqToken), []byte(scopedTokens[i].Token)) == 1 {
 					role = scopedTokens[i].Role
