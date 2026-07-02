@@ -67,6 +67,34 @@ type ServiceControlArgs struct {
 // (never a shell), but this keeps inputs to a well-formed systemd unit name.
 var serviceNameRegex = regexp.MustCompile(`^[A-Za-z0-9@._-]+$`)
 
+// ContainerPsArgs holds the typed arguments for the container_ps tool.
+// It is a structured, read-only wrapper around `docker ps`; it still
+// delegates to command.ExecuteCommand so the operator's allowlist remains
+// the enforced security boundary (the docker binary must be allowlisted).
+type ContainerPsArgs struct {
+	All bool `json:"all,omitempty"`
+}
+
+// K8sGetArgs holds the typed arguments for the k8s_get tool.
+// It is a structured, read-only wrapper around `kubectl get <resource>`;
+// it still delegates to command.ExecuteCommand so the operator's allowlist
+// remains the enforced security boundary (the kubectl binary must be
+// allowlisted).
+type K8sGetArgs struct {
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// k8sResourceRegex conservatively restricts the requested resource type to
+// avoid argument injection; ExecuteCommand always passes args to os/exec
+// directly (never a shell), but this keeps inputs to well-formed kubectl
+// resource names (e.g. "pods", "deployments.apps").
+var k8sResourceRegex = regexp.MustCompile(`^[a-z][a-z0-9.-]*$`)
+
+// k8sNamespaceRegex conservatively restricts the requested namespace to
+// avoid argument injection; matches well-formed Kubernetes namespace names.
+var k8sNamespaceRegex = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 // Build information, injected at build time via -ldflags.
 var (
 	version = "dev"
@@ -326,6 +354,37 @@ func handleListTools(w io.Writer, req JsonRpcRequest) {
 				"required": []string{"action", "service"},
 			},
 		},
+		{
+			"name":        "container_ps",
+			"description": "List Docker containers on the host (read-only). Enforced by the agent's command allowlist; requires the docker binary to be allowlisted.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"all": map[string]interface{}{
+						"type":        "boolean",
+						"description": "If true, include stopped containers (maps to `docker ps -a`)",
+					},
+				},
+			},
+		},
+		{
+			"name":        "k8s_get",
+			"description": "Read-only Kubernetes resource listing via `kubectl get`. Enforced by the agent's command allowlist; requires the kubectl binary to be allowlisted.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"resource": map[string]interface{}{
+						"type":        "string",
+						"description": "The resource type to list, e.g. pods, nodes, deployments",
+					},
+					"namespace": map[string]interface{}{
+						"type":        "string",
+						"description": "The namespace to query (optional; omit to use kubectl's current-context default)",
+					},
+				},
+				"required": []string{"resource"},
+			},
+		},
 	}
 
 	response := JsonRpcResponse{
@@ -449,6 +508,87 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 		}
 
 		output, err := command.ExecuteCommand("systemctl", []string{svcArgs.Action, svcArgs.Service}, cfg.AllowedCommands)
+
+		var textContent string
+		if err != nil {
+			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+		} else {
+			textContent = output
+		}
+
+		response := JsonRpcResponse{
+			JsonRpc: "2.0",
+			Result: map[string]interface{}{
+				"content": []map[string]interface{}{
+					{
+						"type": "text",
+						"text": textContent,
+					},
+				},
+			},
+			ID: req.ID,
+		}
+		sendResponse(w, response)
+
+	case "container_ps":
+		var psArgs ContainerPsArgs
+		if len(params.Arguments) > 0 {
+			if err := json.Unmarshal(params.Arguments, &psArgs); err != nil {
+				sendError(w, req.ID, -32602, "Invalid container_ps arguments")
+				return
+			}
+		}
+
+		dockerArgs := []string{"ps"}
+		if psArgs.All {
+			dockerArgs = append(dockerArgs, "-a")
+		}
+
+		output, err := command.ExecuteCommand("docker", dockerArgs, cfg.AllowedCommands)
+
+		var textContent string
+		if err != nil {
+			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+		} else {
+			textContent = output
+		}
+
+		response := JsonRpcResponse{
+			JsonRpc: "2.0",
+			Result: map[string]interface{}{
+				"content": []map[string]interface{}{
+					{
+						"type": "text",
+						"text": textContent,
+					},
+				},
+			},
+			ID: req.ID,
+		}
+		sendResponse(w, response)
+
+	case "k8s_get":
+		var k8sArgs K8sGetArgs
+		if err := json.Unmarshal(params.Arguments, &k8sArgs); err != nil {
+			sendError(w, req.ID, -32602, "Invalid k8s_get arguments")
+			return
+		}
+
+		if k8sArgs.Resource == "" || !k8sResourceRegex.MatchString(k8sArgs.Resource) {
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid resource %q", k8sArgs.Resource))
+			return
+		}
+		if k8sArgs.Namespace != "" && !k8sNamespaceRegex.MatchString(k8sArgs.Namespace) {
+			sendError(w, req.ID, -32602, fmt.Sprintf("Invalid namespace %q", k8sArgs.Namespace))
+			return
+		}
+
+		kubectlArgs := []string{"get", k8sArgs.Resource}
+		if k8sArgs.Namespace != "" {
+			kubectlArgs = append(kubectlArgs, "-n", k8sArgs.Namespace)
+		}
+
+		output, err := command.ExecuteCommand("kubectl", kubectlArgs, cfg.AllowedCommands)
 
 		var textContent string
 		if err != nil {
