@@ -74,6 +74,12 @@ func (c *Client) Generate(prompt string) (string, error) {
 	return ollamaResp.Response, nil
 }
 
+// Name identifies this engine for logging/diagnostics purposes. It reports
+// the backend type and configured model, e.g. "ollama:gemma2:2b".
+func (c *Client) Name() string {
+	return "ollama:" + c.Model
+}
+
 func (c *Client) HumanizeLog(logContent string) (string, error) {
 	prompt := fmt.Sprintf(`You are a system administrator assistant. Please explain the following system log entry or event log in plain English, highlighting any warnings, security issues, or operational concerns. Keep the output concise (1-3 sentences) and professional.
 
