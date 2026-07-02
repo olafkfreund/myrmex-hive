@@ -337,3 +337,108 @@ func TestIntegrationAgentGateway(t *testing.T) {
 		}
 	})
 }
+
+func TestAuthorizeToolCall(t *testing.T) {
+	agentTags := map[string][]string{
+		"agent-1": {"prod", "web"},
+		"agent-2": {"staging"},
+	}
+
+	tests := []struct {
+		name    string
+		scope   *config.TokenScope
+		agentID string
+		tool    string
+		wantErr bool
+	}{
+		{
+			name:    "nil scope is unrestricted",
+			scope:   nil,
+			agentID: "agent-1",
+			tool:    "run_command",
+			wantErr: false,
+		},
+		{
+			name:    "agent id allowed",
+			scope:   &config.TokenScope{Agents: []string{"agent-1"}},
+			agentID: "agent-1",
+			tool:    "run_command",
+			wantErr: false,
+		},
+		{
+			name:    "agent id denied",
+			scope:   &config.TokenScope{Agents: []string{"agent-1"}},
+			agentID: "agent-2",
+			tool:    "run_command",
+			wantErr: true,
+		},
+		{
+			name:    "tag allowed",
+			scope:   &config.TokenScope{Tags: []string{"prod"}},
+			agentID: "agent-1",
+			tool:    "run_command",
+			wantErr: false,
+		},
+		{
+			name:    "tag denied",
+			scope:   &config.TokenScope{Tags: []string{"prod"}},
+			agentID: "agent-2",
+			tool:    "run_command",
+			wantErr: true,
+		},
+		{
+			name:    "agent restricted with no matching agent id or tag",
+			scope:   &config.TokenScope{Agents: []string{"agent-9"}, Tags: []string{"nope"}},
+			agentID: "agent-1",
+			tool:    "run_command",
+			wantErr: true,
+		},
+		{
+			name:    "tool allowed",
+			scope:   &config.TokenScope{Tools: []string{"run_command", "get_metrics"}},
+			agentID: "agent-1",
+			tool:    "get_metrics",
+			wantErr: false,
+		},
+		{
+			name:    "tool denied",
+			scope:   &config.TokenScope{Tools: []string{"get_metrics"}},
+			agentID: "agent-1",
+			tool:    "run_command",
+			wantErr: true,
+		},
+		{
+			name:    "gateway-native tool skips agent check",
+			scope:   &config.TokenScope{Agents: []string{"agent-1"}},
+			agentID: "gateway",
+			tool:    "ask_gemma",
+			wantErr: false,
+		},
+		{
+			name:    "gateway-native tool still honors tool scope",
+			scope:   &config.TokenScope{Agents: []string{"agent-1"}, Tools: []string{"humanize_syslog"}},
+			agentID: "gateway",
+			tool:    "ask_gemma",
+			wantErr: true,
+		},
+		{
+			name:    "agent and tool both allowed",
+			scope:   &config.TokenScope{Agents: []string{"agent-1"}, Tools: []string{"run_command"}},
+			agentID: "agent-1",
+			tool:    "run_command",
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := authorizeToolCall(tt.scope, agentTags, tt.agentID, tt.tool)
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error, got: %v", err)
+			}
+		})
+	}
+}

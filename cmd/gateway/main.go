@@ -85,6 +85,10 @@ type contextKey string
 const (
 	contextKeyToken contextKey = "token"
 	contextKeyRole  contextKey = "role"
+	// contextKeyScope carries the resolved *config.TokenScope for the caller's
+	// bearer token (nil when the token is unrestricted, e.g. legacy Tokens map
+	// or the default AuthToken).
+	contextKeyScope contextKey = "scope"
 )
 
 var hostKeySigner ssh.Signer
@@ -112,6 +116,61 @@ var rolePermissions = map[string]map[string]bool{
 		"/api/status": true,
 		"/api/tools":  true,
 	},
+}
+
+// authorizeToolCall enforces the fine-grained per-token restrictions carried
+// by scope (see config.TokenScope) against a tools/call target identified by
+// agentID and tool (the tool name with the "<agentID>__" prefix already
+// stripped). A nil scope is unrestricted and always allowed - this preserves
+// backward compatibility for tokens authenticated via the legacy Tokens map
+// or the default AuthToken. Gateway-native tools (agentID == "gateway") skip
+// the agent/tag check since they are not agent-scoped, but are still subject
+// to the Tools allowlist when one is configured.
+func authorizeToolCall(scope *config.TokenScope, agentTags map[string][]string, agentID, tool string) error {
+	if scope == nil {
+		return nil
+	}
+
+	if agentID != "gateway" && (len(scope.Agents) > 0 || len(scope.Tags) > 0) {
+		allowed := false
+		for _, a := range scope.Agents {
+			if a == agentID {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			for _, tag := range agentTags[agentID] {
+				for _, t := range scope.Tags {
+					if tag == t {
+						allowed = true
+						break
+					}
+				}
+				if allowed {
+					break
+				}
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("token not authorized for agent %q", agentID)
+		}
+	}
+
+	if len(scope.Tools) > 0 {
+		allowed := false
+		for _, t := range scope.Tools {
+			if t == tool {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("token not authorized for tool %q", tool)
+		}
+	}
+
+	return nil
 }
 
 func normalizeID(id interface{}) string {
@@ -1363,6 +1422,7 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		currentConfigMu.RLock()
 		tokensMap := currentConfig.Tokens
 		defaultToken := currentConfig.AuthToken
+		scopedTokens := currentConfig.ScopedTokens
 		currentConfigMu.RUnlock()
 
 		// Get the bearer token. The ?token= query param is only honored for the
@@ -1382,13 +1442,27 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		// Fail closed: with no valid token there is no role and access is denied
 		// below. There is deliberately no "no auth configured" dev fallback.
 
-		// Determine the role
+		// Determine the role and, where applicable, the fine-grained scope that
+		// restricts which agents/tools the token may act on. Resolution order:
+		//  1. ScopedTokens (per-token role + agent/tag/tool restrictions)
+		//  2. legacy Tokens map (role only, unrestricted)
+		//  3. legacy default AuthToken (implicit admin, unrestricted)
 		role := ""
+		var scope *config.TokenScope
 		if reqToken != "" {
-			if r, ok := tokensMap[reqToken]; ok {
-				role = r
-			} else if defaultToken != "" && subtle.ConstantTimeCompare([]byte(reqToken), []byte(defaultToken)) == 1 {
-				role = "admin"
+			for i := range scopedTokens {
+				if scopedTokens[i].Token != "" && subtle.ConstantTimeCompare([]byte(reqToken), []byte(scopedTokens[i].Token)) == 1 {
+					role = scopedTokens[i].Role
+					scope = &scopedTokens[i]
+					break
+				}
+			}
+			if role == "" {
+				if r, ok := tokensMap[reqToken]; ok {
+					role = r
+				} else if defaultToken != "" && subtle.ConstantTimeCompare([]byte(reqToken), []byte(defaultToken)) == 1 {
+					role = "admin"
+				}
 			}
 		}
 
@@ -1404,10 +1478,12 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Store token/role in context for audit trail
+		// Store token/role/scope in context for audit trail and per-call
+		// authorization (see authorizeToolCall).
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, contextKeyToken, reqToken)
 		ctx = context.WithValue(ctx, contextKeyRole, role)
+		ctx = context.WithValue(ctx, contextKeyScope, scope)
 
 		handler(w, r.WithContext(ctx))
 	}
@@ -1556,6 +1632,14 @@ func handleMessage(w http.ResponseWriter, r *http.Request) {
 				session.writeChan <- respBytes
 			}
 		}
+		// TODO(#27): enforce scope on the /message MCP path. handleClientRequest
+		// and handleCallTool are not context-aware (and this dispatch is async,
+		// decoupled from the originating *http.Request), so the caller's
+		// contextKeyScope from requireAuth cannot be threaded through here
+		// without a broader refactor of the JSON-RPC handler signatures. Only
+		// the RBAC path check (role -> path) applies to this transport today;
+		// per-agent/per-tool scoping (authorizeToolCall) is enforced on
+		// /api/call only.
 		handleClientRequest(req, sendCallback)
 	}()
 
@@ -2183,6 +2267,28 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
+	}
+
+	// Enforce per-token agent/tool scoping (see authorizeToolCall) before
+	// dispatching the call. A nil scope (legacy Tokens/AuthToken) is
+	// unrestricted.
+	{
+		parts := strings.SplitN(body.Name, "__", 2)
+		agentID := "gateway"
+		toolName := body.Name
+		if len(parts) == 2 {
+			agentID = parts[0]
+			toolName = parts[1]
+		}
+		scope, _ := r.Context().Value(contextKeyScope).(*config.TokenScope)
+		currentConfigMu.RLock()
+		agentTags := currentConfig.AgentTags
+		currentConfigMu.RUnlock()
+		if err := authorizeToolCall(scope, agentTags, agentID, toolName); err != nil {
+			logAuditEvent(r.Context(), "authz_denied", agentID, toolName+" "+string(body.Arguments), "failure", err.Error())
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 	}
 
 	argsBytes, _ := json.Marshal(body.Arguments)

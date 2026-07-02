@@ -42,6 +42,19 @@ type ExternalMcpServerConfig struct {
 	AuthToken string            `json:"auth_token,omitempty"`
 }
 
+// TokenScope restricts a bearer token to a role plus an optional subset of
+// agents (by ID or tag) and tools it may invoke. A token with no Agents/Tags
+// entries is unrestricted with respect to agents; likewise for Tools. This is
+// the fine-grained authorization layer on top of the coarser path-based RBAC
+// in rolePermissions (cmd/gateway/main.go).
+type TokenScope struct {
+	Token  string   `json:"token"`
+	Role   string   `json:"role"`
+	Agents []string `json:"agents,omitempty"`
+	Tags   []string `json:"tags,omitempty"`
+	Tools  []string `json:"tools,omitempty"`
+}
+
 type GatewayConfig struct {
 	ListenAddr         string                    `json:"listen_addr"`
 	HTTPAddr           string                    `json:"http_addr"`
@@ -56,7 +69,15 @@ type GatewayConfig struct {
 	AuthToken          string                    `json:"auth_token,omitempty"`
 	AntigravityToken   string                    `json:"antigravity_token,omitempty"`
 	Tokens             map[string]string         `json:"tokens,omitempty"`
-	AuditLogPath       string                    `json:"audit_log_path,omitempty"`
+	// ScopedTokens are bearer tokens restricted to a role plus an optional
+	// subset of agents/tags/tools. They are checked before Tokens/AuthToken
+	// during authentication; existing Tokens/AuthToken entries remain
+	// unrestricted for backward compatibility.
+	ScopedTokens []TokenScope `json:"scoped_tokens,omitempty"`
+	// AgentTags maps an agent ID to the set of tags it belongs to, used to
+	// evaluate TokenScope.Tags.
+	AgentTags    map[string][]string `json:"agent_tags,omitempty"`
+	AuditLogPath string              `json:"audit_log_path,omitempty"`
 	// AllowedOrigins is the CORS allowlist of browser origins permitted to make
 	// cross-origin requests to the gateway HTTP API. Empty means same-origin only.
 	AllowedOrigins []string `json:"allowed_origins,omitempty"`
@@ -128,6 +149,9 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 			resolvedTokens[resolveSecret(token)] = role
 		}
 		cfg.Tokens = resolvedTokens
+	}
+	for i := range cfg.ScopedTokens {
+		cfg.ScopedTokens[i].Token = resolveSecret(cfg.ScopedTokens[i].Token)
 	}
 
 	return &cfg, nil
