@@ -124,7 +124,7 @@ Configures the receiver, TLS certs, OIDC/Tokens RBAC role mapping (`admin`, `ope
 {
   "listen_addr": ":2222",
   "http_addr": ":8080",
-  "host_key_path": "",
+  "host_key_path": "host_key",
   "authorized_keys_path": "authorized_keys",
   "ollama_url": "http://localhost:11434",
   "ollama_model": "gemma4:e4b",
@@ -138,6 +138,29 @@ Configures the receiver, TLS certs, OIDC/Tokens RBAC role mapping (`admin`, `ope
 }
 ```
 *Note: If `audit_log_path` is set, Myrmex Gateway records all `/api/call` and `/api/chat` executions alongside a cryptographic signature generated using the Gateway's private SSH host key.*
+
+### Fail-closed defaults
+
+Myrmex Gateway **fails closed**: it refuses to start (or rejects a connection) rather than run in an insecure state. When preparing configs and keys, three rules are enforced:
+
+1. **`authorized_keys` comment = agent-id (identity binding).** The Gateway takes each connected agent's identity from the **comment** on its `authorized_keys` entry, and rejects any key whose comment is empty or does not match the `agent_id` the agent presents. Generate every agent key with its agent-id as the comment:
+   ```bash
+   ssh-keygen -t ed25519 -f id_ed25519 -N "" -C "agent-nginx"
+   ```
+   Then the public line in `authorized_keys` must keep that comment (`ssh-ed25519 AAAA... agent-nginx`).
+
+2. **Persistent `host_key_path` required when `audit_log_path` is set.** Audit entries are signed with the Gateway's SSH host key, so a transient (regenerated-on-restart) key would make past signatures unverifiable. The Gateway **refuses to start** if `audit_log_path` is set but `host_key_path` is empty. Generate a stable host key once and point `host_key_path` at it:
+   ```bash
+   ssh-keygen -t ed25519 -f host_key -N "" -C "myrmex-gateway"
+   ```
+   The Gateway also refuses to start without `authorized_keys_path` (no agent allowlist).
+
+3. **Agents verify the Gateway host key.** By default agents use **trust-on-first-use (TOFU)**: on first connect they learn and persist the Gateway host key to `<private_key_path>.gateway_hostkey` (override with `known_host_key_path`) and require a matching key thereafter — no config change needed. To pin explicitly instead, set `gateway_host_key` in `agent_config.json` to the Gateway host public-key line:
+   ```json
+   { "gateway_host_key": "ssh-ed25519 AAAA... myrmex-gateway" }
+   ```
+
+The local test fixtures (`generate_keys.sh`, `setup_test_env.sh`) already satisfy all three: agent keys are commented with their agent-ids, a persistent `test_env/gateway/host_key` is generated and mounted, and agents rely on TOFU.
 
 ---
 

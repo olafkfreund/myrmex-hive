@@ -10,6 +10,9 @@ services:
     volumes:
       - ./test_env/gateway/gateway_config.json:/app/gateway_config.json
       - ./test_env/gateway/authorized_keys:/app/authorized_keys
+      # Persistent host key: required because gateway_config sets audit_log_path,
+      # and gives agents a stable identity to trust-on-first-use.
+      - ./test_env/gateway/host_key:/app/host_key
     networks:
       - mcp-net
     extra_hosts:
