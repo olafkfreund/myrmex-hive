@@ -152,6 +152,11 @@ type GatewayConfig struct {
 	// against each polled metrics sample. Nil (the default) disables
 	// alerting entirely.
 	AlertThresholds *AlertThresholds `json:"alert_thresholds,omitempty"`
+	// EnrollmentTokenTTLSeconds bounds how long a join token minted by
+	// POST /api/enroll/token remains redeemable via POST /api/enroll before
+	// it expires. A value <= 0 (including unset) defaults to 900 (15
+	// minutes) at the point the gateway issues a token.
+	EnrollmentTokenTTLSeconds int `json:"enrollment_token_ttl_seconds,omitempty"`
 }
 
 // AlertThresholds defines the percentage thresholds that trigger a threshold

@@ -887,3 +887,152 @@ func TestFleetMatches(t *testing.T) {
 		})
 	}
 }
+
+// TestValidAgentID covers the agent-id allowlist enforced by the enrollment
+// and revocation APIs (epic #71, #48/#51). This is a security boundary, not
+// cosmetic validation: the agent-id is written into authorized_keys as the
+// SSH identity-binding comment (see startSSHServer's PublicKeyCallback), so
+// whitespace/newlines must be rejected to prevent line-injection.
+func TestValidAgentID(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		{name: "simple alnum", id: "agent1", want: true},
+		{name: "mixed with hyphen and underscore", id: "agent-01_A", want: true},
+		{name: "empty rejected", id: "", want: false},
+		{name: "space rejected", id: "agent 1", want: false},
+		{name: "newline rejected", id: "agent\n1", want: false},
+		{name: "slash rejected", id: "agent/1", want: false},
+		{name: "trailing newline injection rejected", id: "agent1\nssh-ed25519 AAAA evil", want: false},
+		{name: "leading whitespace rejected", id: " agent1", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := validAgentID(tt.id); got != tt.want {
+				t.Errorf("validAgentID(%q) = %v, want %v", tt.id, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestJoinTokenLifecycle covers the pure join-token store helpers behind
+// POST /api/enroll/token and POST /api/enroll (epic #71, #48): creation,
+// single redemption, TTL expiry, single-use consumption, and agent-id
+// binding.
+func TestJoinTokenLifecycle(t *testing.T) {
+	t.Run("create then consume once succeeds", func(t *testing.T) {
+		jt, err := createJoinToken("agent-x", time.Minute)
+		if err != nil {
+			t.Fatalf("createJoinToken failed: %v", err)
+		}
+		if jt.AgentID != "agent-x" {
+			t.Fatalf("expected AgentID %q, got %q", "agent-x", jt.AgentID)
+		}
+		if jt.Token == "" {
+			t.Fatalf("expected a non-empty token value")
+		}
+
+		got, err := consumeJoinToken(jt.Token, "agent-x", time.Now())
+		if err != nil {
+			t.Fatalf("expected valid token to be consumed, got error: %v", err)
+		}
+		if got.AgentID != "agent-x" {
+			t.Errorf("expected consumed token AgentID %q, got %q", "agent-x", got.AgentID)
+		}
+	})
+
+	t.Run("expired token rejected", func(t *testing.T) {
+		jt, err := createJoinToken("agent-y", -1*time.Second)
+		if err != nil {
+			t.Fatalf("createJoinToken failed: %v", err)
+		}
+		if _, err := consumeJoinToken(jt.Token, "agent-y", time.Now()); err == nil {
+			t.Fatalf("expected expired token to be rejected")
+		}
+	})
+
+	t.Run("single use: second consume rejected", func(t *testing.T) {
+		jt, err := createJoinToken("agent-z", time.Minute)
+		if err != nil {
+			t.Fatalf("createJoinToken failed: %v", err)
+		}
+		if _, err := consumeJoinToken(jt.Token, "agent-z", time.Now()); err != nil {
+			t.Fatalf("expected first consume to succeed, got: %v", err)
+		}
+		if _, err := consumeJoinToken(jt.Token, "agent-z", time.Now()); err == nil {
+			t.Fatalf("expected second consume of the same token to be rejected")
+		}
+	})
+
+	t.Run("agent-id mismatch rejected", func(t *testing.T) {
+		jt, err := createJoinToken("agent-bound", time.Minute)
+		if err != nil {
+			t.Fatalf("createJoinToken failed: %v", err)
+		}
+		if _, err := consumeJoinToken(jt.Token, "agent-other", time.Now()); err == nil {
+			t.Fatalf("expected token bound to a different agent-id to be rejected")
+		}
+		// The token must remain usable for its actual bound agent-id after a
+		// mismatched attempt (mismatch must not consume it).
+		if _, err := consumeJoinToken(jt.Token, "agent-bound", time.Now()); err != nil {
+			t.Errorf("expected token to still be valid for its bound agent-id, got: %v", err)
+		}
+	})
+
+	t.Run("unknown token rejected", func(t *testing.T) {
+		if _, err := consumeJoinToken("does-not-exist-in-the-store", "agent-x", time.Now()); err == nil {
+			t.Fatalf("expected unknown token to be rejected")
+		}
+	})
+}
+
+// TestFilterAuthorizedKeysByComment covers the authorized_keys rewrite logic
+// behind POST /api/agents/revoke (epic #71, #51): only entries whose comment
+// matches the target agent-id are removed, and every other line (including
+// another agent's key and non-key lines) is preserved byte-for-byte.
+func TestFilterAuthorizedKeysByComment(t *testing.T) {
+	mkKeyLine := func(t *testing.T, comment string) string {
+		t.Helper()
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("failed to generate key: %v", err)
+		}
+		sshPub, err := ssh.NewPublicKey(pub)
+		if err != nil {
+			t.Fatalf("failed to create ssh pubkey: %v", err)
+		}
+		line := strings.TrimRight(string(ssh.MarshalAuthorizedKey(sshPub)), "\n")
+		return line + " " + comment
+	}
+
+	lineA := mkKeyLine(t, "agent-a")
+	lineB := mkKeyLine(t, "agent-b")
+	data := []byte(lineA + "\n" + lineB + "\n# a standalone comment line\n\n")
+
+	kept, removed := filterAuthorizedKeysByComment(data, "agent-a")
+	if removed != 1 {
+		t.Fatalf("expected 1 line removed, got %d", removed)
+	}
+	keptStr := string(kept)
+	if strings.Contains(keptStr, "agent-a") {
+		t.Errorf("expected agent-a's entry to be removed, got: %s", keptStr)
+	}
+	if !strings.Contains(keptStr, lineB) {
+		t.Errorf("expected agent-b's entry to be kept verbatim, got: %s", keptStr)
+	}
+	if !strings.Contains(keptStr, "# a standalone comment line") {
+		t.Errorf("expected non-key comment line to be kept verbatim, got: %s", keptStr)
+	}
+
+	// No matching comment: nothing removed, content preserved.
+	kept2, removed2 := filterAuthorizedKeysByComment(data, "no-such-agent")
+	if removed2 != 0 {
+		t.Fatalf("expected 0 lines removed for a non-matching agent-id, got %d", removed2)
+	}
+	if string(kept2) != string(data) {
+		t.Errorf("expected content unchanged when nothing matches, got: %s", kept2)
+	}
+}

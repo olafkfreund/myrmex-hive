@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -96,16 +97,18 @@ var hostKeySigner ssh.Signer
 
 var rolePermissions = map[string]map[string]bool{
 	"admin": {
-		"/sse":           true,
-		"/message":       true,
-		"/api/status":    true,
-		"/api/fleet":     true,
-		"/api/config":    true,
-		"/api/keys":      true,
-		"/api/call":      true,
-		"/api/tools":     true,
-		"/api/chat":      true,
-		"/api/approvals": true,
+		"/sse":               true,
+		"/message":           true,
+		"/api/status":        true,
+		"/api/fleet":         true,
+		"/api/config":        true,
+		"/api/keys":          true,
+		"/api/call":          true,
+		"/api/tools":         true,
+		"/api/chat":          true,
+		"/api/approvals":     true,
+		"/api/enroll/token":  true,
+		"/api/agents/revoke": true,
 	},
 	"operator": {
 		"/sse":        true,
@@ -378,6 +381,14 @@ func (c *AgentClient) readLoop() {
 		}
 		c.mu.Unlock()
 	}
+}
+
+// disconnect closes the agent's SSH channel. This triggers readLoop's error
+// path (and its cleanup, which removes the agent from the registry) so the
+// live session is torn down immediately rather than waiting for it to go
+// stale. Used by POST /api/agents/revoke to drop a just-revoked agent.
+func (c *AgentClient) disconnect() {
+	_ = c.channel.Close()
 }
 
 func (c *AgentClient) cleanup(err error) {
@@ -1505,6 +1516,12 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	http.HandleFunc("/api/tools", requireAuth(handleApiTools))
 	http.HandleFunc("/api/chat", requireAuth(handleApiChat))
 	http.HandleFunc("/api/approvals", requireAuth(handleApiApprovals))
+	http.HandleFunc("/api/enroll/token", requireAuth(handleApiEnrollToken))
+	// /api/enroll is deliberately NOT wrapped in requireAuth: the join token
+	// in the request body is itself the one-time credential (see
+	// handleApiEnroll), the same pattern as the unauthenticated /healthz.
+	http.HandleFunc("/api/enroll", handleApiEnroll)
+	http.HandleFunc("/api/agents/revoke", requireAuth(handleApiAgentsRevoke))
 	http.HandleFunc("/logo.png", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "assets/images/logo.png")
 	})
@@ -1817,6 +1834,165 @@ func createPendingApproval(ctx context.Context, agentID, tool, args, tier string
 	approvalsMu.Unlock()
 
 	return approval, nil
+}
+
+// --- Agent enrollment (join tokens) and revocation (epic #71, #48/#51) ---
+//
+// Enrollment lets an admin mint a short-lived, single-use join token bound
+// to a specific agent-id (POST /api/enroll/token). The agent (or whoever is
+// provisioning it) then redeems that token together with its public key
+// (POST /api/enroll, unauthenticated - the join token itself is the
+// credential) to have the gateway append a correctly-formatted entry to
+// AuthorizedKeysPath. Revocation (POST /api/agents/revoke, admin-only)
+// strips an agent's entries from AuthorizedKeysPath and disconnects any live
+// session, all without hand-editing the file.
+
+// agentIDPattern is the allowlist for agent-ids accepted by the enrollment
+// and revocation APIs. This is a hard security boundary, not just cosmetic
+// validation: the agent-id becomes the authorized_keys comment that the SSH
+// PublicKeyCallback (see startSSHServer) treats as the authoritative identity
+// binding, and it is also written verbatim into the authorized_keys file. If
+// it could contain whitespace or newlines, a malicious agent_id could inject
+// extra lines/entries into the allowlist.
+var agentIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// validAgentID reports whether id is safe to use as an agent-id: non-empty
+// and composed solely of ASCII letters, digits, underscore, and hyphen. See
+// agentIDPattern for why this is security-relevant, not just cosmetic.
+func validAgentID(id string) bool {
+	return agentIDPattern.MatchString(id)
+}
+
+// JoinToken is a short-lived, single-use credential created by an admin via
+// POST /api/enroll/token and redeemed by POST /api/enroll to register a new
+// agent's public key. expires is unexported so it can never round-trip
+// through JSON responses (only the RFC3339 expires_at string the handler
+// derives from it is returned to callers).
+type JoinToken struct {
+	Token     string
+	AgentID   string
+	CreatedAt string
+	expires   time.Time
+}
+
+var (
+	joinTokensMu sync.Mutex
+	joinTokens   = map[string]*JoinToken{}
+)
+
+// newJoinTokenValue generates a random hex join token value.
+func newJoinTokenValue() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// createJoinToken generates and stores a new single-use join token bound to
+// agentID, expiring after ttl. Factored out from the HTTP handler (and
+// touching only the joinTokens store) so the lifecycle is directly unit
+// testable without spinning up an HTTP server.
+func createJoinToken(agentID string, ttl time.Duration) (*JoinToken, error) {
+	tok, err := newJoinTokenValue()
+	if err != nil {
+		return nil, err
+	}
+	jt := &JoinToken{
+		Token:     tok,
+		AgentID:   agentID,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		expires:   time.Now().Add(ttl),
+	}
+	joinTokensMu.Lock()
+	joinTokens[tok] = jt
+	joinTokensMu.Unlock()
+	return jt, nil
+}
+
+// consumeJoinToken validates and atomically deletes (single-use) the join
+// token identified by token. It fails if the token does not exist (including
+// because it was already consumed), has expired, or is bound to a different
+// agent-id than agentID. now is threaded through explicitly so expiry is
+// directly unit testable without waiting on a real clock.
+func consumeJoinToken(token, agentID string, now time.Time) (*JoinToken, error) {
+	joinTokensMu.Lock()
+	defer joinTokensMu.Unlock()
+
+	jt, ok := joinTokens[token]
+	if !ok {
+		return nil, fmt.Errorf("join token not found or already used")
+	}
+	if now.After(jt.expires) {
+		delete(joinTokens, token)
+		return nil, fmt.Errorf("join token expired")
+	}
+	if jt.AgentID != agentID {
+		return nil, fmt.Errorf("join token is not bound to agent-id %q", agentID)
+	}
+	delete(joinTokens, token)
+	return jt, nil
+}
+
+// appendAuthorizedKey appends a single pre-formatted authorized_keys line to
+// path, creating the file (mode 0600) if it doesn't already exist, and
+// ensuring the new entry starts on its own line even if the existing file
+// doesn't end with a trailing newline. line must not itself contain a
+// newline (callers pass a single canonical "<key> <comment>" entry).
+func appendAuthorizedKey(path string, line []byte) error {
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
+		if _, err := f.Write([]byte("\n")); err != nil {
+			return err
+		}
+	}
+	if _, err := f.Write(line); err != nil {
+		return err
+	}
+	_, err = f.Write([]byte("\n"))
+	return err
+}
+
+// filterAuthorizedKeysByComment removes every authorized_keys entry whose
+// comment equals agentID, returning the remaining content with every kept
+// line preserved byte-for-byte (verbatim) and a count of removed lines.
+// Lines that don't parse as an SSH public key entry (blank lines, bare
+// comment lines) are always kept unchanged, so this never clobbers unrelated
+// operator annotations in the file. Used by POST /api/agents/revoke.
+func filterAuthorizedKeysByComment(data []byte, agentID string) ([]byte, int) {
+	lines := bytes.Split(data, []byte("\n"))
+	kept := make([][]byte, 0, len(lines))
+	removed := 0
+	for _, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			kept = append(kept, line)
+			continue
+		}
+		_, comment, _, _, err := ssh.ParseAuthorizedKey(trimmed)
+		if err != nil {
+			// Not a parseable key entry - keep as-is rather than risk dropping
+			// content this function isn't meant to touch.
+			kept = append(kept, line)
+			continue
+		}
+		if comment == agentID {
+			removed++
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return bytes.Join(kept, []byte("\n")), removed
 }
 
 // setCORS applies a strict CORS policy based on the configured AllowedOrigins
@@ -2817,6 +2993,200 @@ func handleApiKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+// handleApiEnrollToken mints a short-lived, single-use join token bound to a
+// specific agent-id (epic #71, #48). Admin-only (see rolePermissions and its
+// requireAuth wrapper in startHTTPServer). The token itself becomes the
+// credential redeemed by the unauthenticated POST /api/enroll.
+func handleApiEnrollToken(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	setCORS(w, r)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		AgentID string `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if !validAgentID(body.AgentID) {
+		http.Error(w, "agent_id must be non-empty and match ^[A-Za-z0-9_-]+$", http.StatusBadRequest)
+		return
+	}
+
+	currentConfigMu.RLock()
+	ttlSeconds := currentConfig.EnrollmentTokenTTLSeconds
+	currentConfigMu.RUnlock()
+	if ttlSeconds <= 0 {
+		ttlSeconds = 900
+	}
+
+	jt, err := createJoinToken(body.AgentID, time.Duration(ttlSeconds)*time.Second)
+	if err != nil {
+		http.Error(w, "Failed to generate join token", http.StatusInternalServerError)
+		return
+	}
+
+	logAuditEvent(r.Context(), "enroll_token_created", body.AgentID, "", "success", fmt.Sprintf("ttl_seconds=%d", ttlSeconds))
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"join_token": jt.Token,
+		"agent_id":   jt.AgentID,
+		"expires_at": jt.expires.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleApiEnroll redeems a join token minted by POST /api/enroll/token,
+// appending the caller's public key to AuthorizedKeysPath under the
+// validated agent-id (epic #71, #48). Deliberately NOT wrapped in
+// requireAuth: the join token is itself the one-time credential, exactly
+// like /healthz is an unauthenticated bare route. Every failure path is a
+// 4xx and consumes no state beyond what consumeJoinToken already deletes.
+func handleApiEnroll(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	setCORS(w, r)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		JoinToken string `json:"join_token"`
+		AgentID   string `json:"agent_id"`
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	// agent_id is re-validated here (independent of whatever was validated at
+	// token-mint time) because it is about to be written into the
+	// authorized_keys file as the comment. See agentIDPattern.
+	if !validAgentID(body.AgentID) {
+		http.Error(w, "agent_id must be non-empty and match ^[A-Za-z0-9_-]+$", http.StatusBadRequest)
+		return
+	}
+
+	currentConfigMu.RLock()
+	keysPath := currentConfig.AuthorizedKeysPath
+	currentConfigMu.RUnlock()
+	if keysPath == "" {
+		http.Error(w, "AuthorizedKeysPath is not configured", http.StatusBadRequest)
+		return
+	}
+
+	if _, err := consumeJoinToken(body.JoinToken, body.AgentID, time.Now()); err != nil {
+		logAuditEvent(r.Context(), "agent_enrolled", body.AgentID, "", "failure", err.Error())
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	parsedKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(body.PublicKey))
+	if err != nil {
+		logAuditEvent(r.Context(), "agent_enrolled", body.AgentID, "", "failure", "public key did not parse")
+		http.Error(w, "Invalid public_key", http.StatusBadRequest)
+		return
+	}
+
+	// Never write the raw, untrusted PublicKey string directly: re-marshal the
+	// parsed key canonically and pin the comment to the already-validated
+	// agent_id. This is what prevents a malicious body (e.g. a public_key
+	// value containing embedded newlines and a second "key" line) from
+	// smuggling extra entries into authorized_keys.
+	marshaled := bytes.TrimRight(ssh.MarshalAuthorizedKey(parsedKey), "\n")
+	line := append(append([]byte{}, marshaled...), []byte(" "+body.AgentID)...)
+
+	if err := appendAuthorizedKey(keysPath, line); err != nil {
+		logAuditEvent(r.Context(), "agent_enrolled", body.AgentID, "", "failure", err.Error())
+		http.Error(w, fmt.Sprintf("Failed to write authorized_keys: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	logAuditEvent(r.Context(), "agent_enrolled", body.AgentID, "", "success", "agent enrolled via join token")
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "agent_id": body.AgentID})
+}
+
+// handleApiAgentsRevoke removes every authorized_keys entry bound to an
+// agent-id and disconnects any live session for it (epic #71, #51).
+// Admin-only (see rolePermissions and its requireAuth wrapper in
+// startHTTPServer).
+func handleApiAgentsRevoke(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	setCORS(w, r)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		AgentID string `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if !validAgentID(body.AgentID) {
+		http.Error(w, "agent_id must be non-empty and match ^[A-Za-z0-9_-]+$", http.StatusBadRequest)
+		return
+	}
+
+	currentConfigMu.RLock()
+	keysPath := currentConfig.AuthorizedKeysPath
+	currentConfigMu.RUnlock()
+	if keysPath == "" {
+		http.Error(w, "AuthorizedKeysPath is not configured", http.StatusBadRequest)
+		return
+	}
+
+	data, err := os.ReadFile(keysPath)
+	if err != nil && !os.IsNotExist(err) {
+		http.Error(w, fmt.Sprintf("Failed to read authorized_keys: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	kept, removed := filterAuthorizedKeysByComment(data, body.AgentID)
+	if err := os.WriteFile(keysPath, kept, 0600); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to write authorized_keys: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	sessionDropped := false
+	if cli := getAgent(body.AgentID); cli != nil {
+		cli.disconnect()
+		removeAgent(body.AgentID)
+		sessionDropped = true
+	}
+
+	logAuditEvent(r.Context(), "agent_revoked", body.AgentID, "", "success",
+		fmt.Sprintf("keys_removed=%d session_dropped=%v", removed, sessionDropped))
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"revoked":         true,
+		"keys_removed":    removed,
+		"session_dropped": sessionDropped,
+	})
 }
 
 func handleApiCall(w http.ResponseWriter, r *http.Request) {
