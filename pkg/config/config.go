@@ -95,6 +95,29 @@ type GatewayConfig struct {
 	// a given (token, agent, tool) combination. 0 (the default) disables rate
 	// limiting entirely.
 	RateLimitPerMinute int `json:"rate_limit_per_minute,omitempty"`
+	// MetricsPollSeconds, when > 0, enables periodic background polling of
+	// each connected agent's get_metrics tool. 0 (the default) disables
+	// polling entirely, preserving backward compatibility: no config change
+	// means no new goroutines, network calls, or memory growth.
+	MetricsPollSeconds int `json:"metrics_poll_seconds,omitempty"`
+	// MetricsHistorySize caps the number of metrics samples retained in
+	// memory per agent (a ring buffer). Only meaningful when
+	// MetricsPollSeconds > 0; defaults to 60 when unset/<=0 while polling is
+	// enabled.
+	MetricsHistorySize int `json:"metrics_history_size,omitempty"`
+	// AlertThresholds configures fleet-wide threshold alerting evaluated
+	// against each polled metrics sample. Nil (the default) disables
+	// alerting entirely.
+	AlertThresholds *AlertThresholds `json:"alert_thresholds,omitempty"`
+}
+
+// AlertThresholds defines the percentage thresholds that trigger a threshold
+// alert when breached by a polled get_metrics sample. A field <= 0 means
+// that dimension is not alerted on.
+type AlertThresholds struct {
+	CPUPercent  float64 `json:"cpu_percent"`
+	MemPercent  float64 `json:"mem_percent"`
+	DiskPercent float64 `json:"disk_percent"`
 }
 
 // resolveSecret resolves indirect secret references so secret-bearing config

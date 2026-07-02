@@ -635,3 +635,255 @@ func TestApprovalStoreTransitions(t *testing.T) {
 		}
 	})
 }
+
+// TestAppendMetricSample covers the bounded ring-buffer logic behind
+// metricsPoller's history tracking (#35): the cap is enforced and the
+// oldest samples are dropped first.
+func TestAppendMetricSample(t *testing.T) {
+	mk := func(n int) MetricSample {
+		return MetricSample{Raw: json.RawMessage(fmt.Sprintf(`{"n":%d}`, n))}
+	}
+
+	t.Run("grows under cap", func(t *testing.T) {
+		var history []MetricSample
+		for i := 0; i < 3; i++ {
+			history = appendMetricSample(history, mk(i), 5)
+		}
+		if len(history) != 3 {
+			t.Fatalf("expected 3 samples, got %d", len(history))
+		}
+		if string(history[0].Raw) != `{"n":0}` {
+			t.Errorf("expected oldest sample retained, got %s", history[0].Raw)
+		}
+	})
+
+	t.Run("trims oldest beyond cap", func(t *testing.T) {
+		var history []MetricSample
+		const capSize = 3
+		for i := 0; i < 10; i++ {
+			history = appendMetricSample(history, mk(i), capSize)
+		}
+		if len(history) != capSize {
+			t.Fatalf("expected history capped at %d, got %d", capSize, len(history))
+		}
+		// Samples 7, 8, 9 should be the ones retained (oldest dropped).
+		want := []string{`{"n":7}`, `{"n":8}`, `{"n":9}`}
+		for i, w := range want {
+			if string(history[i].Raw) != w {
+				t.Errorf("history[%d] = %s, want %s", i, history[i].Raw, w)
+			}
+		}
+	})
+
+	t.Run("non-positive cap treated as 1", func(t *testing.T) {
+		var history []MetricSample
+		history = appendMetricSample(history, mk(1), 0)
+		history = appendMetricSample(history, mk(2), 0)
+		if len(history) != 1 {
+			t.Fatalf("expected history capped at 1 for capSize<=0, got %d", len(history))
+		}
+		if string(history[0].Raw) != `{"n":2}` {
+			t.Errorf("expected only the latest sample retained, got %s", history[0].Raw)
+		}
+	})
+}
+
+// TestIsOnline covers agent liveness/staleness (#33) via synthetic
+// timestamps, with no real goroutines or network involved.
+func TestIsOnline(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		lastSeen    time.Time
+		pollSeconds int
+		want        bool
+	}{
+		{
+			name:        "never seen is offline",
+			lastSeen:    time.Time{},
+			pollSeconds: 0,
+			want:        false,
+		},
+		{
+			name:        "recent activity, polling disabled, within 90s window",
+			lastSeen:    now.Add(-30 * time.Second),
+			pollSeconds: 0,
+			want:        true,
+		},
+		{
+			name:        "stale activity, polling disabled, beyond 90s window",
+			lastSeen:    now.Add(-91 * time.Second),
+			pollSeconds: 0,
+			want:        false,
+		},
+		{
+			name:        "exactly at 90s boundary counts as online",
+			lastSeen:    now.Add(-90 * time.Second),
+			pollSeconds: 0,
+			want:        true,
+		},
+		{
+			name:        "within 3x poll interval",
+			lastSeen:    now.Add(-29 * time.Second),
+			pollSeconds: 10,
+			want:        true,
+		},
+		{
+			name:        "beyond 3x poll interval is stale",
+			lastSeen:    now.Add(-31 * time.Second),
+			pollSeconds: 10,
+			want:        false,
+		},
+		{
+			name:        "future lastSeen (clock skew) is not treated as online",
+			lastSeen:    now.Add(5 * time.Second),
+			pollSeconds: 10,
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isOnline(tt.lastSeen, now, tt.pollSeconds); got != tt.want {
+				t.Errorf("isOnline(%v, %v, %d) = %v, want %v", tt.lastSeen, now, tt.pollSeconds, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAlertTransition covers threshold-alert transition logic (#41): a
+// breach must fire exactly once on entry and must not re-fire on subsequent
+// polls until the dimension recovers.
+func TestAlertTransition(t *testing.T) {
+	tests := []struct {
+		name         string
+		wasBreached  bool
+		value        float64
+		threshold    float64
+		wantBreached bool
+		wantFired    bool
+	}{
+		{
+			name:         "threshold disabled never breaches",
+			wasBreached:  false,
+			value:        99,
+			threshold:    0,
+			wantBreached: false,
+			wantFired:    false,
+		},
+		{
+			name:         "negative threshold disabled never breaches",
+			wasBreached:  false,
+			value:        99,
+			threshold:    -1,
+			wantBreached: false,
+			wantFired:    false,
+		},
+		{
+			name:         "first breach fires",
+			wasBreached:  false,
+			value:        95,
+			threshold:    90,
+			wantBreached: true,
+			wantFired:    true,
+		},
+		{
+			name:         "sustained breach does not re-fire",
+			wasBreached:  true,
+			value:        96,
+			threshold:    90,
+			wantBreached: true,
+			wantFired:    false,
+		},
+		{
+			name:         "value at threshold is not a breach",
+			wasBreached:  false,
+			value:        90,
+			threshold:    90,
+			wantBreached: false,
+			wantFired:    false,
+		},
+		{
+			name:         "recovery clears breach without firing",
+			wasBreached:  true,
+			value:        50,
+			threshold:    90,
+			wantBreached: false,
+			wantFired:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBreached, gotFired := alertTransition(tt.wasBreached, tt.value, tt.threshold)
+			if gotBreached != tt.wantBreached || gotFired != tt.wantFired {
+				t.Errorf("alertTransition(%v, %v, %v) = (%v, %v), want (%v, %v)",
+					tt.wasBreached, tt.value, tt.threshold, gotBreached, gotFired, tt.wantBreached, tt.wantFired)
+			}
+		})
+	}
+
+	t.Run("re-fires after recovery then re-breach", func(t *testing.T) {
+		breached := false
+
+		breached, fired := alertTransition(breached, 95, 90)
+		if !breached || !fired {
+			t.Fatalf("expected first breach to fire, got breached=%v fired=%v", breached, fired)
+		}
+
+		breached, fired = alertTransition(breached, 95, 90)
+		if !breached || fired {
+			t.Fatalf("expected sustained breach not to re-fire, got breached=%v fired=%v", breached, fired)
+		}
+
+		breached, fired = alertTransition(breached, 50, 90)
+		if breached || fired {
+			t.Fatalf("expected recovery to clear breach without firing, got breached=%v fired=%v", breached, fired)
+		}
+
+		breached, fired = alertTransition(breached, 95, 90)
+		if !breached || !fired {
+			t.Fatalf("expected re-breach after recovery to fire again, got breached=%v fired=%v", breached, fired)
+		}
+	})
+}
+
+// TestFleetMatches covers the /api/fleet query-param filters (status/tag/os)
+// used by the fleet inventory API (#37/#42).
+func TestFleetMatches(t *testing.T) {
+	online := FleetAgentInfo{OS: "Ubuntu 22.04", Tags: []string{"prod", "web"}, Online: true}
+	stale := FleetAgentInfo{OS: "Debian 12", Tags: []string{"staging"}, Online: false}
+
+	tests := []struct {
+		name   string
+		info   FleetAgentInfo
+		status string
+		tag    string
+		os     string
+		want   bool
+	}{
+		{name: "no filters matches everything", info: online, want: true},
+		{name: "status online matches online agent", info: online, status: "online", want: true},
+		{name: "status online excludes stale agent", info: stale, status: "online", want: false},
+		{name: "status stale matches stale agent", info: stale, status: "stale", want: true},
+		{name: "status stale excludes online agent", info: online, status: "stale", want: false},
+		{name: "status filter is case-insensitive", info: online, status: "ONLINE", want: true},
+		{name: "unrecognized status matches everything", info: stale, status: "bogus", want: true},
+		{name: "tag match", info: online, tag: "prod", want: true},
+		{name: "tag mismatch", info: online, tag: "nope", want: false},
+		{name: "tag match on second tag entries", info: online, tag: "web", want: true},
+		{name: "os substring match case-insensitive", info: online, os: "ubuntu", want: true},
+		{name: "os substring mismatch", info: online, os: "windows", want: false},
+		{name: "combined filters all match", info: online, status: "online", tag: "web", os: "ubuntu", want: true},
+		{name: "combined filters one mismatch", info: online, status: "online", tag: "web", os: "debian", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fleetMatches(tt.info, tt.status, tt.tag, tt.os); got != tt.want {
+				t.Errorf("fleetMatches(%+v, %q, %q, %q) = %v, want %v", tt.info, tt.status, tt.tag, tt.os, got, tt.want)
+			}
+		})
+	}
+}

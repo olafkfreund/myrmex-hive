@@ -99,6 +99,7 @@ var rolePermissions = map[string]map[string]bool{
 		"/sse":           true,
 		"/message":       true,
 		"/api/status":    true,
+		"/api/fleet":     true,
 		"/api/config":    true,
 		"/api/keys":      true,
 		"/api/call":      true,
@@ -110,6 +111,7 @@ var rolePermissions = map[string]map[string]bool{
 		"/sse":        true,
 		"/message":    true,
 		"/api/status": true,
+		"/api/fleet":  true,
 		"/api/call":   true,
 		"/api/tools":  true,
 		"/api/chat":   true,
@@ -120,7 +122,10 @@ var rolePermissions = map[string]map[string]bool{
 	},
 	"read-only": {
 		"/api/status": true,
-		"/api/tools":  true,
+		// /api/fleet is read-only inventory data (issues #37/#42), so it is
+		// available to the read-only role alongside /api/status and /api/tools.
+		"/api/fleet": true,
+		"/api/tools": true,
 	},
 }
 
@@ -212,6 +217,15 @@ func normalizeID(id interface{}) string {
 	}
 }
 
+// MetricSample is one polled snapshot of an agent's get_metrics tool output.
+// The metrics JSON itself is kept raw (not parsed into a typed struct) so
+// the gateway does not need to track the agent-side metrics schema; alert
+// evaluation parses out just the fields it needs (see alertMetrics).
+type MetricSample struct {
+	Timestamp time.Time       `json:"timestamp"`
+	Raw       json.RawMessage `json:"raw"`
+}
+
 // Multiplexed channel client for thread-safe SSH MCP communication
 type AgentClient struct {
 	agentID         string
@@ -223,6 +237,28 @@ type AgentClient struct {
 	pending         map[string]chan JsonRpcResponse
 	mu              sync.Mutex
 	writeMu         sync.Mutex
+
+	// lastSeen records the last time activity was observed from this agent
+	// (a line received by readLoop, or a successful Call reply), guarded by
+	// mu. Used by Online/isOnline to judge liveness.
+	lastSeen time.Time
+
+	// metricsHistory is a bounded ring buffer of recent get_metrics samples,
+	// populated by metricsPoller when GatewayConfig.MetricsPollSeconds > 0.
+	// Guarded by mu.
+	metricsHistory []MetricSample
+
+	// cpuBreached/memBreached/diskBreached track, per alert dimension,
+	// whether the last-evaluated sample was in breach. They exist purely so
+	// alerts fire once on transition into breach rather than every poll
+	// while the breach persists. Guarded by mu.
+	cpuBreached  bool
+	memBreached  bool
+	diskBreached bool
+
+	// stopPoll is closed exactly once, by cleanup, to stop metricsPoller (if
+	// running) when the agent connection is torn down.
+	stopPoll chan struct{}
 }
 
 func NewAgentClient(agentID string, ipAddress string, channel ssh.Channel) *AgentClient {
@@ -231,9 +267,23 @@ func NewAgentClient(agentID string, ipAddress string, channel ssh.Channel) *Agen
 		ipAddress: ipAddress,
 		channel:   channel,
 		pending:   make(map[string]chan JsonRpcResponse),
+		lastSeen:  time.Now(),
+		stopPoll:  make(chan struct{}),
 	}
 	go client.readLoop()
 	go client.querySystemInfo()
+
+	currentConfigMu.RLock()
+	pollSeconds := 0
+	if currentConfig != nil {
+		pollSeconds = currentConfig.MetricsPollSeconds
+	}
+	currentConfigMu.RUnlock()
+	// Opt-in: periodic metrics polling only starts when explicitly configured.
+	if pollSeconds > 0 {
+		go client.metricsPoller(pollSeconds)
+	}
+
 	return client
 }
 
@@ -309,6 +359,10 @@ func (c *AgentClient) readLoop() {
 			return
 		}
 
+		c.mu.Lock()
+		c.lastSeen = time.Now()
+		c.mu.Unlock()
+
 		var resp JsonRpcResponse
 		if err := json.Unmarshal(line, &resp); err != nil {
 			log.Printf("[%s] failed to unmarshal response: %v", c.agentID, err)
@@ -330,6 +384,7 @@ func (c *AgentClient) cleanup(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	log.Printf("[%s] connection closed: %v", c.agentID, err)
+	close(c.stopPoll)
 	for id, ch := range c.pending {
 		ch <- JsonRpcResponse{
 			JsonRpc: "2.0",
@@ -382,6 +437,9 @@ func (c *AgentClient) Call(req JsonRpcRequest) JsonRpcResponse {
 
 	select {
 	case resp := <-ch:
+		c.mu.Lock()
+		c.lastSeen = time.Now()
+		c.mu.Unlock()
 		return resp
 	case <-time.After(35 * time.Second): // Slightly longer than command execution timeout (30s)
 		c.mu.Lock()
@@ -392,6 +450,220 @@ func (c *AgentClient) Call(req JsonRpcRequest) JsonRpcResponse {
 			Error:   JsonRpcError{Code: -32603, Message: "Request timeout"},
 			ID:      req.ID,
 		}
+	}
+}
+
+// isOnline is the pure staleness check behind AgentClient.Online, extracted
+// so it can be table-driven tested with synthetic timestamps without
+// touching global config state or spinning up goroutines. pollSeconds <= 0
+// means periodic polling is disabled, so a fixed 90s liveness window is used
+// instead of 3x the poll interval. A zero lastSeen (never observed) is
+// always considered offline.
+func isOnline(lastSeen, now time.Time, pollSeconds int) bool {
+	if lastSeen.IsZero() {
+		return false
+	}
+	window := 90 * time.Second
+	if pollSeconds > 0 {
+		window = 3 * time.Duration(pollSeconds) * time.Second
+	}
+	age := now.Sub(lastSeen)
+	return age >= 0 && age <= window
+}
+
+// Online reports whether this agent has been heard from recently enough
+// (via readLoop traffic or a successful Call) to be considered live. See
+// isOnline for the staleness window logic.
+func (c *AgentClient) Online() bool {
+	c.mu.Lock()
+	last := c.lastSeen
+	c.mu.Unlock()
+
+	currentConfigMu.RLock()
+	pollSeconds := 0
+	if currentConfig != nil {
+		pollSeconds = currentConfig.MetricsPollSeconds
+	}
+	currentConfigMu.RUnlock()
+
+	return isOnline(last, time.Now(), pollSeconds)
+}
+
+// LastSeen returns the last time activity was observed from this agent.
+func (c *AgentClient) LastSeen() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastSeen
+}
+
+// appendMetricSample appends sample to history, trimming the oldest entries
+// so the length never exceeds capSize. This is the pure ring-buffer logic
+// behind metricsPoller, factored out for direct unit testing. capSize <= 0
+// is treated as 1 (history is never fully disabled once polling starts a
+// poller, since callers only invoke this when polling is enabled).
+func appendMetricSample(history []MetricSample, sample MetricSample, capSize int) []MetricSample {
+	if capSize <= 0 {
+		capSize = 1
+	}
+	history = append(history, sample)
+	if len(history) > capSize {
+		history = history[len(history)-capSize:]
+	}
+	return history
+}
+
+// alertMetrics is a minimal projection of the agent's get_metrics JSON,
+// carrying just the fields threshold alerting evaluates. Field names mirror
+// pkg/metrics.SystemMetrics's JSON tags; kept as a local, independent struct
+// so the gateway isn't coupled to that package's full schema.
+type alertMetrics struct {
+	CPUUsagePercent float64 `json:"cpu_usage_percent"`
+	MemUsedPercent  float64 `json:"mem_used_percent"`
+	DiskUsedPercent float64 `json:"disk_used_percent"`
+}
+
+// alertTransition computes whether a dimension is now breached given value
+// vs threshold, and whether that represents a transition into breach
+// ("fired") from the previous state. Pure function so the transition logic
+// (fire once per breach onset, not every poll while it persists) is directly
+// unit-testable. threshold <= 0 disables alerting for that dimension: never
+// breached, never fires.
+func alertTransition(wasBreached bool, value, threshold float64) (nowBreached, fired bool) {
+	if threshold <= 0 {
+		return false, false
+	}
+	nowBreached = value > threshold
+	fired = nowBreached && !wasBreached
+	return nowBreached, fired
+}
+
+// evaluateAlertDimension applies alertTransition for one metric dimension
+// against the agent's tracked breach state, and on a transition (into breach
+// or recovery) logs and, for breach onset, writes a signed audit event.
+func (c *AgentClient) evaluateAlertDimension(dimension string, threshold, value float64, breached *bool) {
+	c.mu.Lock()
+	wasBreached := *breached
+	nowBreached, fired := alertTransition(wasBreached, value, threshold)
+	recovered := wasBreached && !nowBreached
+	*breached = nowBreached
+	c.mu.Unlock()
+
+	if fired {
+		details := fmt.Sprintf("value=%.2f threshold=%.2f", value, threshold)
+		log.Printf("[ALERT] [%s] %s threshold breached: %s", c.agentID, dimension, details)
+		logAuditEvent(context.Background(), "alert", c.agentID, dimension, "failure", details)
+	} else if recovered {
+		log.Printf("[ALERT] [%s] %s recovered below threshold (value=%.2f threshold=%.2f)", c.agentID, dimension, value, threshold)
+	}
+}
+
+// checkAlerts parses one raw get_metrics sample and evaluates it against the
+// configured thresholds, one dimension at a time. A field <= 0 in thresholds
+// disables alerting for that dimension (see alertTransition).
+func (c *AgentClient) checkAlerts(raw json.RawMessage, thresholds *config.AlertThresholds) {
+	var m alertMetrics
+	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("[%s] alert check: failed to parse metrics: %v", c.agentID, err)
+		return
+	}
+
+	c.evaluateAlertDimension("cpu", thresholds.CPUPercent, m.CPUUsagePercent, &c.cpuBreached)
+	c.evaluateAlertDimension("mem", thresholds.MemPercent, m.MemUsedPercent, &c.memBreached)
+	c.evaluateAlertDimension("disk", thresholds.DiskPercent, m.DiskUsedPercent, &c.diskBreached)
+}
+
+// extractToolResultText pulls the text of the first content item out of a
+// tools/call JsonRpcResponse.Result, matching the standard MCP content[]
+// envelope agents use (mirrors the inline parsing in querySystemInfo).
+func extractToolResultText(result interface{}) (string, bool) {
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	contentArr, ok := resultMap["content"].([]interface{})
+	if !ok || len(contentArr) == 0 {
+		return "", false
+	}
+	contentObj, ok := contentArr[0].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	textVal, ok := contentObj["text"].(string)
+	if !ok {
+		return "", false
+	}
+	return textVal, true
+}
+
+// metricsPoller runs for the lifetime of an agent connection when
+// GatewayConfig.MetricsPollSeconds > 0 (set at connect time in
+// NewAgentClient), periodically calling the agent's get_metrics tool,
+// appending the raw result to the bounded history ring buffer, and
+// evaluating alert thresholds. It exits when stopPoll is closed by cleanup.
+func (c *AgentClient) metricsPoller(pollSeconds int) {
+	ticker := time.NewTicker(time.Duration(pollSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopPoll:
+			return
+		case <-ticker.C:
+			c.pollMetricsOnce()
+		}
+	}
+}
+
+// pollMetricsOnce performs a single get_metrics call, records the sample
+// into the bounded history, and runs alert checks if configured. History
+// size and alert thresholds are read fresh from currentConfig on every poll
+// so config reloads take effect without needing to reconnect agents.
+func (c *AgentClient) pollMetricsOnce() {
+	callParams := CallToolParams{Name: "get_metrics"}
+	callParamsBytes, _ := json.Marshal(callParams)
+	req := JsonRpcRequest{
+		JsonRpc: "2.0",
+		Method:  "tools/call",
+		Params:  callParamsBytes,
+		ID:      "metrics-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+	}
+
+	resp := c.Call(req)
+	if resp.Error != nil {
+		log.Printf("[%s] metrics poll failed: %v", c.agentID, resp.Error)
+		return
+	}
+
+	text, ok := extractToolResultText(resp.Result)
+	if !ok {
+		log.Printf("[%s] metrics poll: unexpected response shape", c.agentID)
+		return
+	}
+	raw := json.RawMessage(text)
+	if !json.Valid(raw) {
+		log.Printf("[%s] metrics poll: get_metrics returned non-JSON text", c.agentID)
+		return
+	}
+
+	currentConfigMu.RLock()
+	historySize := 0
+	var thresholds *config.AlertThresholds
+	if currentConfig != nil {
+		historySize = currentConfig.MetricsHistorySize
+		thresholds = currentConfig.AlertThresholds
+	}
+	currentConfigMu.RUnlock()
+	if historySize <= 0 {
+		historySize = 60
+	}
+
+	sample := MetricSample{Timestamp: time.Now(), Raw: raw}
+	c.mu.Lock()
+	c.metricsHistory = appendMetricSample(c.metricsHistory, sample, historySize)
+	c.mu.Unlock()
+
+	if thresholds != nil {
+		c.checkAlerts(raw, thresholds)
 	}
 }
 
@@ -1226,6 +1498,7 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	http.HandleFunc("/sse", requireAuth(handleSse))
 	http.HandleFunc("/message", requireAuth(handleMessage))
 	http.HandleFunc("/api/status", requireAuth(handleApiStatus))
+	http.HandleFunc("/api/fleet", requireAuth(handleApiFleet))
 	http.HandleFunc("/api/config", requireAuth(handleApiConfig))
 	http.HandleFunc("/api/keys", requireAuth(handleApiKeys))
 	http.HandleFunc("/api/call", requireAuth(handleApiCall))
@@ -2225,7 +2498,18 @@ func handleApiStatus(w http.ResponseWriter, r *http.Request) {
 		OSVersion       string   `json:"os_version"`
 		RunningServices []string `json:"running_services"`
 		OpenPorts       []string `json:"open_ports"`
+		// Online/LastSeen are additive fields for heartbeat/liveness (#33).
+		// Existing callers that decode only the fields above are unaffected.
+		Online   bool   `json:"online"`
+		LastSeen string `json:"last_seen,omitempty"`
 	}
+
+	currentConfigMu.RLock()
+	pollSeconds := 0
+	if currentConfig != nil {
+		pollSeconds = currentConfig.MetricsPollSeconds
+	}
+	currentConfigMu.RUnlock()
 
 	agentsMu.RLock()
 	agentList := make([]AgentStatusInfo, 0, len(agents))
@@ -2237,6 +2521,8 @@ func handleApiStatus(w http.ResponseWriter, r *http.Request) {
 			OSVersion:       client.osVersion,
 			RunningServices: client.runningServices,
 			OpenPorts:       client.openPorts,
+			Online:          isOnline(client.lastSeen, time.Now(), pollSeconds),
+			LastSeen:        formatLastSeen(client.lastSeen),
 		}
 		if info.OSVersion == "" {
 			info.OSVersion = "Loading..."
@@ -2266,6 +2552,133 @@ func handleApiStatus(w http.ResponseWriter, r *http.Request) {
 		"agents":    agentList,
 		"upstreams": upstreams,
 	})
+}
+
+// formatLastSeen renders a lastSeen timestamp for API responses. A zero time
+// (agent never observed) renders as "" rather than Go's zero-value date.
+func formatLastSeen(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// FleetAgentInfo is the per-agent shape returned by /api/fleet, the fleet
+// query/inventory surface (issues #37/#42). It is additive: handleApiStatus
+// keeps its existing AgentStatusInfo shape for backward compatibility with
+// the myrmex CLI, and this is a separate, newer surface.
+type FleetAgentInfo struct {
+	ID            string          `json:"id"`
+	IP            string          `json:"ip"`
+	OS            string          `json:"os"`
+	Services      []string        `json:"services"`
+	Ports         []string        `json:"ports"`
+	Tags          []string        `json:"tags"`
+	Online        bool            `json:"online"`
+	LastSeen      string          `json:"last_seen,omitempty"`
+	LatestMetrics json.RawMessage `json:"latest_metrics"`
+	HistoryLen    int             `json:"history_len"`
+}
+
+// fleetMatches applies the /api/fleet query-param filters to one agent's
+// info. Pure function (no I/O) so filter matching is directly unit
+// testable. Empty filter values match everything. statusFilter is
+// "online"/"stale" (case-insensitive; any other value, including empty,
+// matches all); tagFilter must exactly match one of the agent's tags;
+// osFilter is a case-insensitive substring match against OS.
+func fleetMatches(info FleetAgentInfo, statusFilter, tagFilter, osFilter string) bool {
+	switch strings.ToLower(statusFilter) {
+	case "online":
+		if !info.Online {
+			return false
+		}
+	case "stale":
+		if info.Online {
+			return false
+		}
+	}
+
+	if tagFilter != "" {
+		found := false
+		for _, t := range info.Tags {
+			if t == tagFilter {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	if osFilter != "" && !strings.Contains(strings.ToLower(info.OS), strings.ToLower(osFilter)) {
+		return false
+	}
+
+	return true
+}
+
+// handleApiFleet is the fleet-wide inventory/query API (issues #37/#42): a
+// searchable, filterable snapshot of every connected agent, including
+// liveness (#33) and the latest polled metrics/history size (#35/#41 rely on
+// the same underlying per-agent state). Read-only; available to admin,
+// operator, and read-only roles (see rolePermissions).
+func handleApiFleet(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	setCORS(w, r)
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	statusFilter := r.URL.Query().Get("status")
+	tagFilter := r.URL.Query().Get("tag")
+	osFilter := r.URL.Query().Get("os")
+
+	currentConfigMu.RLock()
+	var agentTags map[string][]string
+	pollSeconds := 0
+	if currentConfig != nil {
+		agentTags = currentConfig.AgentTags
+		pollSeconds = currentConfig.MetricsPollSeconds
+	}
+	currentConfigMu.RUnlock()
+
+	agentsMu.RLock()
+	clients := make([]*AgentClient, 0, len(agents))
+	for _, client := range agents {
+		clients = append(clients, client)
+	}
+	agentsMu.RUnlock()
+
+	now := time.Now()
+	fleet := make([]FleetAgentInfo, 0, len(clients))
+	for _, client := range clients {
+		client.mu.Lock()
+		info := FleetAgentInfo{
+			ID:         client.agentID,
+			IP:         client.ipAddress,
+			OS:         client.osVersion,
+			Services:   client.runningServices,
+			Ports:      client.openPorts,
+			Tags:       agentTags[client.agentID],
+			Online:     isOnline(client.lastSeen, now, pollSeconds),
+			LastSeen:   formatLastSeen(client.lastSeen),
+			HistoryLen: len(client.metricsHistory),
+		}
+		if n := len(client.metricsHistory); n > 0 {
+			info.LatestMetrics = client.metricsHistory[n-1].Raw
+		}
+		client.mu.Unlock()
+
+		if !fleetMatches(info, statusFilter, tagFilter, osFilter) {
+			continue
+		}
+		fleet = append(fleet, info)
+	}
+
+	json.NewEncoder(w).Encode(fleet)
 }
 
 func handleApiConfig(w http.ResponseWriter, r *http.Request) {
