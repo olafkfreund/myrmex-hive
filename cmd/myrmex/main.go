@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -148,6 +149,8 @@ Commands:
   config        View the current gateway configuration
   ask           Ask the Myrmex AI Assistant to perform a task
   audit verify  Verify a signed, hash-chained gateway audit log
+  audit export  Export the audit log as JSON or CSV for archival/review
+  audit pubkey  Print the gateway host public key for external auditors
 
 Global Options:
   --url         Gateway API base URL (default: https://localhost:8080)
@@ -174,8 +177,23 @@ Real-Life Scenarios:
   6. Verify the integrity of the gateway's signed audit log:
      myrmex audit verify --log audit.log --host-key host_key.pub
 
+  7. Export the audit log to CSV for archival or a compliance reviewer:
+     myrmex audit export --log audit.log --format csv --out audit.csv
+
+  8. Print the gateway host public key to hand to an external auditor:
+     myrmex audit pubkey --host-key host_key.pub
+
 Audit Verify Options:
   --log         Path to the audit log file (default: audit.log)
+  --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
+                authorized-key format, e.g. host_key.pub (required)
+
+Audit Export Options:
+  --log         Path to the audit log file (default: audit.log)
+  --format      Output format: json, csv (default: json)
+  --out         Write output to this file instead of stdout (optional)
+
+Audit Pubkey Options:
   --host-key    Path to the gateway's SSH host PUBLIC key in OpenSSH
                 authorized-key format, e.g. host_key.pub (required)
 `
@@ -687,15 +705,28 @@ type auditLineResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// handleAudit dispatches "audit" subcommands. Currently only "verify" is
-// supported.
+// handleAudit dispatches "audit" subcommands: "verify" checks integrity,
+// "export" re-emits the log as JSON/CSV, and "pubkey" prints the gateway's
+// host public key for independent verification.
 func handleAudit(cfg Config, args []string) {
-	if len(args) == 0 || args[0] != "verify" {
-		fmt.Fprintln(os.Stderr, "Error: Unknown or missing 'audit' subcommand.")
-		fmt.Fprintln(os.Stderr, "Usage: myrmex audit verify --log <path> --host-key <path>")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: Missing 'audit' subcommand.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit <verify|export|pubkey> [options]")
 		os.Exit(1)
 	}
-	handleAuditVerify(cfg, args[1:])
+
+	switch args[0] {
+	case "verify":
+		handleAuditVerify(cfg, args[1:])
+	case "export":
+		handleAuditExport(cfg, args[1:])
+	case "pubkey":
+		handleAuditPubkey(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Error: Unknown 'audit' subcommand %q.\n", args[0])
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit <verify|export|pubkey> [options]")
+		os.Exit(1)
+	}
 }
 
 // handleAuditVerify validates a gateway audit log: every entry's SSH
@@ -871,6 +902,156 @@ func handleAuditVerify(cfg Config, args []string) {
 	if cfg.Output != "json" {
 		fmt.Println("Result: AUDIT LOG VERIFICATION PASSED")
 	}
+}
+
+// handleAuditExport reads a gateway audit log and re-emits it as either a JSON
+// array (default) or CSV. It is a local, read-only operation and requires no
+// Gateway auth token. Output goes to --out if given, otherwise stdout.
+func handleAuditExport(cfg Config, args []string) {
+	logPath := "audit.log"
+	format := "json"
+	outPath := ""
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--log":
+			if i+1 < len(args) {
+				logPath = args[i+1]
+				i++
+			}
+		case "--format":
+			if i+1 < len(args) {
+				format = args[i+1]
+				i++
+			}
+		case "--out":
+			if i+1 < len(args) {
+				outPath = args[i+1]
+				i++
+			}
+		}
+	}
+
+	if format != "json" && format != "csv" {
+		fmt.Fprintf(os.Stderr, "Error: Unknown export format %q (expected 'json' or 'csv').\n", format)
+		os.Exit(1)
+	}
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to open audit log %q: %v\n", logPath, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	var entries []auditEntry
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry auditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Invalid JSON on line %d of %q: %v\n", lineNum, logPath, err)
+			os.Exit(1)
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to read audit log %q: %v\n", logPath, err)
+		os.Exit(1)
+	}
+
+	// Select the output writer: a file when --out is given, else stdout.
+	var out io.Writer = os.Stdout
+	if outPath != "" {
+		of, err := os.Create(outPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to create output file %q: %v\n", outPath, err)
+			os.Exit(1)
+		}
+		defer of.Close()
+		out = of
+	}
+
+	switch format {
+	case "json":
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		if entries == nil {
+			entries = []auditEntry{}
+		}
+		if err := enc.Encode(entries); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to encode JSON: %v\n", err)
+			os.Exit(1)
+		}
+	case "csv":
+		w := csv.NewWriter(out)
+		header := []string{"timestamp", "token_id", "role", "action", "agent_id", "command", "status", "details", "signature"}
+		if err := w.Write(header); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to write CSV header: %v\n", err)
+			os.Exit(1)
+		}
+		for _, e := range entries {
+			row := []string{e.Timestamp, e.TokenID, e.Role, e.Action, e.AgentID, e.Command, e.Status, e.Details, e.Signature}
+			if err := w.Write(row); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: Failed to write CSV row: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		w.Flush()
+		if err := w.Error(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to flush CSV: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if outPath != "" {
+		fmt.Fprintf(os.Stderr, "Exported %d audit entries to %q as %s.\n", len(entries), outPath, format)
+	}
+}
+
+// handleAuditPubkey reads the gateway host PUBLIC key file and prints it in
+// OpenSSH authorized-key format so an external auditor can be handed the exact
+// key needed to verify audit-log signatures independently. Local, read-only.
+func handleAuditPubkey(args []string) {
+	hostKeyPath := ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--host-key":
+			if i+1 < len(args) {
+				hostKeyPath = args[i+1]
+				i++
+			}
+		}
+	}
+
+	if hostKeyPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: --host-key <path> is required for 'audit pubkey'.")
+		fmt.Fprintln(os.Stderr, "Usage: myrmex audit pubkey --host-key <path>")
+		os.Exit(1)
+	}
+
+	keyBytes, err := os.ReadFile(hostKeyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to read host key %q: %v\n", hostKeyPath, err)
+		os.Exit(1)
+	}
+
+	// Validate that the file really is an OpenSSH authorized-key so we never
+	// hand an auditor a malformed or private key by mistake.
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %q is not a valid OpenSSH public key: %v\n", hostKeyPath, err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stderr, "Gateway host public key (%s) — give this to auditors to verify audit-log signatures with 'myrmex audit verify':\n", pub.Type())
+	fmt.Println(strings.TrimSpace(string(keyBytes)))
 }
 
 func mustMarshalJSON(v interface{}) string {
