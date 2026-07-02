@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-06-18/server.schema.json",
+  "name": "io.github.olafkfreund/myrmex-hive",
+  "description": "Myrmex Hive: a zero-inbound-port MCP gateway for managing distributed edge servers. Agents dial out to a central Gateway over SSH; the Gateway exposes their tools (run_command, get_metrics, read_logs, get_system_info) as namespaced MCP tools over stdio, HTTP/SSE, and a REST API, with RBAC, scoped tokens, risk-tiered approvals, and a signed audit log.",
+  "repository": {
+    "url": "https://github.com/olafkfreund/myrmex-hive",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registry_type": "oci",
+      "identifier": "ghcr.io/olafkfreund/myrmex-hive-gateway",
+      "version": "0.1.0",
+      "runtime_hint": "docker",
+      "transport": {
+        "type": "stdio"
+      },
+      "package_arguments": [],
+      "environment_variables": [
+        {
+          "name": "MYRMEX_GATEWAY_CONFIG",
+          "description": "Path to gateway_config.json inside the container",
+          "is_required": false
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "sse",
+      "url": "http://localhost:8080/sse"
+    }
+  ]
+}

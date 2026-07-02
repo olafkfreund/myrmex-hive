@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -25,6 +27,44 @@ type AgentConfig struct {
 	// KnownHostKeyPath is the path used to persist a trust-on-first-use (TOFU)
 	// learned gateway host key. Defaults to PrivateKeyPath+".gateway_hostkey".
 	KnownHostKeyPath string `json:"known_host_key_path,omitempty"`
+}
+
+// Validate checks the AgentConfig for missing/inconsistent required fields
+// and normalizes GatewayAddrs so callers can rely on it being populated
+// whenever GatewayAddr and/or GatewayAddrs was set. It returns an aggregated
+// error listing every problem found, or nil if the config is usable.
+func (c *AgentConfig) Validate() error {
+	var errs []error
+
+	if c.GatewayAddr == "" && len(c.GatewayAddrs) == 0 {
+		errs = append(errs, fmt.Errorf("at least one of gateway_addr or gateway_addrs must be set"))
+	}
+
+	// Normalize: ensure GatewayAddrs reflects both fields so callers only
+	// need to consult GatewayAddrs.
+	if len(c.GatewayAddrs) == 0 && c.GatewayAddr != "" {
+		c.GatewayAddrs = []string{c.GatewayAddr}
+	} else if c.GatewayAddr != "" {
+		found := false
+		for _, a := range c.GatewayAddrs {
+			if a == c.GatewayAddr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.GatewayAddrs = append([]string{c.GatewayAddr}, c.GatewayAddrs...)
+		}
+	}
+
+	if c.AgentID == "" {
+		errs = append(errs, fmt.Errorf("agent_id must be set"))
+	}
+	if c.PrivateKeyPath == "" {
+		errs = append(errs, fmt.Errorf("private_key_path must be set"))
+	}
+
+	return errors.Join(errs...)
 }
 
 type UpstreamServer struct {
@@ -120,6 +160,35 @@ type AlertThresholds struct {
 	DiskPercent float64 `json:"disk_percent"`
 }
 
+// Validate checks the GatewayConfig for missing/inconsistent required fields
+// and returns an aggregated error listing every problem found, or nil if the
+// config is usable.
+func (c *GatewayConfig) Validate() error {
+	var errs []error
+
+	if c.ListenAddr == "" {
+		errs = append(errs, fmt.Errorf("listen_addr must be set"))
+	}
+
+	// Mirrors the runtime fail-closed rule: a signed audit log requires a
+	// host key to sign with, so catch the misconfiguration at load time
+	// rather than at first audit-log write.
+	if c.AuditLogPath != "" && c.HostKeyPath == "" {
+		errs = append(errs, fmt.Errorf("host_key_path must be set when audit_log_path is set"))
+	}
+
+	for i, st := range c.ScopedTokens {
+		if st.Token == "" {
+			errs = append(errs, fmt.Errorf("scoped_tokens[%d]: token must not be empty", i))
+		}
+		if st.Role == "" {
+			errs = append(errs, fmt.Errorf("scoped_tokens[%d]: role must not be empty", i))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
 // resolveSecret resolves indirect secret references so secret-bearing config
 // values need not be written inline in the JSON config. Supported forms:
 //
@@ -160,6 +229,10 @@ func LoadAgentConfig(path string) (*AgentConfig, error) {
 		return nil, err
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
@@ -189,6 +262,10 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	}
 	for i := range cfg.ScopedTokens {
 		cfg.ScopedTokens[i].Token = resolveSecret(cfg.ScopedTokens[i].Token)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil
