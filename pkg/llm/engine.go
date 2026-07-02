@@ -44,30 +44,34 @@ func (Disabled) Name() string {
 // EngineConfig selects and configures an Engine implementation.
 //
 // Provider selects the backend:
-//   - ""  or "ollama": local Ollama server (default)
-//   - "disabled":       no LLM backend; Generate always errors
+//   - ""  or "ollama":                             local Ollama server (default)
+//   - "openai", "vllm", "llamacpp", "openai-compatible": any backend exposing
+//     an OpenAI-compatible /v1/chat/completions endpoint (OpenAI itself,
+//     vLLM, or llama.cpp's server)
+//   - "disabled":                                   no LLM backend; Generate always errors
 //
 // URL and Model are backend-specific; for Ollama they map directly to
-// NewClient's url and model parameters.
+// NewClient's url and model parameters. APIKey is only used by the
+// OpenAI-compatible backend, where it is sent as a Bearer token when set.
 type EngineConfig struct {
 	Provider string
 	URL      string
 	Model    string
+	APIKey   string
 }
 
 // NewEngine constructs an Engine from cfg. Unknown providers currently fall
-// back to Ollama to preserve existing behavior while additional backends are
-// implemented.
-//
-// TODO: llama.cpp, vLLM, openai-compatible backends (#53)
+// back to Ollama to preserve existing behavior.
 func NewEngine(cfg EngineConfig) Engine {
 	switch cfg.Provider {
 	case "disabled":
 		return NewDisabled()
+	case "openai", "vllm", "llamacpp", "openai-compatible":
+		return NewOpenAIClient(cfg.URL, cfg.Model, cfg.APIKey)
 	case "", "ollama":
 		return NewClient(cfg.URL, cfg.Model)
 	default:
-		// TODO: llama.cpp, vLLM, openai-compatible backends (#53)
+		// Unknown provider: default to Ollama.
 		return NewClient(cfg.URL, cfg.Model)
 	}
 }
