@@ -1,12 +1,15 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 type AllowedCommand struct {
@@ -192,12 +195,18 @@ func (c *GatewayConfig) Validate() error {
 // resolveSecret resolves indirect secret references so secret-bearing config
 // values need not be written inline in the JSON config. Supported forms:
 //
-//   - "env:NAME"        -> the value of environment variable NAME
-//   - "file:/path/to/f" -> the trimmed contents of that file
-//   - "${NAME}"         -> the value of environment variable NAME (whole-string form)
-//   - anything else     -> returned unchanged, preserving backward compatibility
+//   - "env:NAME"          -> the value of environment variable NAME
+//   - "file:/path/to/f"   -> the trimmed contents of that file
+//   - "${NAME}"           -> the value of environment variable NAME (whole-string form)
+//   - "vault:<path>#field" -> the named field read from HashiCorp Vault's KV
+//     secret engine at <path> (e.g. "vault:secret/data/myrmex#auth_token"),
+//     using VAULT_ADDR (default "http://127.0.0.1:8200") and VAULT_TOKEN from
+//     the environment. Supports both KV v2 (.data.data.<field>) and KV v1
+//     (.data.<field>) response shapes.
+//   - anything else       -> returned unchanged, preserving backward compatibility
 //
-// File read errors are logged to stderr and resolve to "" rather than panicking.
+// File read errors and Vault errors are logged to stderr and resolve to ""
+// rather than panicking.
 func resolveSecret(s string) string {
 	switch {
 	case strings.HasPrefix(s, "env:"):
@@ -209,11 +218,95 @@ func resolveSecret(s string) string {
 			return ""
 		}
 		return strings.TrimSpace(string(data))
+	case strings.HasPrefix(s, "vault:"):
+		val, err := resolveVault(strings.TrimPrefix(s, "vault:"))
+		if err != nil {
+			log.Printf("resolveSecret: failed to resolve vault secret %q: %v", s, err)
+			return ""
+		}
+		return strings.TrimSpace(val)
 	case strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}"):
 		return strings.TrimSpace(os.Getenv(s[2 : len(s)-1]))
 	default:
 		return s
 	}
+}
+
+// resolveVault reads a secret from HashiCorp Vault's HTTP KV API. ref is of
+// the form "<mountAndPath>#<field>", e.g. "secret/data/myrmex#auth_token".
+// It reads VAULT_ADDR (default "http://127.0.0.1:8200") and VAULT_TOKEN from
+// the environment, and supports both KV v2 (.data.data.<field>) and KV v1
+// (.data.<field>) response shapes, trying v2 first.
+func resolveVault(ref string) (string, error) {
+	pathAndField := strings.SplitN(ref, "#", 2)
+	if len(pathAndField) != 2 || pathAndField[0] == "" || pathAndField[1] == "" {
+		return "", fmt.Errorf("invalid vault reference %q: expected \"<path>#<field>\"", ref)
+	}
+	path, field := pathAndField[0], pathAndField[1]
+
+	token := os.Getenv("VAULT_TOKEN")
+	if token == "" {
+		return "", fmt.Errorf("VAULT_TOKEN is not set")
+	}
+
+	addr := os.Getenv("VAULT_ADDR")
+	if addr == "" {
+		addr = "http://127.0.0.1:8200"
+	}
+
+	url := strings.TrimRight(addr, "/") + "/v1/" + strings.TrimLeft(path, "/")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("building vault request: %w", err)
+	}
+	req.Header.Set("X-Vault-Token", token)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("vault request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("vault returned status %d for %q", resp.StatusCode, url)
+	}
+
+	// Decode generically so both KV v1 ({"data": {field: ...}}) and KV v2
+	// ({"data": {"data": {field: ...}}}) response shapes can be inspected
+	// from a single parse.
+	var body struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", fmt.Errorf("decoding vault response: %w", err)
+	}
+
+	// KV v2 shape: data.data.<field>
+	if inner, ok := body.Data["data"].(map[string]any); ok {
+		if v, ok := inner[field]; ok {
+			s, ok := v.(string)
+			if !ok {
+				return "", fmt.Errorf("vault field %q is not a string", field)
+			}
+			return s, nil
+		}
+	}
+
+	// KV v1 shape: data.<field>
+	if v, ok := body.Data[field]; ok {
+		s, ok := v.(string)
+		if !ok {
+			return "", fmt.Errorf("vault field %q is not a string", field)
+		}
+		return s, nil
+	}
+
+	return "", fmt.Errorf("field %q not found in vault response for %q", field, url)
 }
 
 func LoadAgentConfig(path string) (*AgentConfig, error) {
