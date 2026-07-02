@@ -104,19 +104,35 @@ type TokenScope struct {
 }
 
 type GatewayConfig struct {
-	ListenAddr         string                    `json:"listen_addr"`
-	HTTPAddr           string                    `json:"http_addr"`
-	HostKeyPath        string                    `json:"host_key_path"`
-	AuthorizedKeysPath string                    `json:"authorized_keys_path"`
-	OllamaURL          string                    `json:"ollama_url"`
-	OllamaModel        string                    `json:"ollama_model"`
-	UpstreamServers    []UpstreamServer          `json:"upstream_servers,omitempty"`
-	ExternalMcpServers []ExternalMcpServerConfig `json:"external_mcp_servers,omitempty"`
-	TLSCertPath        string                    `json:"tls_cert_path,omitempty"`
-	TLSKeyPath         string                    `json:"tls_key_path,omitempty"`
-	AuthToken          string                    `json:"auth_token,omitempty"`
-	AntigravityToken   string                    `json:"antigravity_token,omitempty"`
-	Tokens             map[string]string         `json:"tokens,omitempty"`
+	ListenAddr         string `json:"listen_addr"`
+	HTTPAddr           string `json:"http_addr"`
+	HostKeyPath        string `json:"host_key_path"`
+	AuthorizedKeysPath string `json:"authorized_keys_path"`
+	OllamaURL          string `json:"ollama_url"`
+	OllamaModel        string `json:"ollama_model"`
+	// LLMProvider selects the LLM backend used for gateway__ask_gemma,
+	// gateway__humanize_syslog, and the /api/chat Ollama fallback path. See
+	// llm.EngineConfig.Provider for accepted values (""/"ollama", "openai",
+	// "vllm", "llamacpp", "openai-compatible", "disabled"). Empty preserves
+	// the historical default: enabled (as Ollama) only when OllamaURL is set,
+	// disabled otherwise.
+	LLMProvider string `json:"llm_provider,omitempty"`
+	// LLMAPIKey is the bearer token sent to OpenAI-compatible LLM backends
+	// (OpenAI, vLLM, llama.cpp's server). Unused by the Ollama provider.
+	// Resolved via resolveSecret like other secret fields (env:/file:/agenix:/vault:).
+	LLMAPIKey string `json:"llm_api_key,omitempty"`
+	// MaxOrchestrationSteps bounds how many tool-call iterations the
+	// gateway__ask_gemma structured orchestration loop may take before it
+	// must stop and summarize whatever was accomplished so far. A value <= 0
+	// (including unset) defaults to 3 at the point the gateway uses it.
+	MaxOrchestrationSteps int                       `json:"max_orchestration_steps,omitempty"`
+	UpstreamServers       []UpstreamServer          `json:"upstream_servers,omitempty"`
+	ExternalMcpServers    []ExternalMcpServerConfig `json:"external_mcp_servers,omitempty"`
+	TLSCertPath           string                    `json:"tls_cert_path,omitempty"`
+	TLSKeyPath            string                    `json:"tls_key_path,omitempty"`
+	AuthToken             string                    `json:"auth_token,omitempty"`
+	AntigravityToken      string                    `json:"antigravity_token,omitempty"`
+	Tokens                map[string]string         `json:"tokens,omitempty"`
 	// ScopedTokens are bearer tokens restricted to a role plus an optional
 	// subset of agents/tags/tools. They are checked before Tokens/AuthToken
 	// during authentication; existing Tokens/AuthToken entries remain
@@ -373,6 +389,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// file instead of embedding the secret value directly in the JSON config.
 	cfg.AuthToken = resolveSecret(cfg.AuthToken)
 	cfg.AntigravityToken = resolveSecret(cfg.AntigravityToken)
+	cfg.LLMAPIKey = resolveSecret(cfg.LLMAPIKey)
 	if cfg.Tokens != nil {
 		resolvedTokens := make(map[string]string, len(cfg.Tokens))
 		for token, role := range cfg.Tokens {
