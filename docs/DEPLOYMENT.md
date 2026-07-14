@@ -128,8 +128,11 @@ also the GitOps/sealed-secrets path. See [SECRETS.md](SECRETS.md).
 - **Every DaemonSet pod shares one `agent_id`.** The gateway's registry is keyed
   by `agent_id`, so identical IDs across nodes collide. For distinct per-node
   identities, render one Secret per node group and use `agent.existingSecret`.
-- **GHCR packages must be public** for anonymous pulls. If they are private, set
-  `imagePullSecrets` and run `helm registry login ghcr.io` before installing.
+- **No registry login needed.** The packages inherit this repository's public
+  visibility, so images and the chart pull anonymously (verified against
+  v1.0.1). If you publish from a *fork* with a private repo, the packages
+  inherit private instead — then set `imagePullSecrets` and run
+  `helm registry login ghcr.io` before installing.
 
 ### Upgrading
 
