@@ -94,6 +94,49 @@ Worth knowing before you build alerts on these:
 - **Counters reset on restart**, as they are in-memory. Use `rate()`/`increase()`,
   which handle resets, rather than raw counter values.
 
+## Grafana dashboard
+
+An example dashboard is shipped at
+[`dashboards/myrmex-hive.json`](../dashboards/myrmex-hive.json): fleet size and
+connectivity, tool-call rate/error-ratio/latency percentiles, per-agent
+CPU/memory/disk, upstream health, threshold breaches, alert-delivery failures,
+and HA peer forwards.
+
+Import it:
+
+1. Grafana → **Dashboards** → **New** → **Import**
+2. **Upload dashboard JSON file**, pick `dashboards/myrmex-hive.json`
+3. Select your Prometheus datasource when prompted for `DS_PROMETHEUS`
+4. **Import**
+
+Or via the API:
+
+```bash
+curl -X POST http://grafana:3000/api/dashboards/import \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $GRAFANA_TOKEN" \
+  -d "{\"dashboard\": $(cat dashboards/myrmex-hive.json), \"overwrite\": true,
+       \"inputs\": [{\"name\": \"DS_PROMETHEUS\", \"type\": \"datasource\",
+                     \"pluginId\": \"prometheus\", \"value\": \"Prometheus\"}]}"
+```
+
+Provision it declaratively by mounting the file into Grafana's dashboard
+provisioning path (`/etc/grafana/provisioning/dashboards/`).
+
+Panels that stay empty are telling you something real:
+
+- **CPU/memory/disk** need `metrics_poll_seconds > 0`.
+- **Threshold breaches** additionally needs `alert_thresholds`.
+- **Alert delivery failures** needs an alert target (see below); no target
+  means no deliveries to fail.
+- **HA peer forwards** only populates in a multi-gateway peer mesh.
+
+The dashboard is kept in sync with the exported metric names by a test
+(`cmd/gateway/dashboard_test.go`), which fails the build if a panel references
+a metric `/metrics` does not export, or if an exported metric has no panel. A
+dashboard drifting out of sync renders empty panels, which reads as "no
+traffic" rather than "broken dashboard" — hence the check.
+
 ### Useful queries
 
 ```promql
