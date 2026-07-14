@@ -90,6 +90,21 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 ```
 *The PowerShell script compiles the binary, registers the agent configuration under `C:\ProgramData\mcp-agent\`, generates OpenSSH keys, and schedules a background task to launch the agent at system startup.*
 
+### Kubernetes (Helm)
+
+Versioned container images and a Helm chart are published to GHCR on every release:
+
+```bash
+helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
+  --version 1.0.0 \
+  --namespace myrmex --create-namespace
+```
+
+`--version` pins the chart and the images together (v1.0.1+; v1.0.0 predates
+image/chart publishing). See
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the image list, a working install
+with agent keys, and the TLS/Service/`agent_id` caveats.
+
 ---
 
 ## 3. Configuration

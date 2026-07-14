@@ -27,6 +27,13 @@ jobs:
         run: |
           go test -v ./...
 
+      # The release publishes this chart *after* pushing images, so a broken
+      # template would otherwise only surface mid-release.
+      - name: Lint Helm chart
+        run: |
+          helm lint charts/myrmex-hive
+          helm template hive charts/myrmex-hive >/dev/null
+
       - name: Install Nix
         uses: cachix/install-nix-action@v26
         with:
