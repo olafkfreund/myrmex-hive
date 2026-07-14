@@ -59,12 +59,27 @@ func (h *histogram) observe(seconds float64) {
 	h.count++
 }
 
+type alertDeliveryKey struct {
+	target string // "webhook" | "alertmanager"
+	status string // "success" | "error"
+}
+
 var (
-	metricsMu    sync.Mutex
-	toolCalls    = map[toolCallKey]uint64{}
-	toolLatency  = map[toolKey]*histogram{}
-	peerForwards = map[string]uint64{}
+	metricsMu       sync.Mutex
+	toolCalls       = map[toolCallKey]uint64{}
+	toolLatency     = map[toolKey]*histogram{}
+	peerForwards    = map[string]uint64{}
+	alertDeliveries = map[alertDeliveryKey]uint64{}
 )
+
+// recordAlertDelivery records the outcome of one outbound alert delivery
+// (#100), so a silently failing on-call integration is visible rather than
+// only discoverable by noticing pages never arrive.
+func recordAlertDelivery(target, status string) {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+	alertDeliveries[alertDeliveryKey{target: target, status: status}]++
+}
 
 // recordToolCall records one completed operator-initiated tool call.
 //
@@ -206,6 +221,22 @@ func renderMetrics(w io.Writer) {
 		}
 	}
 
+	// Alert breach state (#100), so a dashboard can show which agents are
+	// currently alerting rather than re-deriving it from the gauges and the
+	// configured thresholds. Only meaningful when alert_thresholds is set;
+	// with alerting off every dimension reads 0.
+	writeHelp(w, "myrmex_agent_alert_breached", "1 if the agent's last polled sample breached the configured threshold for this dimension, else 0.", "gauge")
+	for _, c := range clients {
+		for _, d := range c.alertBreachState() {
+			breached := 0
+			if d.breached {
+				breached = 1
+			}
+			fmt.Fprintf(w, "myrmex_agent_alert_breached{agent_id=\"%s\",dimension=\"%s\"} %d\n",
+				escapeLabelValue(c.agentID), d.dimension, breached)
+		}
+	}
+
 	// --- Upstreams ----------------------------------------------------------
 	upstreamClientsMu.RLock()
 	upstreams := make([]UpstreamCaller, 0, len(upstreamClients))
@@ -276,11 +307,55 @@ func renderMetrics(w io.Writer) {
 		fwdStatuses = append(fwdStatuses, s)
 	}
 	sort.Strings(fwdStatuses)
+
+	deliveryKeys := make([]alertDeliveryKey, 0, len(alertDeliveries))
+	for k := range alertDeliveries {
+		deliveryKeys = append(deliveryKeys, k)
+	}
+	sort.Slice(deliveryKeys, func(i, j int) bool {
+		if deliveryKeys[i].target != deliveryKeys[j].target {
+			return deliveryKeys[i].target < deliveryKeys[j].target
+		}
+		return deliveryKeys[i].status < deliveryKeys[j].status
+	})
+	deliverySnapshot := make(map[alertDeliveryKey]uint64, len(alertDeliveries))
+	for k, v := range alertDeliveries {
+		deliverySnapshot[k] = v
+	}
+	forwardSnapshot := make(map[string]uint64, len(peerForwards))
+	for k, v := range peerForwards {
+		forwardSnapshot[k] = v
+	}
 	metricsMu.Unlock()
 
 	writeHelp(w, "myrmex_peer_forwards_total", "Calls forwarded to a peer gateway holding the target agent (HA mesh).", "counter")
 	for _, s := range fwdStatuses {
-		fmt.Fprintf(w, "myrmex_peer_forwards_total{status=\"%s\"} %d\n", escapeLabelValue(s), peerForwards[s])
+		fmt.Fprintf(w, "myrmex_peer_forwards_total{status=\"%s\"} %d\n", escapeLabelValue(s), forwardSnapshot[s])
+	}
+
+	writeHelp(w, "myrmex_alert_deliveries_total", "Outbound alert deliveries to a webhook/Alertmanager target.", "counter")
+	for _, k := range deliveryKeys {
+		fmt.Fprintf(w, "myrmex_alert_deliveries_total{target=\"%s\",status=\"%s\"} %d\n",
+			escapeLabelValue(k.target), escapeLabelValue(k.status), deliverySnapshot[k])
+	}
+}
+
+// alertBreachState returns this agent's current per-dimension breach flags in
+// a stable order. Read under c.mu since evaluateAlertDimension mutates them
+// from the poller goroutine.
+func (c *AgentClient) alertBreachState() []struct {
+	dimension string
+	breached  bool
+} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return []struct {
+		dimension string
+		breached  bool
+	}{
+		{"cpu", c.cpuBreached},
+		{"mem", c.memBreached},
+		{"disk", c.diskBreached},
 	}
 }
 
