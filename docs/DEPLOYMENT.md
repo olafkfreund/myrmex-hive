@@ -83,7 +83,11 @@ The default values start, but the agent cannot authenticate until the gateway
 trusts its key. Generate a keypair, then pass both sides:
 
 ```bash
-ssh-keygen -t ed25519 -N '' -f ./agent_key
+# -C MUST be the agent_id. The gateway takes each agent's identity from the
+# COMMENT on its authorized_keys entry and rejects any key whose comment does
+# not match the agent_id the agent presents (see "Fail-closed defaults" in the
+# README). The chart's default agent.config.agent_id is "k8s-node", so:
+ssh-keygen -t ed25519 -N '' -C k8s-node -f ./agent_key
 
 helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
   --version 1.0.0 \
@@ -91,6 +95,16 @@ helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
   --set-file gateway.authorizedKeys=./agent_key.pub \
   --set-file agent.privateKey=./agent_key
 ```
+
+Omitting `-C k8s-node` gives the key `ssh-keygen`'s default `user@host` comment,
+and the agent will loop on:
+
+```
+SSH handshake failed: identity mismatch: key is bound to agent-id
+"user@host" but connection requested "k8s-node"
+```
+
+If you override `agent.config.agent_id`, the key comment must change to match.
 
 `--set-file` for keys is dev/test convenience — it puts the private key in Helm
 release values. For anything real, create the Secrets out of band and point the
