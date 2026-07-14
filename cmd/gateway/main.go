@@ -112,6 +112,7 @@ var rolePermissions = map[string]map[string]bool{
 		"/api/approvals":     true,
 		"/api/enroll/token":  true,
 		"/api/agents/revoke": true,
+		"/metrics":           true,
 	},
 	"operator": {
 		"/sse":        true,
@@ -121,6 +122,7 @@ var rolePermissions = map[string]map[string]bool{
 		"/api/call":   true,
 		"/api/tools":  true,
 		"/api/chat":   true,
+		"/metrics":    true,
 		// Operators may list pending approvals but deciding them (POST) is
 		// restricted to admins inside handleApiApprovalDecision, since
 		// rolePermissions only gates by path, not by HTTP method.
@@ -132,6 +134,9 @@ var rolePermissions = map[string]map[string]bool{
 		// available to the read-only role alongside /api/status and /api/tools.
 		"/api/fleet": true,
 		"/api/tools": true,
+		// /metrics is read-only observability data (#97). A scrape token should
+		// be the least-privileged role that works, so read-only must reach it.
+		"/metrics": true,
 	},
 }
 
@@ -1792,6 +1797,15 @@ func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender
 		authzToolName = parts[1]
 	}
 
+	// Record this call for /metrics (#97) by wrapping send, which every exit
+	// path below funnels through (including sendErrorDirect and the async
+	// upstream goroutine). This is the single choke point for operator tool
+	// calls on all transports: stdio and SSE arrive here via
+	// handleClientRequest, and so does REST /api/call. Internal traffic
+	// (pollMetricsOnce, querySystemInfo, handleListTools) calls
+	// AgentClient.Call directly and is deliberately not counted here.
+	send = instrumentToolCall(send, authzAgentID, authzToolName)
+
 	scope, _ := ctx.Value(contextKeyScope).(*config.TokenScope)
 	currentConfigMu.RLock()
 	agentTags := currentConfig.AgentTags
@@ -2365,6 +2379,18 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	// handleApiEnroll), the same pattern as the unauthenticated /healthz.
 	http.HandleFunc("/api/enroll", handleApiEnroll)
 	http.HandleFunc("/api/agents/revoke", requireAuth(handleApiAgentsRevoke))
+	// /metrics is opt-in (#97): when metrics_enabled is unset the route is not
+	// registered at all, so an unconfigured gateway is unchanged. Behind
+	// requireAuth like the other API paths - the fleet topology it exposes is
+	// not public data, and Prometheus can present a bearer via scrape_config's
+	// `authorization:`.
+	currentConfigMu.RLock()
+	metricsEnabled := currentConfig != nil && currentConfig.MetricsEnabled
+	currentConfigMu.RUnlock()
+	if metricsEnabled {
+		http.HandleFunc("/metrics", requireAuth(handleMetrics))
+		log.Println("Prometheus metrics endpoint enabled at /metrics")
+	}
 	// /internal/* are the HA peer-mesh endpoints (#47/#56/#63): gateway-to-
 	// gateway only, gated by requireClusterSecret (a shared ClusterSecret
 	// bearer), never by requireAuth's operator-facing RBAC.
@@ -4334,6 +4360,9 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 	if !local && peerURL != "" {
 		resp, err := forwardToPeer(r.Context(), peerURL, cfg.ClusterSecret, cfg.PeerInsecureSkipVerify, body.Name, argsBytes)
 		if err != nil {
+			// This path returns before reaching handleCallTool, so it is
+			// counted here rather than by instrumentToolCall (#97).
+			recordPeerForward("error")
 			logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), "failure", fmt.Sprintf("forward to peer %s failed: %v", peerURL, err))
 			http.Error(w, "Failed to reach peer gateway holding this agent", http.StatusBadGateway)
 			return
@@ -4345,6 +4374,7 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 			errBytes, _ := json.Marshal(resp.Error)
 			details = string(errBytes)
 		}
+		recordPeerForward(status)
 		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), status, details)
 		json.NewEncoder(w).Encode(resp)
 		return

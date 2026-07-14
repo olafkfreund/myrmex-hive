@@ -278,6 +278,16 @@ type GatewayConfig struct {
 	// commonly needed in test/dev clusters unless peers share a common CA.
 	// Defaults to false (verify).
 	PeerInsecureSkipVerify bool `json:"peer_insecure_skip_verify,omitempty"`
+	// MetricsEnabled exposes a Prometheus exposition endpoint at /metrics on
+	// the gateway's HTTP server (issue #97). Defaults to false: with nothing
+	// configured the route is not registered at all and behavior is unchanged.
+	//
+	// The endpoint sits behind requireAuth like every other API path, so a
+	// scraper must present a bearer token (Prometheus scrape_config supports
+	// this via `authorization:`). The per-agent resource gauges additionally
+	// require MetricsPollSeconds > 0, which is what populates the samples they
+	// read.
+	MetricsEnabled bool `json:"metrics_enabled,omitempty"`
 }
 
 // AlertThresholds defines the percentage thresholds that trigger a threshold
