@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/olafkfreund/myrmex-hive/pkg/config"
@@ -1032,9 +1033,20 @@ func startPeerSync(cfg *config.GatewayConfig) {
 // routeForAgent decides the target agent lives on a peer rather than
 // locally.
 func forwardToPeer(ctx context.Context, peerURL, clusterSecret string, insecureSkipVerify bool, name string, arguments json.RawMessage) (*JsonRpcResponse, error) {
+	// Span for the cross-gateway hop (#98). Started before the request is
+	// built so the trace context injected below identifies THIS span as the
+	// parent, making the peer's spans children of it.
+	ctx, span := startSpan(ctx, "mcp.peer_forward",
+		attribute.String("myrmex.peer_url", peerURL),
+		attribute.String("myrmex.tool", name),
+	)
+	var forwardErr error
+	defer func() { endSpanWithError(span, forwardErr) }()
+
 	callParams := CallToolParams{Name: name, Arguments: arguments}
 	bodyBytes, err := json.Marshal(callParams)
 	if err != nil {
+		forwardErr = err
 		return nil, err
 	}
 
@@ -1043,10 +1055,17 @@ func forwardToPeer(ctx context.Context, peerURL, clusterSecret string, insecureS
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(peerURL, "/")+"/internal/call", bytes.NewReader(bodyBytes))
 	if err != nil {
+		forwardErr = err
 		return nil, err
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+clusterSecret)
 	httpReq.Header.Set("Content-Type", "application/json")
+	// Propagate W3C trace context to the peer gateway (#98) so a forwarded
+	// call appears as one trace spanning both gateways rather than two
+	// disconnected ones. This is the hop where propagation genuinely pays off:
+	// the peer runs its own tracer and continues the trace. No-op when tracing
+	// is disabled (the propagator injects nothing for a non-recording span).
+	injectTraceContext(reqCtx, httpReq.Header)
 
 	client := &http.Client{
 		Timeout: 40 * time.Second,
@@ -1056,16 +1075,19 @@ func forwardToPeer(ctx context.Context, peerURL, clusterSecret string, insecureS
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		forwardErr = err
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("peer %s returned status %d", peerURL, resp.StatusCode)
+		forwardErr = fmt.Errorf("peer %s returned status %d", peerURL, resp.StatusCode)
+		return nil, forwardErr
 	}
 
 	var rpcResp JsonRpcResponse
 	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		forwardErr = err
 		return nil, err
 	}
 	return &rpcResp, nil
@@ -1188,8 +1210,19 @@ func handleInternalCall(w http.ResponseWriter, r *http.Request) {
 		ID:      "peer-" + fmt.Sprintf("%d", time.Now().UnixNano()),
 	}
 
+	// Continue the origin gateway's trace (#98): the forwarding peer injected a
+	// W3C traceparent, so spans below become children of its mcp.peer_forward
+	// span and the whole cross-gateway call reads as ONE trace.
+	//
+	// Deliberately derived from context.Background() rather than r.Context(),
+	// preserving the existing behavior that a peer call is not cancelled when
+	// the HTTP request goes away. Background also carries no authz scope, which
+	// is correct here: scoping was already enforced on the origin gateway and
+	// this path trusts ClusterSecret instead (see routeForAgent).
+	peerCtx := extractTraceContext(context.Background(), r.Header)
+
 	done := make(chan JsonRpcResponse, 1)
-	go handleClientRequest(context.Background(), req, func(resp JsonRpcResponse) { done <- resp })
+	go handleClientRequest(peerCtx, req, func(resp JsonRpcResponse) { done <- resp })
 
 	select {
 	case resp := <-done:
@@ -1200,7 +1233,7 @@ func handleInternalCall(w http.ResponseWriter, r *http.Request) {
 			errBytes, _ := json.Marshal(resp.Error)
 			details = string(errBytes)
 		}
-		logAuditEvent(context.Background(), "peer_call", agentID, body.Name+" "+string(body.Arguments), status, details)
+		logAuditEvent(peerCtx, "peer_call", agentID, body.Name+" "+string(body.Arguments), status, details)
 		json.NewEncoder(w).Encode(resp)
 	case <-time.After(35 * time.Second):
 		logAuditEvent(context.Background(), "peer_call", agentID, body.Name+" "+string(body.Arguments), "failure", "Gateway timeout")
@@ -1343,6 +1376,14 @@ func main() {
 	configFilePath = *configPath
 	currentConfig = cfg
 
+	// OpenTelemetry tracing (#98). Opt-in via tracing_enabled; when off this
+	// installs nothing and every span call site downstream is a no-op. A
+	// failure to reach the collector must not stop the gateway from serving,
+	// so this logs rather than exits — the exporter retries on its own.
+	if err := initTracing(context.Background(), cfg); err != nil {
+		log.Printf("[TRACE] tracing disabled: failed to initialize: %v", err)
+	}
+
 	// Load persisted state (issues #44/#50) BEFORE starting any server, so
 	// the last-known fleet and audit index are available to serve the very
 	// first request after a restart. Opt-in: stateStore stays nil, and
@@ -1415,6 +1456,11 @@ func main() {
 		sig := <-sigCh
 		log.Printf("Received signal %v, flushing state and shutting down...", sig)
 		snapshotState()
+		// Flush buffered spans before exit (#98). The batch processor holds
+		// spans in memory, so os.Exit without this drops whatever was in
+		// flight — precisely the spans you want when debugging a shutdown.
+		// No-op when tracing is disabled.
+		shutdownTracing()
 		os.Exit(0)
 	}()
 
@@ -1827,6 +1873,18 @@ func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender
 	// AgentClient.Call directly and is deliberately not counted here.
 	send = instrumentToolCall(send, authzAgentID, authzToolName)
 
+	// Trace the call (#98) from the same choke point, so a span exists for
+	// every transport and traces agree with the metrics above on what a call
+	// is. The span is closed by the send wrapper rather than a defer: the
+	// upstream branch below dispatches a goroutine and returns immediately,
+	// so a deferred End() would close the span before the work finished and
+	// report a ~0s duration. No-op when tracing is disabled.
+	ctx, span := startSpan(ctx, "mcp.tool_call",
+		attribute.String("myrmex.agent_id", authzAgentID),
+		attribute.String("myrmex.tool", authzToolName),
+	)
+	send = traceToolCall(send, span)
+
 	scope, _ := ctx.Value(contextKeyScope).(*config.TokenScope)
 	currentConfigMu.RLock()
 	agentTags := currentConfig.AgentTags
@@ -1859,6 +1917,13 @@ func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender
 
 	if isUpstream {
 		go func() {
+			// Child span for the upstream hop (#98). Runs in the goroutine, so
+			// it captures the real proxying duration; ctx carries the parent
+			// span started above.
+			_, upSpan := startSpan(ctx, "mcp.upstream_call",
+				attribute.String("myrmex.upstream", agentID),
+				attribute.String("myrmex.tool", agentToolName),
+			)
 			forwardParams := CallToolParams{
 				Name:      agentToolName,
 				Arguments: params.Arguments,
@@ -1872,9 +1937,11 @@ func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender
 			}
 			resp, err := uc.Call(upstreamReq)
 			if err != nil {
+				endSpanWithError(upSpan, err)
 				sendErrorDirect(send, req.ID, -32603, fmt.Sprintf("Upstream server %q call failed: %v", agentID, err))
 				return
 			}
+			endSpanWithRPCResult(upSpan, *resp)
 			send(*resp)
 		}()
 		return
@@ -1900,7 +1967,18 @@ func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender
 		ID:      req.ID,
 	}
 
+	// Child span for the tunnel hop (#98): separates time spent on the agent
+	// from gateway-side overhead in the parent mcp.tool_call span.
+	//
+	// Trace context is deliberately NOT propagated to the agent: the agent has
+	// no tracer, so injecting a traceparent into the JSON-RPC params would be
+	// a wire-format change nothing reads. See docs/OBSERVABILITY.md.
+	_, tunnelSpan := startSpan(ctx, "mcp.agent_call",
+		attribute.String("myrmex.agent_id", agentID),
+		attribute.String("myrmex.tool", agentToolName),
+	)
 	resp := cli.Call(agentReq)
+	endSpanWithRPCResult(tunnelSpan, resp)
 	send(resp)
 }
 
@@ -1978,7 +2056,7 @@ func handleGatewayToolCall(ctx context.Context, name string, argsRaw json.RawMes
 		}
 
 		// Implement Gemma-orchestrated security loop
-		executeGemmaOrchestration(args.AgentID, cli, args.Prompt, reqID, send)
+		executeGemmaOrchestration(ctx, args.AgentID, cli, args.Prompt, reqID, send)
 
 	default:
 		sendErrorDirect(send, reqID, -32601, fmt.Sprintf("Tool not found: %s", name))
@@ -2209,7 +2287,15 @@ func finalizeOrchestration(send ResponseSender, reqID interface{}, summary strin
 // own allowlist (pkg/command.ExecuteCommand) remains the sole execution
 // safety boundary regardless — this is defense in depth, not a replacement
 // for it.
-func executeGemmaOrchestration(agentID string, cli *AgentClient, userPrompt string, reqID interface{}, send ResponseSender) {
+func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentClient, userPrompt string, reqID interface{}, send ResponseSender) {
+	// Parent span for the whole multi-step loop (#98). This is the path traces
+	// help most: without one, a slow ask_gemma is a single opaque number with
+	// no way to see which step burned the time.
+	ctx, orchSpan := startSpan(ctx, "gemma.orchestration",
+		attribute.String("myrmex.agent_id", agentID),
+	)
+	defer orchSpan.End()
+
 	// 1. Discover the tools this agent allows.
 	listReq := JsonRpcRequest{
 		JsonRpc: "2.0",
@@ -2288,7 +2374,14 @@ func executeGemmaOrchestration(agentID string, cli *AgentClient, userPrompt stri
 			ID:      reqID,
 		}
 
+		// One span per orchestration step, so a slow loop shows WHICH tool
+		// call was slow rather than just a slow total.
+		_, stepSpan := startSpan(ctx, "gemma.step",
+			attribute.Int("myrmex.step", step),
+			attribute.String("myrmex.tool", decision.ToolName),
+		)
 		agentResp := cli.Call(callReq)
+		endSpanWithRPCResult(stepSpan, agentResp)
 		resultStr, failed := orchestrationResultText(agentResp)
 
 		observations = append(observations, orchestrationObservation{
