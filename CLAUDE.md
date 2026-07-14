@@ -57,7 +57,7 @@ Ollama side-services for the LLM: `docker compose --profile ollama-cpu up -d` (o
 
 ## Conventions & gotchas
 
-- **Dependencies are vendored** (`vendor/`) and the flake sets `vendorHash = null` to use it directly. After changing `go.mod`, run `go mod vendor` or the Nix build breaks. The only real external dep is `golang.org/x/crypto` (SSH).
+- **Dependencies are vendored** (`vendor/`) and the flake sets `vendorHash = null` to use it directly. After changing `go.mod`, run `go mod vendor` or the Nix build breaks. Direct deps are `golang.org/x/crypto` (SSH) and the OpenTelemetry SDK + OTLP/HTTP exporter (tracing, #98) — the latter pulls gRPC/protobuf transitively and is most of the ~21MB `vendor/`. **The bar for a new dependency is high**: prefer the stdlib. The Prometheus exposition (`cmd/gateway/metrics.go`) is hand-written for exactly this reason — the text format is a few `Fprintf` calls. OTel was taken deliberately because tracing's subtleties (context propagation, sampling, batching, retry) are where reimplementing a spec buys bugs rather than saves bytes.
 - Agent-side `HostKeyCallback` is `InsecureIgnoreHostKey()` — flagged in-code as a production TODO; don't treat it as intentional for hardened deployments.
 - GoReleaser (`.goreleaser.yaml`) renames binaries for distribution: `myrmex-gateway`, `myrmex-agent`, `myrmex`. The `bin/` names from `just build` differ (`gateway`, `agent`, `myrmex`).
 - Config lives in `agent_config.json` / `gateway_config.json` at repo root for local runs. Multiple `gateway_addrs` on the agent enable HA failover cycling.

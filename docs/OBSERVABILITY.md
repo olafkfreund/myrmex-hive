@@ -228,10 +228,88 @@ route:
 > doesn't need auth or accepts a secret in the URL. Same for TLS: the system
 > trust store is used, with no skip-verify escape hatch.
 
+## Distributed tracing (OpenTelemetry)
+
+Tool calls, Gemma orchestration, upstream proxying and peer forwarding can be
+traced and exported over OTLP/HTTP. Opt-in; with `tracing_enabled` unset no
+tracer provider is installed, every span call site is a no-op, and no exporter
+goroutine or network call exists.
+
+```json
+{
+  "tracing_enabled": true,
+  "otlp_endpoint": "otel-collector:4318",
+  "otlp_insecure": true,
+  "trace_service_name": "myrmex-gateway",
+  "trace_sample_ratio": 1.0,
+  "otlp_headers": { "authorization": "env:OTLP_TOKEN" }
+}
+```
+
+- `otlp_endpoint` is **host:port only** — no scheme, no path. The exporter
+  appends `/v1/traces`. Defaults to `localhost:4318`.
+- `otlp_insecure` sends plain HTTP; collectors commonly listen on plaintext
+  4318 inside a trusted network.
+- `otlp_headers` values go through the same secret indirection as
+  `llm_api_key` (`env:` / `file:` / `agenix:` / `vault:`), so a hosted
+  backend's token never has to sit in the config file.
+- `trace_sample_ratio` defaults to 1.0 (sample everything) — a gateway's
+  tool-call rate is low enough that full sampling is the useful default. Lower
+  it for a busy fleet. Sampling is `ParentBased`, so a decision made by the
+  gateway that forwarded to us is honored rather than re-rolled (which would
+  produce half-sampled, broken traces).
+
+### Spans
+
+| Span | Parent | Covers |
+|---|---|---|
+| `mcp.tool_call` | root (or the forwarding peer) | The whole operator tool call, any transport. Attributes: `myrmex.agent_id`, `myrmex.tool`. |
+| `mcp.agent_call` | `mcp.tool_call` | The SSH-tunnel hop — separates time on the agent from gateway overhead. |
+| `mcp.upstream_call` | `mcp.tool_call` | Proxying to an upstream MCP server. |
+| `mcp.peer_forward` | `mcp.tool_call` | Forwarding to the peer gateway holding the agent. Injects W3C `traceparent`. |
+| `gemma.orchestration` | `mcp.tool_call` | The whole multi-step LLM loop. |
+| `gemma.step` | `gemma.orchestration` | One step — shows *which* tool call was slow, not just a slow total. |
+
+Resource attributes carry `service.name`, `service.version` and
+`myrmex.gateway_id`, so a trace can be attributed to one gateway in an HA mesh.
+
+A failing call sets the span status to error with the JSON-RPC error, using the
+same definition of "error" as `myrmex_tool_calls_total` — traces and metrics
+agree. (Which means the same caveat applies: an allowlist rejection is a
+well-formed result and is *not* an error here.)
+
+### Propagation
+
+- **Gateway → gateway** is propagated: `forwardToPeer` injects W3C
+  `traceparent`, `handleInternalCall` extracts it, so a forwarded call is
+  **one** trace spanning both gateways rather than two disconnected ones.
+- **Gateway → agent is deliberately NOT propagated.** The agent has no tracer,
+  so injecting a `traceparent` into the JSON-RPC params would be a wire-format
+  change nothing reads. The tunnel hop is still visible as `mcp.agent_call` on
+  the gateway side. Propagating becomes worthwhile only if the agent is ever
+  instrumented.
+
+### Verifying
+
+```bash
+docker run --rm --network host \
+  -v ./collector.yaml:/etc/otelcol/config.yaml \
+  otel/opentelemetry-collector:latest --config /etc/otelcol/config.yaml
+```
+
+with a `debug` exporter at `verbosity: detailed`; a tool call then prints its
+spans. A dead collector is never fatal — the exporter retries and logs
+`[TRACE] exporter error: ...` while the gateway keeps serving.
+
 ## Implementation note
 
-The exposition format is written by hand (`cmd/gateway/metrics.go`) rather than
-via `prometheus/client_golang`. The text format is a handful of `Fprintf` calls,
-and this project's only real external dependency is `golang.org/x/crypto` — a
-client library would drag a transitive tree through `vendor/` for no functional
-gain at this scale. If the metric surface grows substantially, revisit.
+The Prometheus exposition is written by hand (`cmd/gateway/metrics.go`) rather
+than via `prometheus/client_golang`: the text format is a handful of `Fprintf`
+calls, so a client library would drag a transitive tree through `vendor/` for no
+functional gain. If the metric surface grows substantially, revisit.
+
+Tracing went the other way and uses the real OTel SDK, which is most of the
+~21MB `vendor/`. That was a deliberate trade: unlike a text exposition, tracing
+has genuinely subtle parts — W3C context propagation, parent-based sampling,
+batching, retry — where reimplementing the spec buys bugs we own rather than
+saving bytes.

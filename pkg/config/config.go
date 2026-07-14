@@ -292,6 +292,32 @@ type GatewayConfig struct {
 	// commonly needed in test/dev clusters unless peers share a common CA.
 	// Defaults to false (verify).
 	PeerInsecureSkipVerify bool `json:"peer_insecure_skip_verify,omitempty"`
+	// TracingEnabled turns on OpenTelemetry tracing of tool calls, Gemma
+	// orchestration, upstream proxying and peer forwarding (issue #98).
+	// Defaults to false: with nothing configured no tracer provider is
+	// installed, spans become no-ops, and no exporter goroutines or network
+	// calls exist.
+	TracingEnabled bool `json:"tracing_enabled,omitempty"`
+	// OTLPEndpoint is the OTLP/HTTP collector endpoint, host:port WITHOUT a
+	// scheme or path (e.g. "otel-collector:4318"); the exporter appends
+	// /v1/traces. Empty with TracingEnabled defaults to "localhost:4318".
+	OTLPEndpoint string `json:"otlp_endpoint,omitempty"`
+	// OTLPInsecure sends OTLP over plain HTTP instead of HTTPS. Collectors
+	// commonly listen on plaintext 4318 inside a trusted network.
+	OTLPInsecure bool `json:"otlp_insecure,omitempty"`
+	// OTLPHeaders are extra headers sent to the collector, e.g. an auth token
+	// for a hosted backend. Values are resolved via resolveSecret, so
+	// "env:OTLP_TOKEN" / "file:/run/secrets/x" / "agenix:name" / "vault:path"
+	// work as they do for llm_api_key.
+	OTLPHeaders map[string]string `json:"otlp_headers,omitempty"`
+	// TraceSampleRatio is the head-sampling ratio, 0.0-1.0. 0 (unset) means
+	// 1.0 (sample everything) when tracing is enabled - a gateway's tool-call
+	// rate is low enough that full sampling is the useful default. Set lower
+	// for a busy fleet.
+	TraceSampleRatio float64 `json:"trace_sample_ratio,omitempty"`
+	// TraceServiceName is the service.name resource attribute reported to the
+	// collector. Empty defaults to "myrmex-gateway".
+	TraceServiceName string `json:"trace_service_name,omitempty"`
 	// MetricsEnabled exposes a Prometheus exposition endpoint at /metrics on
 	// the gateway's HTTP server (issue #97). Defaults to false: with nothing
 	// configured the route is not registered at all and behavior is unchanged.
@@ -533,6 +559,16 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	}
 	for i := range cfg.ScopedTokens {
 		cfg.ScopedTokens[i].Token = resolveSecret(cfg.ScopedTokens[i].Token)
+	}
+	// OTLP header VALUES only: a hosted tracing backend's auth token belongs
+	// in an env/file/agenix/vault reference, not inline in the config. Header
+	// names are not secrets and are left as-is.
+	if cfg.OTLPHeaders != nil {
+		resolvedHeaders := make(map[string]string, len(cfg.OTLPHeaders))
+		for name, value := range cfg.OTLPHeaders {
+			resolvedHeaders[name] = resolveSecret(value)
+		}
+		cfg.OTLPHeaders = resolvedHeaders
 	}
 
 	if err := cfg.Validate(); err != nil {
