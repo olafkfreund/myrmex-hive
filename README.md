@@ -149,10 +149,13 @@ Configures the receiver, TLS certs, OIDC/Tokens RBAC role mapping (`admin`, `ope
     "operator-token-456": "operator",
     "read-token-789": "read-only"
   },
-  "audit_log_path": "audit.log"
+  "audit_log_path": "audit.log",
+  "metrics_enabled": true
 }
 ```
 *Note: If `audit_log_path` is set, Myrmex Gateway records all `/api/call` and `/api/chat` executions alongside a cryptographic signature generated using the Gateway's private SSH host key.*
+
+*Note: `metrics_enabled` exposes a Prometheus endpoint at `/metrics` (opt-in; behind the same bearer-token auth as the rest of the API). See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the metric reference and a `scrape_config`.*
 
 ### Fail-closed defaults
 
