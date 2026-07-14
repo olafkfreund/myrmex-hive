@@ -34,6 +34,17 @@ jobs:
           helm lint charts/myrmex-hive
           helm template hive charts/myrmex-hive >/dev/null
 
+      # GoReleaser otherwise only runs on a tag, so a config error costs a
+      # burned tag and a re-release (it did: v1.0.1 failed because builds
+      # pointed `main:` at a single .go file, which silently ignored every
+      # other file in the package). A snapshot build catches that on the PR.
+      - name: Validate GoReleaser build
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: build --snapshot --clean --single-target
+
       - name: Install Nix
         uses: cachix/install-nix-action@v26
         with:
