@@ -9,7 +9,7 @@ before:
 
 builds:
   - id: gateway
-    main: ./cmd/gateway/main.go
+    main: ./cmd/gateway
     binary: myrmex-gateway
     env:
       - CGO_ENABLED=0
@@ -24,7 +24,7 @@ builds:
       - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
 
   - id: agent
-    main: ./cmd/agent/main.go
+    main: ./cmd/agent
     binary: myrmex-agent
     env:
       - CGO_ENABLED=0
@@ -39,7 +39,7 @@ builds:
       - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
 
   - id: myrmex
-    main: ./cmd/myrmex/main.go
+    main: ./cmd/myrmex
     binary: myrmex
     env:
       - CGO_ENABLED=0
