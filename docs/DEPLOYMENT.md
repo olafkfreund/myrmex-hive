@@ -9,6 +9,11 @@ gateway is the only thing that listens), see the [README](../README.md).
 
 ## Container images
 
+> **Available from v1.0.1 onward.** The image and chart publishing was added
+> after v1.0.0 was tagged, so the v1.0.0 release contains **binaries, SBOMs and
+> checksums only** — there are no `:1.0.0` images and no `1.0.0` chart. Pin
+> v1.0.1 or later.
+
 Three multi-arch (`linux/amd64` + `linux/arm64`) images are published per release:
 
 | Image | Contents |
@@ -20,13 +25,13 @@ Three multi-arch (`linux/amd64` + `linux/arm64`) images are published per releas
 Each is tagged with the release version and `latest`:
 
 ```bash
-docker pull ghcr.io/olafkfreund/myrmex-gateway:1.0.0
-docker pull ghcr.io/olafkfreund/myrmex-agent:1.0.0
+docker pull ghcr.io/olafkfreund/myrmex-gateway:1.0.1
+docker pull ghcr.io/olafkfreund/myrmex-agent:1.0.1
 ```
 
 Pin the version tag in production. `latest` moves on every release.
 
-Per-arch tags (`:1.0.0-amd64`, `:1.0.0-arm64`) are published as the backing
+Per-arch tags (`:1.0.1-amd64`, `:1.0.1-arm64`) are published as the backing
 manifests. Pull the plain version tag — Docker resolves the right architecture.
 
 ### Verifying release artifacts
@@ -52,7 +57,7 @@ The chart is published as an OCI artifact. There is no chart repo to add:
 
 ```bash
 helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
-  --version 1.0.0 \
+  --version 1.0.1 \
   --namespace myrmex --create-namespace
 ```
 
@@ -64,8 +69,8 @@ moves both. Override per-image with `image.tag`, `gateway.image.tag`, or
 Inspect before installing:
 
 ```bash
-helm show values oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.0.0
-helm template hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.0.0
+helm show values oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.0.1
+helm template hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.0.1
 ```
 
 ### What it deploys
@@ -90,7 +95,7 @@ trusts its key. Generate a keypair, then pass both sides:
 ssh-keygen -t ed25519 -N '' -C k8s-node -f ./agent_key
 
 helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
-  --version 1.0.0 \
+  --version 1.0.1 \
   --namespace myrmex --create-namespace \
   --set-file gateway.authorizedKeys=./agent_key.pub \
   --set-file agent.privateKey=./agent_key
@@ -129,7 +134,7 @@ also the GitOps/sealed-secrets path. See [SECRETS.md](SECRETS.md).
 ### Upgrading
 
 ```bash
-helm upgrade hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.1.0
+helm upgrade hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.0.2
 ```
 
 Rolling the gateway drops agent tunnels; agents reconnect on their own. Give

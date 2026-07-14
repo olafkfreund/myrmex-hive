@@ -100,7 +100,8 @@ helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
   --namespace myrmex --create-namespace
 ```
 
-`--version` pins the chart and the images together. See
+`--version` pins the chart and the images together (v1.0.1+; v1.0.0 predates
+image/chart publishing). See
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the image list, a working install
 with agent keys, and the TLS/Service/`agent_id` caveats.
 
