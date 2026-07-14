@@ -9,12 +9,15 @@ import (
 
 // resetMetrics clears the package-level counters so tests don't leak into each
 // other.
+// Every package-level counter must be cleared here, or a -count>1 run
+// accumulates across iterations and the assertions drift.
 func resetMetrics() {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 	toolCalls = map[toolCallKey]uint64{}
 	toolLatency = map[toolKey]*histogram{}
 	peerForwards = map[string]uint64{}
+	alertDeliveries = map[alertDeliveryKey]uint64{}
 }
 
 func TestHistogramObserveIsCumulative(t *testing.T) {

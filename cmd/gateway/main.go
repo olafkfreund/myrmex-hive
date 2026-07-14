@@ -574,6 +574,27 @@ func (c *AgentClient) evaluateAlertDimension(dimension string, threshold, value 
 	} else if recovered {
 		log.Printf("[ALERT] [%s] %s recovered below threshold (value=%.2f threshold=%.2f)", c.agentID, dimension, value, threshold)
 	}
+
+	// Route the transition to external on-call targets (#100). notifyAlert
+	// returns immediately and no-ops entirely when no target is configured, so
+	// this cannot slow or block the metrics poller that called us. Only
+	// transitions are delivered - fired/recovered are already once-per-onset
+	// (see alertTransition), so on-call is not re-paged every poll while a
+	// breach persists.
+	if fired || recovered {
+		status := "firing"
+		if recovered {
+			status = "resolved"
+		}
+		notifyAlert(alertEvent{
+			AgentID:   c.agentID,
+			Dimension: dimension,
+			Status:    status,
+			Value:     value,
+			Threshold: threshold,
+			Timestamp: time.Now(),
+		})
+	}
 }
 
 // checkAlerts parses one raw get_metrics sample and evaluates it against the

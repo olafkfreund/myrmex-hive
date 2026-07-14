@@ -65,9 +65,11 @@ curl -sk -H 'Authorization: Bearer s3cr3t-scrape-token' https://localhost:8080/m
 | `myrmex_agent_mem_used_percent` | gauge | `agent_id` | Newest polled memory sample. Requires `metrics_poll_seconds > 0`. |
 | `myrmex_agent_disk_used_percent` | gauge | `agent_id` | Newest polled disk sample. Requires `metrics_poll_seconds > 0`. |
 | `myrmex_upstream_up` | gauge | `server` | 1 if the upstream MCP server reports `connected`. |
+| `myrmex_agent_alert_breached` | gauge | `agent_id`, `dimension` | 1 if the last polled sample breached the configured threshold. Requires `alert_thresholds`. |
 | `myrmex_tool_calls_total` | counter | `agent`, `tool`, `status` | Operator-initiated tool calls. |
 | `myrmex_tool_call_duration_seconds` | histogram | `agent`, `tool` | Gateway-observed latency, dispatch to response. |
 | `myrmex_peer_forwards_total` | counter | `status` | Calls forwarded to a peer gateway holding the target agent. |
+| `myrmex_alert_deliveries_total` | counter | `target`, `status` | Outbound alert deliveries (see Alert routing). |
 
 Gateway-native tools appear with `agent="gateway"` (e.g. `tool="ask_gemma"`),
 matching the `gateway__` namespace.
@@ -106,6 +108,82 @@ histogram_quantile(0.95,
 # Agents that dropped off
 myrmex_agent_online == 0
 ```
+
+## Alert routing (webhook / Alertmanager)
+
+The gateway's threshold alerts (`alert_thresholds`) go to the log and the signed
+audit trail by default. They can additionally be routed to on-call systems. Both
+targets are opt-in; with neither set, nothing changes.
+
+```json
+{
+  "metrics_poll_seconds": 30,
+  "alert_thresholds": { "cpu_percent": 90, "mem_percent": 90, "disk_percent": 85 },
+  "alert_webhook_url": "https://hooks.example.com/myrmex",
+  "alertmanager_url": "http://alertmanager:9093",
+  "alert_delivery_retries": 3
+}
+```
+
+Set either, or both — each configured target receives every alert. Delivery is
+asynchronous, so a slow or dead receiver never stalls the metrics poller.
+
+### Generic webhook
+
+POSTs `application/json`:
+
+```json
+{
+  "agent_id": "web-1",
+  "dimension": "cpu",
+  "status": "firing",
+  "value": 91.5,
+  "threshold": 90,
+  "timestamp": "2026-07-14T17:26:14Z",
+  "gateway_id": "gw-1"
+}
+```
+
+`status` is `firing` on breach onset and `resolved` on recovery.
+
+### Alertmanager
+
+POSTs to `<alertmanager_url>/api/v2/alerts` (give the **base** URL; the path is
+appended). Alerts carry `alertname=MyrmexThresholdBreach` plus `agent_id`,
+`dimension`, `gateway_id` and `severity` labels.
+
+Alertmanager has no "resolved" field — an alert resolves via `endsAt`. Firing
+alerts deliberately omit `endsAt` so Alertmanager applies its own
+`resolve_timeout`; resolved alerts set it. Route on the labels:
+
+```yaml
+route:
+  routes:
+    - matchers: [ alertname="MyrmexThresholdBreach" ]
+      receiver: myrmex-oncall
+```
+
+### Delivery, retries and failure
+
+- Alerts are sent **only on transitions** — once per breach onset and once on
+  recovery — not every poll while a breach persists. On-call is not re-paged
+  for a sustained breach.
+- Failed deliveries retry with exponential backoff (1s, 2s, 4s…),
+  `alert_delivery_retries` times (default 3; set negative to disable retrying).
+- A **4xx is treated as permanent** and is not retried — a malformed or
+  unauthorized request will never be accepted, so retrying only burns attempts.
+  **429 is the exception** and is retried, as it means "slow down", not "never".
+- Watch `myrmex_alert_deliveries_total{status="error"}`. A silently failing
+  integration otherwise only reveals itself when a page never arrives:
+
+  ```promql
+  rate(myrmex_alert_deliveries_total{status="error"}[5m]) > 0
+  ```
+
+> **No auth on the webhook yet.** There is no field for a bearer token or
+> custom headers, so point `alert_webhook_url` at an endpoint that either
+> doesn't need auth or accepts a secret in the URL. Same for TLS: the system
+> trust store is used, with no skip-verify escape hatch.
 
 ## Implementation note
 

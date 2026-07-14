@@ -173,6 +173,20 @@ type GatewayConfig struct {
 	// against each polled metrics sample. Nil (the default) disables
 	// alerting entirely.
 	AlertThresholds *AlertThresholds `json:"alert_thresholds,omitempty"`
+	// AlertWebhookURL receives a POST with a JSON alert body on every
+	// threshold breach and recovery (issue #100). Empty (the default) means
+	// no webhook delivery: alerts stay in-portal/log/audit as before.
+	AlertWebhookURL string `json:"alert_webhook_url,omitempty"`
+	// AlertmanagerURL is the BASE url of a Prometheus Alertmanager (e.g.
+	// "http://alertmanager:9093"); alerts are POSTed to its /api/v2/alerts.
+	// Empty (the default) means no Alertmanager delivery. May be set
+	// alongside AlertWebhookURL; both targets receive every alert.
+	AlertmanagerURL string `json:"alertmanager_url,omitempty"`
+	// AlertDeliveryRetries is how many times a failed alert delivery is
+	// retried, with exponential backoff, before it is dropped and logged. A
+	// value < 0 disables retrying; 0 (unset) defaults to 3 at the point of
+	// use.
+	AlertDeliveryRetries int `json:"alert_delivery_retries,omitempty"`
 	// EnrollmentTokenTTLSeconds bounds how long a join token minted by
 	// POST /api/enroll/token remains redeemable via POST /api/enroll before
 	// it expires. A value <= 0 (including unset) defaults to 900 (15
