@@ -67,6 +67,46 @@ checksum:
 # only (no bundled config) — gateway_config.json/agent_config.json at the
 # repo root are local dev configs (real Tailscale hostnames, example agent
 # IDs), not suitable as installed defaults.
+# Homebrew tap (#103).
+#
+# homebrew_casks, NOT brews: `brews` is soft-deprecated since goreleaser v2.10
+# and HARD-deprecates in v2.16, and release.yml pins `version: latest` — using
+# it would schedule a release failure. Casks are also Homebrew's supported way
+# to ship pre-built binaries (the old formulas were, per goreleaser's own
+# deprecation note, "hackyish formulas that would install the pre-compiled
+# binaries").
+#
+# Trade-off: casks are macOS-only (Linuxbrew does not support them). Linux
+# users have deb/rpm (nfpms above), Nix, install.sh and the GHCR images.
+#
+# The single `archives` entry has no `ids:` filter, so each tar.gz carries all
+# three binaries — one cask installs all three.
+#
+# NOTE: the release job's GITHUB_TOKEN is scoped to THIS repo and cannot push
+# to olafkfreund/homebrew-myrmex. A HOMEBREW_TAP_TOKEN secret (PAT with `repo`
+# scope) is required; without it the release fails at this step.
+homebrew_casks:
+  - name: myrmex-hive
+    repository:
+      owner: olafkfreund
+      name: homebrew-myrmex
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    binaries:
+      - myrmex
+      - myrmex-gateway
+      - myrmex-agent
+    homepage: "https://myrmex-hive.freundcloud.com"
+    description: "Zero-inbound-port MCP gateway for managing distributed edge servers over reverse SSH tunnels"
+    skip_upload: auto # no formulas for prereleases/snapshots
+    caveats: |
+      The operator CLI is `myrmex`; it talks to a Gateway's REST API
+      (default https://localhost:8080, override with --gateway / MYRMEX_TOKEN).
+
+      myrmex-gateway and myrmex-agent are installed too, but both fail closed:
+      neither starts without a config file and Ed25519 keys. See
+      https://github.com/olafkfreund/myrmex-hive#3-configuration
+
 nfpms:
   - id: gateway-nfpm
     ids: [gateway]
@@ -75,6 +115,7 @@ nfpms:
     vendor: olafkfreund
     homepage: https://github.com/olafkfreund/myrmex-hive
     maintainer: "Olaf K Freund <olaf.loken@gmail.com>"
+    license: MIT
     description: |-
       Myrmex Hive Gateway: the central SSH tunnel receiver, MCP/REST API,
       and web portal for the Myrmex Hive agent orchestration framework.
@@ -90,6 +131,7 @@ nfpms:
     vendor: olafkfreund
     homepage: https://github.com/olafkfreund/myrmex-hive
     maintainer: "Olaf K Freund <olaf.loken@gmail.com>"
+    license: MIT
     description: |-
       Myrmex Hive Agent: dials out to a Myrmex Hive Gateway over SSH and
       exposes system metrics/commands with zero inbound ports.
@@ -105,6 +147,7 @@ nfpms:
     vendor: olafkfreund
     homepage: https://github.com/olafkfreund/myrmex-hive
     maintainer: "Olaf K Freund <olaf.loken@gmail.com>"
+    license: MIT
     description: |-
       Myrmex Hive operator CLI: talks to a Myrmex Hive Gateway's REST API
       to inspect agents, upstreams, and tools, and to invoke tool calls.
@@ -141,6 +184,10 @@ dockers:
       - "--label=org.opencontainers.image.title=myrmex-gateway"
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      # The MCP registry (#102) verifies OCI ownership by reading this label
+      # off the PUBLISHED image and matching it against server.json's `name`.
+      # Publishing is rejected without it.
+      - "--label=io.modelcontextprotocol.server.name=io.github.olafkfreund/myrmex-hive"
 
   - id: gateway-arm64
     ids: [gateway]
@@ -158,6 +205,10 @@ dockers:
       - "--label=org.opencontainers.image.title=myrmex-gateway"
       - "--label=org.opencontainers.image.version={{ .Version }}"
       - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      # The MCP registry (#102) verifies OCI ownership by reading this label
+      # off the PUBLISHED image and matching it against server.json's `name`.
+      # Publishing is rejected without it.
+      - "--label=io.modelcontextprotocol.server.name=io.github.olafkfreund/myrmex-hive"
 
   - id: agent-amd64
     ids: [agent]

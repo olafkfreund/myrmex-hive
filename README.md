@@ -75,6 +75,17 @@ To deploy a Myrmex Agent or Gateway as a declarative systemd service on NixOS, e
 }
 ```
 
+### macOS (Homebrew)
+
+```bash
+brew tap olafkfreund/myrmex
+brew install --cask myrmex-hive
+```
+
+Installs all three binaries: `myrmex` (operator CLI), `myrmex-gateway`, and `myrmex-agent`.
+
+*macOS only — Homebrew casks are not supported on Linuxbrew. On Linux use the deb/rpm packages from the [releases page](https://github.com/olafkfreund/myrmex-hive/releases), the Nix flake, `install.sh`, or the container images.*
+
 ### Linux & macOS (Direct Install)
 To download, compile, and configure the Agent as a background daemon (systemd on Linux, LaunchDaemon on macOS):
 ```bash

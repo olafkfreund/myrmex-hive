@@ -34,6 +34,19 @@ jobs:
           helm lint charts/myrmex-hive
           helm template hive charts/myrmex-hive >/dev/null
 
+      # server.json is what the public MCP registry consumes (#102). Validate
+      # it against the schema the FILE ITSELF declares, so this catches both a
+      # doc that drifted from the schema and a $schema URL that has 404'd —
+      # the file previously pointed at a dead 2025-06-18 schema and had never
+      # been valid against any live one.
+      - name: Validate server.json against the MCP registry schema
+        run: |
+          pip install --quiet check-jsonschema
+          SCHEMA=$(jq -r '."$schema"' server.json)
+          echo "server.json declares: $SCHEMA"
+          curl -sfI "$SCHEMA" >/dev/null || { echo "::error::\$schema URL is unreachable: $SCHEMA"; exit 1; }
+          check-jsonschema --schemafile "$SCHEMA" server.json
+
       # GoReleaser otherwise only runs on a tag, so a config error costs a
       # burned tag and a re-release (it did: v1.0.1 failed because builds
       # pointed `main:` at a single .go file, which silently ignored every
