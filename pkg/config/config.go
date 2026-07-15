@@ -187,6 +187,20 @@ type GatewayConfig struct {
 	// value < 0 disables retrying; 0 (unset) defaults to 3 at the point of
 	// use.
 	AlertDeliveryRetries int `json:"alert_delivery_retries,omitempty"`
+	// AlertWebhookHeaders are extra headers sent with every AlertWebhookURL
+	// delivery, e.g. {"authorization": "Bearer env:PAGERDUTY_TOKEN"} (issue
+	// #127). Most on-call systems require a token, and without this the only
+	// way to authenticate was to smuggle a secret into the URL - where it then
+	// lands in the config, logs and error messages.
+	//
+	// Values resolve via resolveSecret, so "env:"/"file:"/"agenix:"/"vault:"
+	// work as they do for llm_api_key. Header names are not secrets and are
+	// left as-is. Empty (the default) sends no extra headers.
+	AlertWebhookHeaders map[string]string `json:"alert_webhook_headers,omitempty"`
+	// AlertmanagerHeaders are extra headers sent with every AlertmanagerURL
+	// delivery, for an Alertmanager behind an authenticating proxy. Same
+	// secret-indirection rules as AlertWebhookHeaders.
+	AlertmanagerHeaders map[string]string `json:"alertmanager_headers,omitempty"`
 	// EnrollmentTokenTTLSeconds bounds how long a join token minted by
 	// POST /api/enroll/token remains redeemable via POST /api/enroll before
 	// it expires. A value <= 0 (including unset) defaults to 900 (15
@@ -563,6 +577,11 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// OTLP header VALUES only: a hosted tracing backend's auth token belongs
 	// in an env/file/agenix/vault reference, not inline in the config. Header
 	// names are not secrets and are left as-is.
+	for _, headers := range []map[string]string{cfg.AlertWebhookHeaders, cfg.AlertmanagerHeaders} {
+		for name, value := range headers {
+			headers[name] = resolveSecret(value)
+		}
+	}
 	if cfg.OTLPHeaders != nil {
 		resolvedHeaders := make(map[string]string, len(cfg.OTLPHeaders))
 		for name, value := range cfg.OTLPHeaders {

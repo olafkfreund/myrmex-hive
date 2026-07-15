@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -48,12 +49,17 @@ var alertBackoffBase = time.Second
 func notifyAlert(ev alertEvent) {
 	currentConfigMu.RLock()
 	var webhookURL, amURL, gatewayID string
+	var webhookHeaders, amHeaders map[string]string
 	retries := 0
 	if currentConfig != nil {
 		webhookURL = currentConfig.AlertWebhookURL
 		amURL = currentConfig.AlertmanagerURL
 		gatewayID = currentConfig.GatewayID
 		retries = currentConfig.AlertDeliveryRetries
+		// Copied, not aliased: delivery runs in a goroutine that outlives this
+		// lock, and a config reload replaces these maps.
+		webhookHeaders = copyHeaders(currentConfig.AlertWebhookHeaders)
+		amHeaders = copyHeaders(currentConfig.AlertmanagerHeaders)
 	}
 	currentConfigMu.RUnlock()
 
@@ -75,7 +81,7 @@ func notifyAlert(ev alertEvent) {
 			// take down the poller goroutine.
 			log.Printf("[ALERT] webhook payload marshal failed: %v", err)
 		} else {
-			go deliverWithRetry("webhook", webhookURL, body, retries)
+			go deliverWithRetry("webhook", webhookURL, body, webhookHeaders, retries)
 		}
 	}
 
@@ -84,7 +90,7 @@ func notifyAlert(ev alertEvent) {
 		if err != nil {
 			log.Printf("[ALERT] alertmanager payload marshal failed: %v", err)
 		} else {
-			go deliverWithRetry("alertmanager", alertmanagerEndpoint(amURL), body, retries)
+			go deliverWithRetry("alertmanager", alertmanagerEndpoint(amURL), body, amHeaders, retries)
 		}
 	}
 }
@@ -129,10 +135,36 @@ func alertmanagerPayload(ev alertEvent) ([]byte, error) {
 // transport errors and 5xx/429 responses. A 4xx (other than 429) is a
 // permanent rejection - retrying a malformed or unauthorized request just
 // wastes attempts - so it fails fast.
-func deliverWithRetry(target, url string, body []byte, retries int) {
+func copyHeaders(h map[string]string) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		out[k] = v
+	}
+	return out
+}
+
+// redactURL strips userinfo and query from a URL before logging it. Secrets in
+// the URL were the only way to authenticate a webhook before #127 added
+// headers, so existing configs still carry them - and Go's *url.Error embeds
+// the full URL, which would otherwise put a live credential in the log.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[unparseable url]"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+func deliverWithRetry(target, url string, body []byte, headers map[string]string, retries int) {
 	backoff := alertBackoffBase
 	for attempt := 0; ; attempt++ {
-		status, err := postAlert(url, body)
+		status, err := postAlert(url, body, headers)
 		if err == nil && status < 300 {
 			recordAlertDelivery(target, "success")
 			return
@@ -140,13 +172,14 @@ func deliverWithRetry(target, url string, body []byte, retries int) {
 
 		permanent := err == nil && status >= 400 && status < 500 && status != http.StatusTooManyRequests
 		if permanent {
-			log.Printf("[ALERT] %s delivery rejected (HTTP %d), not retrying: %s", target, status, url)
+			log.Printf("[ALERT] %s delivery rejected (HTTP %d), not retrying: %s", target, status, redactURL(url))
 			recordAlertDelivery(target, "error")
 			return
 		}
 		if attempt >= retries {
 			if err != nil {
-				log.Printf("[ALERT] %s delivery failed after %d attempt(s): %v", target, attempt+1, err)
+				// err is typically *url.Error, which embeds the full URL.
+				log.Printf("[ALERT] %s delivery failed after %d attempt(s): %v", target, attempt+1, redactDeliveryError(err, url))
 			} else {
 				log.Printf("[ALERT] %s delivery failed after %d attempt(s): HTTP %d", target, attempt+1, status)
 			}
@@ -158,15 +191,30 @@ func deliverWithRetry(target, url string, body []byte, retries int) {
 	}
 }
 
-func postAlert(url string, body []byte) (int, error) {
+// redactDeliveryError keeps an error loggable without leaking a URL-embedded
+// credential: *url.Error stringifies with the full URL, query and all.
+func redactDeliveryError(err error, rawURL string) string {
+	msg := err.Error()
+	if rawURL != "" {
+		msg = strings.ReplaceAll(msg, rawURL, redactURL(rawURL))
+	}
+	return msg
+}
+
+func postAlert(rawURL string, body []byte, headers map[string]string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Set after Content-Type so an operator can override it if their receiver
+	// demands something else.
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
 
 	resp, err := alertHTTPClient.Do(req)
 	if err != nil {

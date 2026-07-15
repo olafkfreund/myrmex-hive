@@ -48,8 +48,23 @@ cosign verify-blob \
   checksums.txt
 ```
 
-> The **container images are not signed yet** — only the release checksums are.
-> Verify images by digest until image signing lands.
+### Verifying container images
+
+Images are cosign-signed (keyless, via Sigstore) **from v1.0.3 onward** —
+v1.0.1 and v1.0.2 predate image signing and carry no signature:
+
+```bash
+cosign verify ghcr.io/olafkfreund/myrmex-gateway:1.0.3 \
+  --certificate-identity-regexp 'https://github.com/olafkfreund/myrmex-hive.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Both the multi-arch manifest (the plain `:1.0.3` tag you pull) and the
+per-arch images (`:1.0.3-amd64`) are signed, so verifying either works.
+
+There is no signing key to manage: signatures are tied to the GitHub Actions
+workload identity that built them, which is what the `--certificate-identity`
+flags check.
 
 ## Helm chart
 

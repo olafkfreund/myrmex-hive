@@ -74,6 +74,17 @@ func redactConfigSecrets(cfg *config.GatewayConfig) {
 		cfg.OTLPHeaders = scrubbed
 	}
 
+	// Alert delivery headers (#127) carry the on-call system's token, same as
+	// OTLPHeaders. Names kept, values redacted.
+	for _, headers := range []map[string]string{cfg.AlertWebhookHeaders, cfg.AlertmanagerHeaders} {
+		if headers == nil {
+			continue
+		}
+		for name, value := range headers {
+			headers[name] = redactSecret(value)
+		}
+	}
+
 	// --- Key material ------------------------------------------------------
 	// The private key path itself is not a secret value, but it points at one
 	// and leaking layout helps an attacker; kept redacted as before.
@@ -144,11 +155,17 @@ func preserveRedactedSecrets(incoming, live *config.GatewayConfig) {
 		}
 	}
 
-	// OTLP header names survive redaction, so restore values by name.
-	for name, value := range incoming.OTLPHeaders {
-		if isPlaceholder(value) {
-			if liveValue, ok := live.OTLPHeaders[name]; ok {
-				incoming.OTLPHeaders[name] = liveValue
+	// Header names survive redaction, so restore values by name.
+	for _, pair := range []struct{ in, live map[string]string }{
+		{incoming.OTLPHeaders, live.OTLPHeaders},
+		{incoming.AlertWebhookHeaders, live.AlertWebhookHeaders},
+		{incoming.AlertmanagerHeaders, live.AlertmanagerHeaders},
+	} {
+		for name, value := range pair.in {
+			if isPlaceholder(value) {
+				if liveValue, ok := pair.live[name]; ok {
+					pair.in[name] = liveValue
+				}
 			}
 		}
 	}

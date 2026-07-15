@@ -315,6 +315,31 @@ sboms:
     documents:
       - "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}.sbom.spdx.json"
 
+# Sign the published container images (#120). Until now only the release
+# CHECKSUMS were signed (see `signs:` below), so operators pulling
+# ghcr.io/olafkfreund/myrmex-* had no way to verify provenance beyond pinning
+# a digest.
+#
+# Two non-obvious settings:
+#   - artifacts: all — the DEFAULT is images from `dockers_v2` only, and this
+#     config uses `dockers`, so the default would sign NOTHING. "all" covers
+#     both the per-arch images and the multi-arch manifests; signing only the
+#     per-arch images would leave `cosign verify ghcr.io/.../myrmex-gateway:X`
+#     (the plain tag operators actually pull, which resolves to the manifest)
+#     with no signature to find.
+#   - args — the DEFAULT is key-based (`--key=cosign.key`). These are
+#     overridden for Sigstore keyless signing, matching the `signs:` block and
+#     the id-token: write permission the release workflow already grants.
+docker_signs:
+  - id: cosign-images
+    cmd: cosign
+    artifacts: all
+    output: true
+    args:
+      - "sign"
+      - "${artifact}@${digest}"
+      - "--yes" # Keyless signing via Sigstore
+
 signs:
   - id: cosign
     cmd: cosign

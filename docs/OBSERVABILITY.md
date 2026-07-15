@@ -223,10 +223,41 @@ route:
   rate(myrmex_alert_deliveries_total{status="error"}[5m]) > 0
   ```
 
-> **No auth on the webhook yet.** There is no field for a bearer token or
-> custom headers, so point `alert_webhook_url` at an endpoint that either
-> doesn't need auth or accepts a secret in the URL. Same for TLS: the system
-> trust store is used, with no skip-verify escape hatch.
+### Authenticating to the receiver
+
+Most on-call systems want a token. Send arbitrary headers with each delivery:
+
+```json
+{
+  "alert_webhook_url": "https://events.pagerduty.com/v2/enqueue",
+  "alert_webhook_headers": {
+    "Authorization": "env:PAGERDUTY_TOKEN",
+    "X-Routing-Key": "team-sre"
+  },
+  "alertmanager_url": "https://alertmanager.internal",
+  "alertmanager_headers": { "Authorization": "file:/run/secrets/am-token" }
+}
+```
+
+Header **values** resolve through the same secret indirection as `llm_api_key`
+— `env:` / `file:` / `agenix:` / `vault:` — so the token never has to sit in
+the config file. Header **names** are not secrets and are used as-is.
+
+Notes:
+
+- `Content-Type: application/json` is set first, so you can override it if your
+  receiver insists on something else.
+- `GET /api/config` redacts header **values** (names stay visible). It cannot
+  know which values are credentials, so it redacts them all — including
+  innocuous ones like a routing key.
+- A misconfigured token fails fast: a 4xx is treated as permanent and is not
+  retried. Watch `myrmex_alert_deliveries_total{status="error"}`.
+- URLs are redacted in log lines and delivery errors (userinfo and query
+  stripped), since a secret smuggled into the URL was the only option before
+  this existed — and Go's `*url.Error` stringifies with the full URL.
+
+> **TLS:** the system trust store is used, with no custom-CA or skip-verify
+> option. A receiver with a private certificate is not supported yet.
 
 ## Distributed tracing (OpenTelemetry)
 
