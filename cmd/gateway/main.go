@@ -4058,14 +4058,12 @@ func handleApiConfig(w http.ResponseWriter, r *http.Request) {
 		tokenCount := len(currentConfig.Tokens)
 		currentConfigMu.RUnlock()
 
-		// Redact all secret material: bearer/API tokens and TLS key material must
-		// never be returned over the API. Note the keys of the Tokens map ARE the
-		// secret tokens, so the whole map is omitted (a non-secret count is
-		// surfaced separately for operators).
-		safe.AuthToken = ""
-		safe.AntigravityToken = ""
-		safe.Tokens = nil
-		safe.TLSKeyPath = ""
+		// Redact all secret material: nothing secret may be returned over the
+		// API, even to an admin. See redactConfigSecrets — this used to be an
+		// inline list of four fields and silently drifted as secrets were added
+		// (issue #131), so the logic now lives in one tested place guarded by
+		// TestGatewayConfigFieldsAreClassified.
+		redactConfigSecrets(&safe)
 
 		out, err := json.Marshal(safe)
 		if err != nil {
@@ -4096,6 +4094,19 @@ func handleApiConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		// Restore secrets the caller did not actually change (issue #131).
+		// GET and POST here are a round trip - the web portal POSTs
+		// {...currentConfigData, <edited fields>}, i.e. the REDACTED GET
+		// response - and the whole decoded struct is written to disk below. A
+		// secret arriving empty or as the redaction placeholder therefore means
+		// "unchanged", not "clear it". Without this, saving settings from the
+		// portal writes the placeholder to disk and the admin bearer token
+		// becomes the literal string "[redacted]".
+		currentConfigMu.RLock()
+		live := currentConfig
+		currentConfigMu.RUnlock()
+		preserveRedactedSecrets(&newCfg, live)
 
 		// Write to disk if we have a configFilePath. Config contains secrets
 		// (tokens, API keys) so it is written with 0600 permissions.
