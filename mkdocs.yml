@@ -1,0 +1,33 @@
+# MkDocs config for Backstage TechDocs (#106).
+#
+# The nav below is checked by TestTechDocsNavCoversEveryDoc: a docs/*.md file
+# missing from it fails the build. Hand-maintained lists have silently drifted
+# three times in this repo (server.json #102, /api/config redaction #131), and a
+# doc missing from the nav is invisible in Backstage while still looking fine in
+# the repo — exactly the kind of failure nobody notices.
+site_name: Myrmex Hive
+site_description: Zero-inbound-port MCP gateway for managing distributed edge servers over reverse SSH tunnels
+site_url: https://myrmex-hive.freundcloud.com
+repo_url: https://github.com/olafkfreund/myrmex-hive
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+# docs/announce/ holds launch/marketing drafts (LinkedIn, Reddit), not product
+# documentation — they must not render in Backstage. Excluded here rather than
+# added to the nav; TestTechDocsNavCoversEveryDoc mirrors this exclusion.
+exclude_docs: |
+  announce/
+
+nav:
+  - Overview: index.md
+  - Deployment: DEPLOYMENT.md
+  - Observability: OBSERVABILITY.md
+  - Secrets: SECRETS.md
+  - Agent enrollment: ENROLLMENT.md
+  - Compliance & audit: COMPLIANCE.md
+  - MCP registry: MCP_REGISTRY.md
+  - Backstage & TechDocs: BACKSTAGE.md
+
+plugins:
+  - techdocs-core

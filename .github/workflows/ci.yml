@@ -47,6 +47,18 @@ jobs:
           curl -sfI "$SCHEMA" >/dev/null || { echo "::error::\$schema URL is unreachable: $SCHEMA"; exit 1; }
           check-jsonschema --schemafile "$SCHEMA" server.json
 
+      # Backstage renders docs/ via MkDocs (#106). --strict fails on a broken
+      # internal link or a dangling nav entry, so docs rot is caught here rather
+      # than discovered as a blank Docs tab in the portal.
+      #
+      # Note --strict does NOT fail when a doc is merely missing from the nav
+      # (it is only an INFO line, verified) — TestTechDocsNavCoversEveryDoc in
+      # the Go suite covers that direction.
+      - name: Build TechDocs
+        run: |
+          pip install --quiet mkdocs-techdocs-core
+          mkdocs build --strict --site-dir /tmp/techdocs
+
       # GoReleaser otherwise only runs on a tag, so a config error costs a
       # burned tag and a re-release (it did: v1.0.1 failed because builds
       # pointed `main:` at a single .go file, which silently ignored every
