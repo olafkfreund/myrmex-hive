@@ -97,7 +97,7 @@ Worth knowing before you build alerts on these:
 ## Grafana dashboard
 
 An example dashboard is shipped at
-[`dashboards/myrmex-hive.json`](../dashboards/myrmex-hive.json): fleet size and
+[`dashboards/myrmex-hive.json`](https://github.com/olafkfreund/myrmex-hive/blob/main/dashboards/myrmex-hive.json): fleet size and
 connectivity, tool-call rate/error-ratio/latency percentiles, per-agent
 CPU/memory/disk, upstream health, threshold breaches, alert-delivery failures,
 and HA peer forwards.

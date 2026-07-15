@@ -5,7 +5,7 @@ GHCR on every release tag. This document covers installing from those published
 artifacts.
 
 For the security model behind the topology below (agents dial *out*; the
-gateway is the only thing that listens), see the [README](../README.md).
+gateway is the only thing that listens), see the [README](https://github.com/olafkfreund/myrmex-hive#readme).
 
 ## Container images
 
