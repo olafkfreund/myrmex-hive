@@ -10,7 +10,7 @@ variable "gateway_version" {
     moves on every release. Images are cosign-signed from 1.0.3 onward.
   EOT
   type        = string
-  default     = "1.0.3"
+  default     = "1.1.0"
 }
 
 variable "agent_public_keys" {

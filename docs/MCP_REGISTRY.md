@@ -33,7 +33,7 @@ on the `gateway-amd64`/`gateway-arm64` builds. **The label must be on the
 released yet will fail verification.
 
 **2. `identifier` must include the tag.** The documented format is
-`registry/namespace/repository:tag` — `ghcr.io/olafkfreund/myrmex-gateway:1.0.2`,
+`registry/namespace/repository:tag` — `ghcr.io/olafkfreund/myrmex-gateway:1.1.0`,
 not the bare repository.
 
 **3. An OCI package must NOT have a `version` field.** The tag in `identifier`
@@ -42,7 +42,7 @@ not the bare repository.
 ```json
 "packages": [{
   "registryType": "oci",
-  "identifier": "ghcr.io/olafkfreund/myrmex-gateway:1.0.3"
+  "identifier": "ghcr.io/olafkfreund/myrmex-gateway:1.1.0"
 }]
 ```
 

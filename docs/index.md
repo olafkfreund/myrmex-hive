@@ -32,10 +32,10 @@ daemon, no management port for scanners to find.
 brew tap olafkfreund/myrmex && brew install --cask myrmex-hive
 
 # Kubernetes — --version pins the chart AND the images together
-helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.0.3
+helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.1.0
 
 # Containers (signed from v1.0.3 onward)
-docker pull ghcr.io/olafkfreund/myrmex-gateway:1.0.3
+docker pull ghcr.io/olafkfreund/myrmex-gateway:1.1.0
 ```
 
 Full options — Nix flake, `install.sh`, Windows, deb/rpm — are in the
