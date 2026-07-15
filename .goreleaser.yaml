@@ -90,7 +90,15 @@ checksum:
 # release: Homebrew is one optional distribution channel, and it should never
 # be able to take down the images, chart, packages and binaries with it — an
 # expired PAT a year from now would otherwise kill an unrelated release.
-# `.Env.X` errors on a missing var, hence envOrDefault/isEnvSet.
+# `.Env.X` errors on a MISSING var — but release.yml always maps
+# HOMEBREW_TAP_TOKEN (to "" when the secret is absent), so it is never missing,
+# only possibly empty. isEnvSet treats empty as unset, which is what gates the
+# skip below.
+#
+# NOTE: envOrDefault is NOT available in this template context — goreleaser
+# fails with `function "envOrDefault" not defined`, even though isEnvSet works.
+# That was invisible until the token was finally set, because skip_upload:true
+# means the token template is never evaluated.
 #
 # Consequence: with no token set, `brew` stays on the previous version. That
 # skip is SILENT in a passing release — it hid a real bug for three releases
@@ -104,7 +112,7 @@ homebrew_casks:
       owner: olafkfreund
       name: homebrew-myrmex
       branch: main
-      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     binaries:
       - myrmex
       - myrmex-gateway
