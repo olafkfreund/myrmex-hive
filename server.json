@@ -13,7 +13,6 @@
     {
       "registryType": "oci",
       "identifier": "ghcr.io/olafkfreund/myrmex-gateway:1.0.3",
-      "version": "1.0.3",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"

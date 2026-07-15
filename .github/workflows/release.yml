@@ -52,6 +52,8 @@ jobs:
       - name: server.json matches the tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # packages[].version is deliberately absent: the registry rejects it
+          # for OCI packages (the tag in identifier is the version).
           GOT_VERSION=$(jq -r '.version' server.json)
           GOT_IMAGE=$(jq -r '.packages[0].identifier' server.json)
           WANT_IMAGE="ghcr.io/olafkfreund/myrmex-gateway:${VERSION}"

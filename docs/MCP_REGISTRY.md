@@ -16,7 +16,7 @@ The gateway is the MCP server; agents are reached *through* it as namespaced
 tools (`<agentID>__<tool>`). There is deliberately **no `remotes` entry**: a
 Myrmex gateway is self-hosted, so there is no public URL to advertise.
 
-## Two rules that will reject a publish
+## Three rules that will reject a publish
 
 Both are enforced by the registry, and both have bitten this repo:
 
@@ -35,6 +35,29 @@ released yet will fail verification.
 **2. `identifier` must include the tag.** The documented format is
 `registry/namespace/repository:tag` — `ghcr.io/olafkfreund/myrmex-gateway:1.0.2`,
 not the bare repository.
+
+**3. An OCI package must NOT have a `version` field.** The tag in `identifier`
+*is* the version:
+
+```json
+"packages": [{
+  "registryType": "oci",
+  "identifier": "ghcr.io/olafkfreund/myrmex-gateway:1.0.3"
+}]
+```
+
+This one is not in the JSON Schema — the schema accepts `packages[].version`
+and the registry rejects it:
+
+```
+400: OCI packages must not have 'version' field —
+     include version in 'identifier' instead
+```
+
+**Schema-valid is not the same as publishable.** The registry runs server-side
+rules the schema does not express, so a clean `check-jsonschema` proves less
+than it looks. CI now checks this specific rule too, but expect the live API to
+be the final word.
 
 Because of rule 1, publishing is always *after* the release that carries the
 label, never before.
