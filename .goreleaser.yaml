@@ -82,23 +82,36 @@ checksum:
 # The single `archives` entry has no `ids:` filter, so each tar.gz carries all
 # three binaries — one cask installs all three.
 #
-# NOTE: the release job's GITHUB_TOKEN is scoped to THIS repo and cannot push
-# to olafkfreund/homebrew-myrmex. A HOMEBREW_TAP_TOKEN secret (PAT with `repo`
-# scope) is required; without it the release fails at this step.
+# The release job's GITHUB_TOKEN is scoped to THIS repo and cannot push to
+# olafkfreund/homebrew-myrmex, so pushing the cask needs a HOMEBREW_TAP_TOKEN
+# secret (PAT with `repo` scope).
+#
+# When that secret is absent the cask is SKIPPED rather than failing the
+# release: Homebrew is one optional distribution channel, and it should never
+# be able to take down the images, chart, packages and binaries with it — an
+# expired PAT a year from now would otherwise kill an unrelated release.
+# `.Env.X` errors on a missing var, hence envOrDefault/isEnvSet.
+#
+# Consequence: with no secret set, `brew` silently stays on the previous
+# version. GoReleaser logs the skip; check the release log if a new version
+# doesn't show up in the tap.
 homebrew_casks:
   - name: myrmex-hive
     repository:
       owner: olafkfreund
       name: homebrew-myrmex
       branch: main
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
     binaries:
       - myrmex
       - myrmex-gateway
       - myrmex-agent
     homepage: "https://myrmex-hive.freundcloud.com"
     description: "Zero-inbound-port MCP gateway for managing distributed edge servers over reverse SSH tunnels"
-    skip_upload: auto # no formulas for prereleases/snapshots
+    # "auto" skips prereleases/snapshots; the isEnvSet guard additionally skips
+    # when no tap token is configured, so a missing secret degrades instead of
+    # failing the release.
+    skip_upload: '{{ if isEnvSet "HOMEBREW_TAP_TOKEN" }}auto{{ else }}true{{ end }}'
     caveats: |
       The operator CLI is `myrmex`; it talks to a Gateway's REST API
       (default https://localhost:8080, override with --gateway / MYRMEX_TOKEN).
