@@ -3,7 +3,7 @@
   "name": "io.github.olafkfreund/myrmex-hive",
   "title": "Myrmex Hive",
   "description": "Zero-inbound-port MCP gateway for managing distributed edge servers over reverse SSH tunnels",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "websiteUrl": "https://myrmex-hive.freundcloud.com",
   "repository": {
     "url": "https://github.com/olafkfreund/myrmex-hive",
@@ -12,8 +12,8 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/olafkfreund/myrmex-gateway:1.0.2",
-      "version": "1.0.2",
+      "identifier": "ghcr.io/olafkfreund/myrmex-gateway:1.0.3",
+      "version": "1.0.3",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
