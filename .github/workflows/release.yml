@@ -74,6 +74,13 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A GitHub secret is NOT an env var until it is mapped here. Without
+          # this line goreleaser's `isEnvSet "HOMEBREW_TAP_TOKEN"` is false, the
+          # cask silently skips, and the release still passes — which is exactly
+          # what happened for v1.0.2, v1.0.3 and v1.1.0. The skip was blamed on
+          # the secret not existing; in fact the secret was never wired through,
+          # so the cask could not have published even once it was set.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       # Chart version AND appVersion both track the git tag, so the chart's
       # image-tag fallback (.Chart.AppVersion) pins the images published above.
