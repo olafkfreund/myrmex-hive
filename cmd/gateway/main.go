@@ -114,6 +114,9 @@ var rolePermissions = map[string]map[string]bool{
 		"/api/enroll/token":  true,
 		"/api/agents/revoke": true,
 		"/metrics":           true,
+		// Admin only: entries carry token ids, the commands operators ran and
+		// agent ids — the fleet's activity history (#111).
+		"/api/audit": true,
 	},
 	"operator": {
 		"/sse":        true,
@@ -2493,6 +2496,9 @@ func startHTTPServer(cfg *config.GatewayConfig) {
 	// handleApiEnroll), the same pattern as the unauthenticated /healthz.
 	http.HandleFunc("/api/enroll", handleApiEnroll)
 	http.HandleFunc("/api/agents/revoke", requireAuth(handleApiAgentsRevoke))
+	// Read-only signed-audit viewer (#111). Admin-only via rolePermissions;
+	// handleApiAudit serves GET only.
+	http.HandleFunc("/api/audit", requireAuth(handleApiAudit))
 	// /metrics is opt-in (#97): when metrics_enabled is unset the route is not
 	// registered at all, so an unconfigured gateway is unchanged. Behind
 	// requireAuth like the other API paths - the fleet topology it exposes is
@@ -5804,6 +5810,7 @@ const PortalHTML = `<!DOCTYPE html>
         <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
         <button class="tab-btn" onclick="switchTab('fleet')">Fleet</button>
         <button class="tab-btn" onclick="switchTab('approvals')">Approvals</button>
+        <button class="tab-btn" onclick="switchTab('audit')">Audit</button>
         <button class="tab-btn" onclick="switchTab('playground')">Playground</button>
         <button class="tab-btn" onclick="switchTab('keys')">SSH Authorized Keys</button>
         <button class="tab-btn" onclick="switchTab('config')">Configuration</button>
@@ -5928,6 +5935,46 @@ const PortalHTML = `<!DOCTYPE html>
                         </thead>
                         <tbody id="approvals-tbody">
                             <tr class="empty-row"><td colspan="7">No pending approvals.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Audit Tab (#111): read-only, admin-only signed audit log -->
+        <div id="audit" class="tab-content">
+            <div class="mgmt-card">
+                <div class="item-header">
+                    <span class="item-title">Signed Audit Log</span>
+                    <span class="item-meta" id="audit-count">0 entries</span>
+                </div>
+                <div id="audit-alert"></div>
+                <div class="mgmt-toolbar" style="flex-wrap: wrap; gap: 8px;">
+                    <input class="input" id="audit-f-actor" placeholder="Actor (token)" style="max-width: 140px;" oninput="debouncedLoadAudit()">
+                    <input class="input" id="audit-f-agent" placeholder="Agent" style="max-width: 130px;" oninput="debouncedLoadAudit()">
+                    <input class="input" id="audit-f-action" placeholder="Action" style="max-width: 130px;" oninput="debouncedLoadAudit()">
+                    <input class="input" id="audit-f-since" type="datetime-local" style="max-width: 190px;" onchange="loadAudit()" title="From">
+                    <input class="input" id="audit-f-until" type="datetime-local" style="max-width: 190px;" onchange="loadAudit()" title="To">
+                    <button class="btn" onclick="clearAuditFilters()">Clear</button>
+                    <button class="btn" onclick="loadAudit()">Refresh</button>
+                </div>
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Time</th>
+                                <th>Actor</th>
+                                <th>Role</th>
+                                <th>Action</th>
+                                <th>Agent</th>
+                                <th>Command</th>
+                                <th>Status</th>
+                                <th>Signature</th>
+                            </tr>
+                        </thead>
+                        <tbody id="audit-tbody">
+                            <tr class="empty-row"><td colspan="9">No audit entries.</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -6296,6 +6343,123 @@ const PortalHTML = `<!DOCTYPE html>
                 loadFleet();
             } else if (tabId === 'approvals') {
                 loadApprovals();
+            } else if (tabId === 'audit') {
+                loadAudit();
+            }
+        }
+
+        // --- Audit log viewer (#111) -------------------------------------
+        //
+        // Read-only. The gateway verifies every signature server-side against
+        // the live host key; this only renders the verdict. It deliberately
+        // never computes or infers "valid" itself — a portal that guessed
+        // green would be worse than no viewer at all.
+        let auditDebounce = null;
+        function debouncedLoadAudit() {
+            clearTimeout(auditDebounce);
+            auditDebounce = setTimeout(loadAudit, 250);
+        }
+
+        function clearAuditFilters() {
+            ['audit-f-actor', 'audit-f-agent', 'audit-f-action', 'audit-f-since', 'audit-f-until']
+                .forEach(id => { document.getElementById(id).value = ''; });
+            loadAudit();
+        }
+
+        // datetime-local gives "2026-07-15T10:30"; the log stores RFC3339 UTC.
+        function auditTimeParam(id) {
+            const v = document.getElementById(id).value;
+            if (!v) return '';
+            const d = new Date(v);
+            return isNaN(d) ? '' : d.toISOString();
+        }
+
+        async function loadAudit() {
+            const tbody = document.getElementById('audit-tbody');
+            const alertBox = document.getElementById('audit-alert');
+            alertBox.innerHTML = '';
+
+            const params = new URLSearchParams();
+            const actor = document.getElementById('audit-f-actor').value.trim();
+            const agent = document.getElementById('audit-f-agent').value.trim();
+            const action = document.getElementById('audit-f-action').value.trim();
+            const since = auditTimeParam('audit-f-since');
+            const until = auditTimeParam('audit-f-until');
+            if (actor) params.set('actor', actor);
+            if (agent) params.set('agent', agent);
+            if (action) params.set('action', action);
+            if (since) params.set('since', since);
+            if (until) params.set('until', until);
+
+            try {
+                const res = await authFetch('/api/audit?' + params.toString());
+                if (res.status === 404) {
+                    tbody.innerHTML = '<tr class="empty-row"><td colspan="9">Audit logging is not enabled. Set <code>audit_log_path</code> in the gateway config.</td></tr>';
+                    document.getElementById('audit-count').innerText = 'disabled';
+                    return;
+                }
+                if (res.status === 403) {
+                    tbody.innerHTML = '<tr class="empty-row"><td colspan="9">The audit log is admin-only.</td></tr>';
+                    document.getElementById('audit-count').innerText = 'forbidden';
+                    return;
+                }
+                if (!res.ok) throw new Error(await res.text());
+                const data = await res.json();
+                const s = data.summary || {};
+
+                // The summary covers the WHOLE log, not the filtered view: the
+                // PrevSig chain only means anything over the complete file, so
+                // a count derived from a filter would misrepresent it.
+                if (s.tampered) {
+                    alertBox.innerHTML = '<div class="alert alert-danger">' +
+                        '<strong>Audit log verification FAILED.</strong> ' +
+                        htmlEscape(String(s.signature_failures || 0)) + ' signature failure(s), ' +
+                        htmlEscape(String(s.chain_failures || 0)) + ' chain break(s) across ' +
+                        htmlEscape(String(s.total || 0)) + ' entries. First problem on line ' +
+                        htmlEscape(String(s.first_bad_line || 0)) + ': ' +
+                        htmlEscape(s.first_bad_reason || '') + '</div>';
+                } else if (s.total > 0) {
+                    alertBox.innerHTML = '<div class="alert alert-success">' +
+                        'All ' + htmlEscape(String(s.total)) + ' entries verified against the gateway host key: ' +
+                        'signatures valid, chain intact.</div>';
+                }
+
+                document.getElementById('audit-count').innerText =
+                    data.filtered + ' of ' + (s.total || 0) + ' entries' + (data.truncated ? ' (truncated)' : '');
+
+                const rows = data.entries || [];
+                if (rows.length === 0) {
+                    tbody.innerHTML = '<tr class="empty-row"><td colspan="9">No entries match these filters.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = rows.map(e => {
+                    let sigCell;
+                    if (e.signature_valid && e.chain_valid) {
+                        sigCell = '<span class="status-badge status-online">verified</span>';
+                    } else if (!e.signature_valid && e.chain_valid) {
+                        sigCell = '<span class="status-badge status-offline" title="' + htmlEscape(e.verify_error || '') + '">tampered</span>';
+                    } else if (e.signature_valid && !e.chain_valid) {
+                        // Signature fine, chain broken: an entry was removed or
+                        // reordered around this one.
+                        sigCell = '<span class="status-badge status-offline" title="' + htmlEscape(e.verify_error || '') + '">chain break</span>';
+                    } else {
+                        sigCell = '<span class="status-badge status-offline" title="' + htmlEscape(e.verify_error || '') + '">invalid</span>';
+                    }
+                    return '<tr>' +
+                        '<td>' + htmlEscape(String(e.line)) + '</td>' +
+                        '<td>' + htmlEscape(e.timestamp || '') + '</td>' +
+                        '<td>' + htmlEscape(e.token_id || '') + '</td>' +
+                        '<td>' + htmlEscape(e.role || '') + '</td>' +
+                        '<td>' + htmlEscape(e.action || '') + '</td>' +
+                        '<td>' + htmlEscape(e.agent_id || '') + '</td>' +
+                        '<td><code>' + htmlEscape(e.command || '') + '</code></td>' +
+                        '<td>' + htmlEscape(e.status || '') + '</td>' +
+                        '<td>' + sigCell + '</td>' +
+                        '</tr>';
+                }).join('');
+            } catch (e) {
+                alertBox.innerHTML = '<div class="alert alert-danger">Failed to load audit log: ' + htmlEscape(e.message) + '</div>';
             }
         }
 
