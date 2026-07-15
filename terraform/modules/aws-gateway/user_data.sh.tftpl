@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Myrmex Hive gateway bootstrap.
+#
+# Secrets are pulled from SSM at boot rather than templated into user_data:
+# user_data is readable from inside the instance via IMDS, so a compromised
+# process could read the admin token straight out of it.
+set -euo pipefail
+
+dnf install -y docker awscli-2
+systemctl enable --now docker
+
+install -d -m 0700 /etc/myrmex
+install -d -m 0700 /var/lib/myrmex
+
+fetch() {
+  aws ssm get-parameter --with-decryption --region "${region}" \
+    --name "$1" --query 'Parameter.Value' --output text
+}
+
+# 0600: the host key signs the audit log, the config carries the admin token.
+umask 077
+fetch "/${name}/host_key"             > /etc/myrmex/host_key
+fetch "/${name}/authorized_keys"      > /etc/myrmex/authorized_keys
+fetch "/${name}/gateway_config.json"  > /etc/myrmex/gateway_config.json
+chmod 0600 /etc/myrmex/host_key /etc/myrmex/authorized_keys /etc/myrmex/gateway_config.json
+
+# Run under systemd so it restarts on failure and survives reboots.
+cat > /etc/systemd/system/myrmex-gateway.service <<UNIT
+[Unit]
+Description=Myrmex Hive Gateway
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f myrmex-gateway
+ExecStartPre=/usr/bin/docker pull ghcr.io/olafkfreund/myrmex-gateway:${gateway_version}
+ExecStart=/usr/bin/docker run --rm --name myrmex-gateway \
+  -p 2222:2222 -p 8080:8080 \
+  -v /etc/myrmex:/app/config:ro \
+  -v /var/lib/myrmex:/var/lib/myrmex \
+  ghcr.io/olafkfreund/myrmex-gateway:${gateway_version} \
+  -config /app/config/gateway_config.json
+ExecStop=/usr/bin/docker stop myrmex-gateway
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now myrmex-gateway
