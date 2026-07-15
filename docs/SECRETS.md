@@ -145,3 +145,72 @@ change the underlying source, then make the Gateway re-read it.
 - **`GET /api/config` never returns resolved secret values.** The config
   surfaced over the API omits/redacts secret-bearing fields, so tokens cannot
   be read back out of a running Gateway.
+
+## OIDC / SSO (native)
+
+The gateway can validate real OIDC-issued JWTs against the issuer's JWKS —
+signature, `iss`, `aud` and `exp` — and map claims to its roles. Opt-in: with
+`oidc_issuer` unset nothing runs, no discovery happens, and bearer tokens
+resolve exactly as before.
+
+```json
+{
+  "oidc_issuer": "https://login.microsoftonline.com/<tenant>/v2.0",
+  "oidc_audience": "<your-client-id>",
+  "oidc_role_claim": "groups",
+  "oidc_role_map": {
+    "myrmex-admins": "admin",
+    "sre-oncall": "operator",
+    "auditors": "read-only"
+  }
+}
+```
+
+**There is no client secret.** The gateway *validates* tokens; it never obtains
+them. Nothing here is secret — issuer and audience are public (the audience is
+in every JWT), and the role map contains no credentials. Your IdP issues tokens
+to your clients; the gateway just checks them.
+
+### The two settings that fail closed
+
+`oidc_audience` and `oidc_role_map` are **required** when `oidc_issuer` is set,
+and the gateway refuses to start without them:
+
+- **No audience** → any token that issuer minted, *for any application*, would
+  authenticate here. On a shared IdP (Entra, Okta, Google) that is a confused
+  deputy, not an inconvenience.
+- **No role map** → every validated token maps to no role and is denied.
+  Authenticating nobody is a confusing way to discover a config mistake.
+
+There is deliberately **no default role**. A token from a valid issuer whose
+groups match nothing is denied — it is a caller you never told the gateway
+about.
+
+### How it resolves
+
+Auth order is: mTLS → trusted proxy → **OIDC** → scoped tokens → tokens →
+auth_token.
+
+- A bearer that **is not a JWT** falls through to the static-token path
+  untouched. That is the backward-compatibility guarantee: existing
+  deployments are unaffected, and static tokens keep working alongside SSO.
+- A bearer that **is a JWT but fails validation** is denied outright and never
+  falls through — a forged or expired JWT does not get a second chance at
+  being a static token.
+
+A caller in several mapped groups gets the **most privileged** role
+(admin > operator > read-only), matching how group membership is normally
+additive.
+
+### Operational notes
+
+- Discovery (`<issuer>/.well-known/openid-configuration`) happens on **first
+  use**, not at startup. A gateway that refused to boot because the IdP was
+  briefly unreachable would take static-token auth down with it; lazy init
+  retries on the next request instead. go-oidc caches and rotates the JWKS.
+- The mapped role feeds the same `rolePermissions` matrix as everything else —
+  an `operator` JWT gets `/api/status` and not `/api/config`, exactly like an
+  operator static token.
+- Audit entries record the token's `sub`, but currently pass it through the
+  same redactor as secrets, so it reads `alic....com`. See
+  [#143](https://github.com/olafkfreund/myrmex-hive/issues/143).

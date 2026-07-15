@@ -332,6 +332,37 @@ type GatewayConfig struct {
 	// TraceServiceName is the service.name resource attribute reported to the
 	// collector. Empty defaults to "myrmex-gateway".
 	TraceServiceName string `json:"trace_service_name,omitempty"`
+	// OIDCIssuer enables native OIDC/JWKS bearer-token validation (#114).
+	// The issuer URL, e.g. "https://accounts.google.com" or
+	// "https://login.microsoftonline.com/<tenant>/v2.0" — the gateway fetches
+	// <issuer>/.well-known/openid-configuration to discover the JWKS endpoint,
+	// and go-oidc caches and rotates the keys.
+	//
+	// Empty (the default) disables OIDC entirely: no discovery, no network
+	// calls, and bearer tokens resolve exactly as before.
+	//
+	// This does NOT replace static tokens. A bearer that fails OIDC validation
+	// still falls through to scoped_tokens/tokens/auth_token, so existing
+	// deployments are unaffected.
+	OIDCIssuer string `json:"oidc_issuer,omitempty"`
+	// OIDCAudience is the expected `aud` claim — normally your client ID.
+	// REQUIRED when OIDCIssuer is set: without it any token the issuer minted
+	// for ANY audience would be accepted here, which is a confused-deputy
+	// waiting to happen. Validate() enforces this.
+	OIDCAudience string `json:"oidc_audience,omitempty"`
+	// OIDCRoleClaim is the JWT claim carrying the caller's groups/roles.
+	// Defaults to "groups". The claim may be a string or an array of strings.
+	OIDCRoleClaim string `json:"oidc_role_claim,omitempty"`
+	// OIDCRoleMap maps a value from OIDCRoleClaim to a gateway role, e.g.
+	// {"myrmex-admins": "admin", "sre-oncall": "operator"}. REQUIRED when
+	// OIDCIssuer is set: with no mapping every validated token would resolve
+	// no role and be denied, so an empty map is a misconfiguration, not a
+	// default. Validate() enforces this.
+	//
+	// A caller matching several entries gets the most privileged
+	// (admin > operator > read-only), matching how group membership is
+	// normally additive.
+	OIDCRoleMap map[string]string `json:"oidc_role_map,omitempty"`
 	// MetricsEnabled exposes a Prometheus exposition endpoint at /metrics on
 	// the gateway's HTTP server (issue #97). Defaults to false: with nothing
 	// configured the route is not registered at all and behavior is unchanged.
@@ -361,6 +392,30 @@ func (c *GatewayConfig) Validate() error {
 
 	if c.ListenAddr == "" {
 		errs = append(errs, fmt.Errorf("listen_addr must be set"))
+	}
+
+	// OIDC (#114) fails closed on misconfiguration rather than degrading into
+	// something permissive.
+	if c.OIDCIssuer != "" {
+		if c.OIDCAudience == "" {
+			// Without an audience check, ANY token the issuer minted — for any
+			// application — would authenticate here. On a shared IdP that is a
+			// confused deputy, not an inconvenience.
+			errs = append(errs, fmt.Errorf("oidc_audience must be set when oidc_issuer is: without it any token from that issuer, for any audience, would be accepted"))
+		}
+		if len(c.OIDCRoleMap) == 0 {
+			// Every validated token would map to no role and be denied. That is
+			// a config mistake, and silently authenticating nobody is a
+			// confusing way to discover it.
+			errs = append(errs, fmt.Errorf("oidc_role_map must be set when oidc_issuer is: with no mapping every validated token resolves no role and is denied"))
+		}
+		for claim, role := range c.OIDCRoleMap {
+			switch role {
+			case "admin", "operator", "read-only":
+			default:
+				errs = append(errs, fmt.Errorf("oidc_role_map[%q] = %q is not a gateway role (admin, operator, read-only)", claim, role))
+			}
+		}
 	}
 
 	// Mirrors the runtime fail-closed rule: a signed audit log requires a
