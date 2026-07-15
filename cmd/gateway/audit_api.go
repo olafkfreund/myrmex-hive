@@ -204,10 +204,10 @@ func handleApiAudit(w http.ResponseWriter, r *http.Request) {
 		entries = append(entries, auditAPIEntry{
 			Line:      res.Line,
 			Timestamp: e.Timestamp,
-			// Already anonymized when the entry was written (logAuditEvent
-			// stores anonymizeToken(token)), so the raw credential is never on
-			// disk. Re-anonymizing here would be redundant AND would mangle
-			// "none" (the no-token marker) into "...".
+			// Written by auditPrincipal (#143): an identity (OIDC sub, mTLS CN,
+			// proxy identity) verbatim, a static bearer already redacted. Either
+			// way the raw credential is never on disk, and re-anonymizing here
+			// would destroy the identity — which is the point of recording it.
 			TokenID:     e.TokenID,
 			Role:        e.Role,
 			Action:      e.Action,

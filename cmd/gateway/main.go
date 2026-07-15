@@ -91,7 +91,13 @@ type contextKey string
 
 const (
 	contextKeyToken contextKey = "token"
-	contextKeyRole  contextKey = "role"
+	// contextKeyIdentity marks contextKeyToken as carrying an IDENTITY (an
+	// mTLS CN, a proxy-forwarded identity, an OIDC subject) rather than a
+	// credential. The key is overloaded by design — every auth path resolves a
+	// principal into it — but the audit trail must not redact an identity the
+	// way it redacts a bearer (#143).
+	contextKeyIdentity contextKey = "identity"
+	contextKeyRole     contextKey = "role"
 	// contextKeyScope carries the resolved *config.TokenScope for the caller's
 	// bearer token (nil when the token is unrestricted, e.g. legacy Tokens map
 	// or the default AuthToken).
@@ -2637,11 +2643,34 @@ func anonymizeToken(token string) string {
 	return "..."
 }
 
+// auditPrincipal resolves who acted, for the audit trail and the approvals
+// queue (#143).
+//
+// contextKeyToken is overloaded: a bearer credential for static tokens, an
+// identity (mTLS CN / proxy identity / OIDC subject) for every SSO path. Both
+// used to go through anonymizeToken, which is a redactor for CREDENTIALS —
+// applied to an identity it destroys the very thing the audit log exists to
+// record, and it COLLIDES: alice@example.com and alicia@example.com both
+// render "alic....com".
+//
+// So: identities verbatim, credentials redacted. One accessor, because the
+// audit log and the approvals queue must never disagree about who someone is.
+func auditPrincipal(ctx context.Context) string {
+	principal, _ := ctx.Value(contextKeyToken).(string)
+	if isIdentity, _ := ctx.Value(contextKeyIdentity).(bool); isIdentity {
+		// An OIDC sub / mTLS CN / proxy identity is not a secret — it is the
+		// answer to "who did this".
+		return principal
+	}
+	// A bearer in the audit log would be a credential leak into a file
+	// operators read, paste into issues and ship to a SIEM.
+	return anonymizeToken(principal)
+}
+
 func logAuditEvent(ctx context.Context, action, agentID, command, status, details string) {
-	token, _ := ctx.Value(contextKeyToken).(string)
 	role, _ := ctx.Value(contextKeyRole).(string)
 
-	anonymizedToken := anonymizeToken(token)
+	anonymizedToken := auditPrincipal(ctx)
 	if role == "" {
 		role = "system"
 	}
@@ -2863,14 +2892,13 @@ func createPendingApproval(ctx context.Context, agentID, tool, args, tier string
 	if err != nil {
 		return nil, err
 	}
-	token, _ := ctx.Value(contextKeyToken).(string)
 	role, _ := ctx.Value(contextKeyRole).(string)
 	if role == "" {
 		role = "system"
 	}
 	approval := &PendingApproval{
 		ID:        id,
-		TokenID:   anonymizeToken(token),
+		TokenID:   auditPrincipal(ctx),
 		Role:      role,
 		AgentID:   agentID,
 		Tool:      tool,
@@ -3152,11 +3180,16 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		// them carries a TokenScope.
 		role := ""
 		var scope *config.TokenScope
+		// Whether reqToken ends up holding an identity or a bearer credential.
+		// Static tokens leave this false: a bearer in the audit log would be a
+		// credential leak into a file operators read and share.
+		isIdentity := false
 
 		if clientCACertPath != "" && r.TLS != nil && len(r.TLS.VerifiedChains) > 0 {
 			cn := r.TLS.VerifiedChains[0][0].Subject.CommonName
 			role = roleForClientCert(cn, mtlsCNRoles, mtlsRole)
 			reqToken = cn // carried into context below for the audit trail
+			isIdentity = true
 		}
 
 		if role == "" && trustedProxySecret != "" {
@@ -3168,6 +3201,7 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 					role = "operator"
 				}
 				reqToken = identity // carried into context below for the audit trail
+				isIdentity = true
 			}
 		}
 
@@ -3200,6 +3234,7 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 				// both render "alic....com"). Pre-existing for mTLS/proxy;
 				// tracked in #143 rather than widened here.
 				reqToken = subject
+				isIdentity = true
 			}
 		}
 
@@ -3236,6 +3271,7 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		// authorization (see authorizeToolCall).
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, contextKeyToken, reqToken)
+		ctx = context.WithValue(ctx, contextKeyIdentity, isIdentity)
 		ctx = context.WithValue(ctx, contextKeyRole, role)
 		ctx = context.WithValue(ctx, contextKeyScope, scope)
 
