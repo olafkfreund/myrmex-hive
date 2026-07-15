@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/csv"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/olafkfreund/myrmex-hive/pkg/audit"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -765,159 +765,6 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 	fmt.Println(renderMarkdown(finalResponse))
 }
 
-// auditEntry mirrors the gateway's AuditEntry JSON shape (cmd/gateway/main.go).
-type auditEntry struct {
-	Timestamp string `json:"timestamp"`
-	TokenID   string `json:"token_id"`
-	Role      string `json:"role"`
-	Action    string `json:"action"`
-	AgentID   string `json:"agent_id,omitempty"`
-	Command   string `json:"command,omitempty"`
-	Status    string `json:"status"`
-	Details   string `json:"details"`
-	PrevSig   string `json:"prev_sig,omitempty"`
-	Signature string `json:"signature,omitempty"`
-}
-
-type auditLineResult struct {
-	Line       int    `json:"line"`
-	Timestamp  string `json:"timestamp"`
-	Action     string `json:"action"`
-	SigValid   bool   `json:"signature_valid"`
-	ChainValid bool   `json:"chain_valid"`
-	Error      string `json:"error,omitempty"`
-}
-
-// auditVerifyResult is the outcome of one full pass over an audit log,
-// shared by "audit verify" (which prints it once) and "audit watch" (which
-// prints a condensed line every polling cycle).
-type auditVerifyResult struct {
-	Results       []auditLineResult
-	Total         int
-	Valid         int
-	SigFailures   int
-	ChainFailures int
-	// FirstBadLine is the 1-based line number of the first entry with a
-	// signature or chain failure, or 0 if every entry verified cleanly.
-	FirstBadLine int
-	// FirstBadReason is the auditLineResult.Error text for FirstBadLine.
-	FirstBadReason string
-}
-
-// verifyAuditLog re-verifies every entry in a gateway audit log: each
-// entry's own SSH signature over its fields, and the PrevSig -> Signature
-// hash chain linking it to the entry before it. It performs no printing —
-// callers (handleAuditVerify, handleAuditWatch) render the result however
-// they need. A returned error means the log/key could not even be read or
-// parsed, distinct from tamper being found (which is reported in the
-// returned auditVerifyResult).
-func verifyAuditLog(logPath, hostKeyPath string) (auditVerifyResult, error) {
-	var out auditVerifyResult
-
-	keyBytes, err := os.ReadFile(hostKeyPath)
-	if err != nil {
-		return out, fmt.Errorf("Failed to read host key %q: %v", hostKeyPath, err)
-	}
-
-	pub, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
-	if err != nil {
-		return out, fmt.Errorf("Failed to parse host public key %q: %v", hostKeyPath, err)
-	}
-
-	f, err := os.Open(logPath)
-	if err != nil {
-		return out, fmt.Errorf("Failed to open audit log %q: %v", logPath, err)
-	}
-	defer f.Close()
-
-	var prevSig string
-	lineNum := 0
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		out.Total++
-
-		res := auditLineResult{Line: lineNum}
-
-		var entry auditEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			res.Error = fmt.Sprintf("invalid JSON: %v", err)
-			out.SigFailures++
-			out.ChainFailures++
-			if out.FirstBadLine == 0 {
-				out.FirstBadLine = lineNum
-				out.FirstBadReason = res.Error
-			}
-			out.Results = append(out.Results, res)
-			// Leave prevSig untouched: we cannot trust anything derived from
-			// this line, but subsequent entries may still chain correctly
-			// from the last entry we could parse.
-			continue
-		}
-
-		res.Timestamp = entry.Timestamp
-		res.Action = entry.Action
-
-		if entry.PrevSig == prevSig {
-			res.ChainValid = true
-		} else {
-			out.ChainFailures++
-			res.Error = fmt.Sprintf("chain break: prev_sig %q does not match previous entry's signature %q", entry.PrevSig, prevSig)
-		}
-
-		payload := strings.Join([]string{
-			entry.Timestamp, entry.TokenID, entry.Role, entry.Action,
-			entry.AgentID, entry.Command, entry.Status, entry.Details, entry.PrevSig,
-		}, "|")
-
-		blob, err := hex.DecodeString(entry.Signature)
-		if err != nil {
-			out.SigFailures++
-			if res.Error != "" {
-				res.Error += "; "
-			}
-			res.Error += fmt.Sprintf("invalid signature encoding: %v", err)
-		} else {
-			sig := &ssh.Signature{Format: pub.Type(), Blob: blob}
-			if err := pub.Verify([]byte(payload), sig); err != nil {
-				out.SigFailures++
-				if res.Error != "" {
-					res.Error += "; "
-				}
-				res.Error += fmt.Sprintf("signature verification failed: %v", err)
-			} else {
-				res.SigValid = true
-			}
-		}
-
-		if (!res.SigValid || !res.ChainValid) && out.FirstBadLine == 0 {
-			out.FirstBadLine = lineNum
-			out.FirstBadReason = res.Error
-		}
-
-		out.Results = append(out.Results, res)
-		prevSig = entry.Signature
-	}
-
-	if err := scanner.Err(); err != nil {
-		return out, fmt.Errorf("Failed to read audit log %q: %v", logPath, err)
-	}
-
-	for _, r := range out.Results {
-		if r.SigValid && r.ChainValid {
-			out.Valid++
-		}
-	}
-
-	return out, nil
-}
-
 // handleAudit dispatches "audit" subcommands: "verify" checks integrity,
 // "watch" polls the log on an interval and alerts on tamper, "export"
 // re-emits the log as JSON/CSV, and "pubkey" prints the gateway's host
@@ -973,7 +820,7 @@ func handleAuditVerify(cfg Config, args []string) {
 		os.Exit(1)
 	}
 
-	result, err := verifyAuditLog(logPath, hostKeyPath)
+	result, err := audit.VerifyFile(logPath, hostKeyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -1075,7 +922,7 @@ func handleAuditWatch(args []string) {
 	fmt.Printf("Watching audit log %q for tampering (host key %q, checking every %ds)...\n", logPath, hostKeyPath, interval)
 
 	check := func() {
-		result, err := verifyAuditLog(logPath, hostKeyPath)
+		result, err := audit.VerifyFile(logPath, hostKeyPath)
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err != nil {
 			fmt.Printf("[%s] check error: %v\n", now, err)
@@ -1143,7 +990,7 @@ func handleAuditExport(cfg Config, args []string) {
 	}
 	defer f.Close()
 
-	var entries []auditEntry
+	var entries []audit.Entry
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	lineNum := 0
@@ -1153,7 +1000,7 @@ func handleAuditExport(cfg Config, args []string) {
 		if line == "" {
 			continue
 		}
-		var entry auditEntry
+		var entry audit.Entry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: Invalid JSON on line %d of %q: %v\n", lineNum, logPath, err)
 			os.Exit(1)
@@ -1182,7 +1029,7 @@ func handleAuditExport(cfg Config, args []string) {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		if entries == nil {
-			entries = []auditEntry{}
+			entries = []audit.Entry{}
 		}
 		if err := enc.Encode(entries); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: Failed to encode JSON: %v\n", err)
