@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -164,7 +167,7 @@ func TestDeliverWithRetryRetriesOn5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	deliverWithRetry(target, srv.URL, []byte(`{}`), 3)
+	deliverWithRetry(target, srv.URL, []byte(`{}`), nil, 3)
 
 	if got := atomic.LoadInt32(&attempts); got != 3 {
 		t.Errorf("attempts: got %d, want 3 (2 failures then success)", got)
@@ -194,7 +197,7 @@ func TestDeliverWithRetryDoesNotRetryOn4xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	deliverWithRetry(target, srv.URL, []byte(`{}`), 3)
+	deliverWithRetry(target, srv.URL, []byte(`{}`), nil, 3)
 
 	if got := atomic.LoadInt32(&attempts); got != 1 {
 		t.Errorf("attempts: got %d, want 1 (4xx must not be retried)", got)
@@ -222,7 +225,7 @@ func TestDeliverWithRetryRetriesOn429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	deliverWithRetry(target, srv.URL, []byte(`{}`), 3)
+	deliverWithRetry(target, srv.URL, []byte(`{}`), nil, 3)
 
 	if got := atomic.LoadInt32(&attempts); got != 2 {
 		t.Errorf("attempts: got %d, want 2 (429 must be retried)", got)
@@ -246,7 +249,7 @@ func TestDeliverWithRetryGivesUpAfterRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	deliverWithRetry(target, srv.URL, []byte(`{}`), 2)
+	deliverWithRetry(target, srv.URL, []byte(`{}`), nil, 2)
 
 	// 1 initial + 2 retries
 	if got := atomic.LoadInt32(&attempts); got != 3 {
@@ -290,5 +293,69 @@ func TestNotifyAlertDeliversToBothTargets(t *testing.T) {
 	}
 	if amPath != "/api/v2/alerts" {
 		t.Errorf("alertmanager path: got %q, want /api/v2/alerts", amPath)
+	}
+}
+
+// #127: an on-call system needs a token, and before this the only way to pass
+// one was to put it in the URL — where it then lands in config, logs and errors.
+func TestNotifyAlertSendsAuthHeaders(t *testing.T) {
+	got := make(chan http.Header, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Clone()
+	}))
+	defer srv.Close()
+
+	withAlertConfig(t, &config.GatewayConfig{
+		AlertWebhookURL:     srv.URL,
+		AlertWebhookHeaders: map[string]string{"Authorization": "Bearer SECRET-TOKEN", "X-Routing-Key": "oncall"},
+	})
+	notifyAlert(alertEvent{AgentID: "web-1", Dimension: "cpu", Status: "firing", Timestamp: time.Now()})
+
+	select {
+	case h := <-got:
+		if h.Get("Authorization") != "Bearer SECRET-TOKEN" {
+			t.Errorf("Authorization = %q, want Bearer SECRET-TOKEN", h.Get("Authorization"))
+		}
+		if h.Get("X-Routing-Key") != "oncall" {
+			t.Errorf("X-Routing-Key = %q, want oncall", h.Get("X-Routing-Key"))
+		}
+		if h.Get("Content-Type") != "application/json" {
+			t.Errorf("Content-Type clobbered: %q", h.Get("Content-Type"))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received the alert")
+	}
+}
+
+// A credential in the URL must never reach the log. Existing configs still
+// carry them, since URL-smuggling was the only auth option before #127.
+func TestRedactURLStripsCredentials(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"https://user:pass@hooks.example.com/x", "https://hooks.example.com/x"},
+		{"https://hooks.example.com/x?token=SECRET", "https://hooks.example.com/x"},
+		{"https://hooks.example.com/x", "https://hooks.example.com/x"},
+	}
+	for _, tc := range tests {
+		if got := redactURL(tc.in); got != tc.want {
+			t.Errorf("redactURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if got := redactURL("https://u:p@h/x?token=SECRET"); strings.Contains(got, "SECRET") || strings.Contains(got, "p@") {
+		t.Errorf("credential survived redaction: %q", got)
+	}
+}
+
+// Go's *url.Error stringifies with the full URL, so the raw error must never be
+// logged verbatim.
+func TestRedactDeliveryErrorHidesURLCredentials(t *testing.T) {
+	raw := "https://hooks.example.com/x?token=SUPERSECRET"
+	err := &url.Error{Op: "Post", URL: raw, Err: errors.New("connection refused")}
+	msg := redactDeliveryError(err, raw)
+
+	if strings.Contains(msg, "SUPERSECRET") {
+		t.Errorf("token leaked into the log line: %s", msg)
+	}
+	if !strings.Contains(msg, "connection refused") {
+		t.Errorf("redaction destroyed the useful part of the error: %s", msg)
 	}
 }

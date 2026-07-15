@@ -13,15 +13,17 @@ import (
 // secretFields are GatewayConfig fields whose value is (or contains) secret
 // material and MUST NOT be returned by GET /api/config.
 var secretFields = map[string]bool{
-	"AuthToken":          true,
-	"AntigravityToken":   true,
-	"LLMAPIKey":          true,
-	"TrustedProxySecret": true,
-	"ClusterSecret":      true,
-	"Tokens":             true, // the map KEYS are the tokens
-	"ScopedTokens":       true, // .Token within each entry
-	"OTLPHeaders":        true, // values commonly carry an auth token
-	"TLSKeyPath":         true, // points at private key material
+	"AuthToken":           true,
+	"AntigravityToken":    true,
+	"LLMAPIKey":           true,
+	"TrustedProxySecret":  true,
+	"ClusterSecret":       true,
+	"Tokens":              true, // the map KEYS are the tokens
+	"ScopedTokens":        true, // .Token within each entry
+	"OTLPHeaders":         true, // values commonly carry an auth token
+	"AlertWebhookHeaders": true, // values carry the on-call system's token
+	"AlertmanagerHeaders": true, // ditto, for an authenticating proxy
+	"TLSKeyPath":          true, // points at private key material
 }
 
 // nonSecretFields are GatewayConfig fields that are safe to return. Listed
