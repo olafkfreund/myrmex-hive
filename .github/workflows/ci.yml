@@ -46,6 +46,15 @@ jobs:
           echo "server.json declares: $SCHEMA"
           curl -sfI "$SCHEMA" >/dev/null || { echo "::error::\$schema URL is unreachable: $SCHEMA"; exit 1; }
           check-jsonschema --schemafile "$SCHEMA" server.json
+          # Schema-valid is NOT publishable. The registry's server-side
+          # validator enforces rules the JSON Schema does not: it rejected our
+          # first publish with "OCI packages must not have 'version' field —
+          # include version in 'identifier' instead", on a document that passed
+          # the schema cleanly. Catch that class here rather than at publish.
+          if jq -e '.packages[]? | select(.registryType == "oci") | has("version")' server.json >/dev/null; then
+            echo "::error::An OCI package has a 'version' field. The registry rejects this — the tag in 'identifier' IS the version."
+            exit 1
+          fi
 
       # The portal's JS used to live in a Go string literal, where nothing
       # checked it: `escapeHtml` shipped clean when the helper is `htmlEscape`
