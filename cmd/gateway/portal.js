@@ -673,6 +673,97 @@
             return '<div class="mini-metrics">' + parts.join('') + '</div>';
         }
 
+        // --- Agent detail (#109) -----------------------------------------
+        //
+        // Shows what nothing else surfaces: metric history. Tool calls and
+        // read_logs are LINKS to the Audit and Playground tabs, which already
+        // do both — rebuilding an audit table and a tool caller in here would
+        // be two more things to keep in step.
+        function closeAgentDetail() {
+            document.getElementById('agent-detail').hidden = true;
+        }
+
+        // The gateway stores get_metrics output verbatim, so pull the three
+        // fields the alerting path already parses (alertMetrics).
+        function metricCell(raw, key) {
+            try {
+                const m = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                const v = m && m[key];
+                return typeof v === 'number' ? v.toFixed(1) : '-';
+            } catch (e) {
+                return '-';
+            }
+        }
+
+        async function openAgentDetail(agentId) {
+            const panel = document.getElementById('agent-detail');
+            const tbody = document.getElementById('agent-detail-history');
+            panel.hidden = false;
+            document.getElementById('agent-detail-title').textContent = agentId;
+
+            // Deep-links to the tabs that already do these jobs.
+            document.getElementById('agent-detail-audit').onclick = function () {
+                document.getElementById('audit-f-agent').value = agentId;
+                switchTab('audit');
+            };
+            document.getElementById('agent-detail-logs').onclick = function () {
+                switchTab('playground');
+                const sel = document.getElementById('tool-select');
+                if (sel) {
+                    const opt = Array.from(sel.options).find(function (o) {
+                        return o.value === agentId + '__read_logs';
+                    });
+                    if (opt) {
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change'));
+                    }
+                }
+            };
+
+            try {
+                const res = await authFetch('/api/fleet?agent=' + encodeURIComponent(agentId));
+                if (res.status === 403) {
+                    document.getElementById('agent-detail-info').innerHTML =
+                        '<div class="alert alert-danger">Your token is not scoped to this agent.</div>';
+                    tbody.innerHTML = '<tr class="empty-row"><td colspan="4">-</td></tr>';
+                    return;
+                }
+                if (!res.ok) throw new Error(await res.text());
+                const all = await res.json();
+                const a = (all || []).find(function (x) { return x.id === agentId; });
+                if (!a) {
+                    document.getElementById('agent-detail-info').innerHTML =
+                        '<div class="alert alert-danger">Agent not connected.</div>';
+                    return;
+                }
+
+                document.getElementById('agent-detail-info').innerHTML =
+                    '<div><strong>OS:</strong> ' + htmlEscape(a.os || '-') + '</div>' +
+                    '<div><strong>IP:</strong> ' + htmlEscape(a.ip || '-') + '</div>' +
+                    '<div><strong>Last seen:</strong> ' + htmlEscape(a.last_seen || '-') + '</div>' +
+                    '<div><strong>Services:</strong> ' + htmlEscape(String((a.services || []).length)) + '</div>' +
+                    '<div><strong>Open ports:</strong> ' + htmlEscape((a.ports || []).join(', ') || '-') + '</div>';
+
+                const history = a.history || [];
+                if (history.length === 0) {
+                    tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No metric history. Set <code>metrics_poll_seconds</code> to collect it.</td></tr>';
+                    return;
+                }
+                // Newest first.
+                tbody.innerHTML = history.slice().reverse().map(function (s) {
+                    return '<tr>' +
+                        '<td>' + htmlEscape(s.timestamp || '') + '</td>' +
+                        '<td>' + metricCell(s.raw, 'cpu_usage_percent') + '</td>' +
+                        '<td>' + metricCell(s.raw, 'mem_used_percent') + '</td>' +
+                        '<td>' + metricCell(s.raw, 'disk_used_percent') + '</td>' +
+                        '</tr>';
+                }).join('');
+            } catch (e) {
+                document.getElementById('agent-detail-info').innerHTML =
+                    '<div class="alert alert-danger">Failed to load agent: ' + htmlEscape(e.message) + '</div>';
+            }
+        }
+
         function renderFleet(agents) {
             const tbody = document.getElementById('fleet-tbody');
             const countEl = document.getElementById('fleet-count');
@@ -691,7 +782,7 @@
                     : '<span class="mini-na">-</span>';
                 const lastSeen = a.last_seen ? htmlEscape(a.last_seen) : '<span class="mini-na">-</span>';
                 return '<tr>' +
-                    '<td><span class="item-name">' + htmlEscape(a.id) + '</span><div class="item-meta">' + htmlEscape(a.ip || '') + '</div></td>' +
+                    '<td><button class="link-btn" onclick="openAgentDetail(' + JSON.stringify(a.id) + ')">' + htmlEscape(a.id) + '</button><div class="item-meta">' + htmlEscape(a.ip || '') + '</div></td>' +
                     '<td><span class="item-name"><span class="status-dot ' + dotClass + '"></span>' + statusLabel + '</span></td>' +
                     '<td>' + (a.os ? htmlEscape(a.os) : '<span class="mini-na">-</span>') + '</td>' +
                     '<td>' + tags + '</td>' +

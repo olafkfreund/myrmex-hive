@@ -153,35 +153,41 @@ var rolePermissions = map[string]map[string]bool{
 // or the default AuthToken. Gateway-native tools (agentID == "gateway") skip
 // the agent/tag check since they are not agent-scoped, but are still subject
 // to the Tools allowlist when one is configured.
+// authorizeAgentAccess is the agent/tag half of authorizeToolCall, split out so
+// a read-only inspection can reuse it without also tripping the Tools
+// allowlist (a tool="" read would fail any scope.Tools check). Dispatching a
+// tool call wants authorizeToolCall; exposing an agent's data wants this. One
+// implementation either way — a second copy of scope logic is how authz drifts.
+func authorizeAgentAccess(scope *config.TokenScope, agentTags map[string][]string, agentID string) error {
+	if scope == nil {
+		return nil
+	}
+	if agentID == "gateway" || (len(scope.Agents) == 0 && len(scope.Tags) == 0) {
+		return nil
+	}
+
+	for _, a := range scope.Agents {
+		if a == agentID {
+			return nil
+		}
+	}
+	for _, tag := range agentTags[agentID] {
+		for _, t := range scope.Tags {
+			if tag == t {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("token not authorized for agent %q", agentID)
+}
+
 func authorizeToolCall(scope *config.TokenScope, agentTags map[string][]string, agentID, tool string) error {
 	if scope == nil {
 		return nil
 	}
 
-	if agentID != "gateway" && (len(scope.Agents) > 0 || len(scope.Tags) > 0) {
-		allowed := false
-		for _, a := range scope.Agents {
-			if a == agentID {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			for _, tag := range agentTags[agentID] {
-				for _, t := range scope.Tags {
-					if tag == t {
-						allowed = true
-						break
-					}
-				}
-				if allowed {
-					break
-				}
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("token not authorized for agent %q", agentID)
-		}
+	if err := authorizeAgentAccess(scope, agentTags, agentID); err != nil {
+		return err
 	}
 
 	if len(scope.Tools) > 0 {
@@ -3875,6 +3881,11 @@ type FleetAgentInfo struct {
 	LastSeen      string          `json:"last_seen,omitempty"`
 	LatestMetrics json.RawMessage `json:"latest_metrics"`
 	HistoryLen    int             `json:"history_len"`
+	// History carries the metric samples themselves, populated ONLY for a
+	// single-agent lookup (?agent=X) — the drill-down (#109). Returning it for
+	// the whole list would multiply the response by the ring-buffer size for
+	// every agent, to render one panel.
+	History []MetricSample `json:"history,omitempty"`
 	// Gateway identifies which gateway instance in the cluster this agent is
 	// connected to (#47/#56/#63): the local GatewayID for agents connected
 	// to this gateway, or a peer's base URL for agents learned via peer
@@ -3982,6 +3993,8 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 	statusFilter := r.URL.Query().Get("status")
 	tagFilter := r.URL.Query().Get("tag")
 	osFilter := r.URL.Query().Get("os")
+	// ?agent=X is the drill-down (#109): one agent, with its metric history.
+	agentFilter := r.URL.Query().Get("agent")
 
 	currentConfigMu.RLock()
 	var agentTags map[string][]string
@@ -3993,6 +4006,18 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 		gatewayID = resolveGatewayID(currentConfig)
 	}
 	currentConfigMu.RUnlock()
+
+	if agentFilter != "" {
+		// The list is names/OS and has always been visible to any authorized
+		// caller. The drill-down exposes an agent's metric history — more than
+		// a name — so it gets the same agent scoping authorizeToolCall enforces
+		// on the message path (#109 acceptance).
+		scope, _ := r.Context().Value(contextKeyScope).(*config.TokenScope)
+		if err := authorizeAgentAccess(scope, agentTags, agentFilter); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+	}
 
 	agentsMu.RLock()
 	clients := make([]*AgentClient, 0, len(agents))
@@ -4019,6 +4044,11 @@ func handleApiFleet(w http.ResponseWriter, r *http.Request) {
 		}
 		if n := len(client.metricsHistory); n > 0 {
 			info.LatestMetrics = client.metricsHistory[n-1].Raw
+		}
+		if agentFilter != "" && client.agentID == agentFilter {
+			// Copied, not aliased: metricsHistory is a ring buffer the poller
+			// mutates under client.mu.
+			info.History = append([]MetricSample(nil), client.metricsHistory...)
 		}
 		client.mu.Unlock()
 		live = append(live, info)
@@ -5039,6 +5069,18 @@ const portalHead = `<!DOCTYPE html>
 
         /* Pending-approval count on the tab (#112). [hidden] does the hiding —
            the attribute is the native way, no display juggling in JS. */
+        /* A real <button> so it is keyboard-focusable and announced as such;
+           styled to read as a link. */
+        .link-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            font: inherit;
+            color: var(--accent);
+            cursor: pointer;
+            text-decoration: underline;
+        }
+
         .tab-badge {
             display: inline-block;
             margin-left: 8px;
@@ -5950,6 +5992,32 @@ const portalHead = `<!DOCTYPE html>
                         </thead>
                         <tbody id="fleet-tbody">
                             <tr class="empty-row"><td colspan="6">No fleet data loaded yet.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Agent detail (#109). Shows what nothing else surfaces —
+                 metric history — and LINKS to the Audit and Playground tabs
+                 for tool calls and read_logs rather than rebuilding an audit
+                 table and a tool caller in here. -->
+            <div class="mgmt-card" id="agent-detail" hidden style="margin-top: 16px;">
+                <div class="item-header">
+                    <span class="item-title" id="agent-detail-title">Agent</span>
+                    <button class="btn" onclick="closeAgentDetail()">Close</button>
+                </div>
+                <div id="agent-detail-info" class="mgmt-toolbar" style="display:block;"></div>
+                <div class="mgmt-toolbar">
+                    <button class="btn" id="agent-detail-audit">Recent tool calls</button>
+                    <button class="btn" id="agent-detail-logs">Read logs</button>
+                </div>
+                <div class="table-wrap">
+                    <table class="data-table">
+                        <thead>
+                            <tr><th>Time</th><th>CPU %</th><th>Memory %</th><th>Disk %</th></tr>
+                        </thead>
+                        <tbody id="agent-detail-history">
+                            <tr class="empty-row"><td colspan="4">No metric history. Set <code>metrics_poll_seconds</code> to collect it.</td></tr>
                         </tbody>
                     </table>
                 </div>
