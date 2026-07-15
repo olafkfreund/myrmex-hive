@@ -1,0 +1,21 @@
+region    = "eu-west-1"
+vpc_id    = "vpc-0123456789abcdef0"
+subnet_id = "subnet-0123456789abcdef0"
+
+# Agents dial OUT to :2222. Scope to where they live.
+agent_cidrs = ["10.0.0.0/8"]
+
+# Operator control plane — VPN/bastion only. 0.0.0.0/0 is rejected.
+operator_cidrs = ["203.0.113.10/32"]
+
+# agent_id => public key. Generate with:
+#   ssh-keygen -t ed25519 -N '' -C web-1 -f ./web-1
+# The -C comment is rewritten to the map key by the module, so it does not have
+# to match here — but keeping them aligned avoids confusion.
+agent_public_keys = {
+  "web-1" = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample1"
+  "db-1"  = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample2"
+}
+
+# Prefer TF_VAR_auth_token in the environment over committing this.
+auth_token = "change-me"

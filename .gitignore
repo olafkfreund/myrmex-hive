@@ -4,3 +4,10 @@ test_env/
 
 # runtime artifact
 audit.log
+
+# Terraform: provider plugins, state, and local var files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars

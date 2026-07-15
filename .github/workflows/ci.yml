@@ -47,6 +47,27 @@ jobs:
           curl -sfI "$SCHEMA" >/dev/null || { echo "::error::\$schema URL is unreachable: $SCHEMA"; exit 1; }
           check-jsonschema --schemafile "$SCHEMA" server.json
 
+      # Terraform is only exercised on a real `apply`, which CI will never do —
+      # so validate is the only thing standing between a broken reference and an
+      # operator's first deploy (#105). Runs for the module and the example root
+      # config; -backend=false keeps init offline and credential-free.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          # The wrapper mangles exit codes for later steps; we only need the CLI.
+          terraform_wrapper: false
+
+      - name: Validate Terraform
+        run: |
+          terraform fmt -check -recursive terraform/
+          for dir in terraform/modules/aws-gateway terraform/examples/aws; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
       # Backstage renders docs/ via MkDocs (#106). --strict fails on a broken
       # internal link or a dangling nav entry, so docs rot is caught here rather
       # than discovered as a blank Docs tab in the portal.
