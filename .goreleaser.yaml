@@ -92,9 +92,12 @@ checksum:
 # expired PAT a year from now would otherwise kill an unrelated release.
 # `.Env.X` errors on a missing var, hence envOrDefault/isEnvSet.
 #
-# Consequence: with no secret set, `brew` silently stays on the previous
-# version. GoReleaser logs the skip; check the release log if a new version
-# doesn't show up in the tap.
+# Consequence: with no token set, `brew` stays on the previous version. That
+# skip is SILENT in a passing release — it hid a real bug for three releases
+# (v1.0.2/v1.0.3/v1.1.0): the secret existed but release.yml never mapped it
+# into the step's env, so isEnvSet was false and the cask never published.
+# If a release does not update the tap, check the env block in release.yml
+# before assuming the secret is missing.
 homebrew_casks:
   - name: myrmex-hive
     repository:
