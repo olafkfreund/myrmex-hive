@@ -47,6 +47,18 @@ jobs:
           curl -sfI "$SCHEMA" >/dev/null || { echo "::error::\$schema URL is unreachable: $SCHEMA"; exit 1; }
           check-jsonschema --schemafile "$SCHEMA" server.json
 
+      # The portal's JS used to live in a Go string literal, where nothing
+      # checked it: `escapeHtml` shipped clean when the helper is `htmlEscape`
+      # and only failed in the browser (#137). It is now cmd/gateway/portal.js,
+      # embedded — so a real linter works on it.
+      #
+      # no-undef only: that is the bug that actually happened. eslint@8 pinned
+      # because 9 requires a config FILE; inline flags keep this to one line.
+      - name: Check portal JS
+        run: |
+          npx --yes eslint@8 --no-eslintrc --env browser,es2022 \
+            --rule '{"no-undef":"error"}' cmd/gateway/portal.js
+
       # Terraform is only exercised on a real `apply`, which CI will never do —
       # so validate is the only thing standing between a broken reference and an
       # operator's first deploy (#105). Runs for the module and the example root
