@@ -224,6 +224,15 @@
 
                 // Update counts
                 document.getElementById('count-agents').innerText = data.agents ? data.agents.length : 0;
+
+                // Pending approvals badge (#112). fetchStatus already polls
+                // every 5s from whichever tab you are on, so this is also the
+                // "cleared in real time" half — no extra timer or endpoint.
+                const badge = document.getElementById('approvals-badge');
+                const pending = data.pending_approvals || 0;
+                badge.textContent = pending;
+                badge.hidden = pending === 0;
+                badge.setAttribute('aria-label', pending + ' pending approval' + (pending === 1 ? '' : 's'));
                 document.getElementById('count-upstreams').innerText = data.upstreams ? data.upstreams.length : 0;
 
                 // Update Edge Agents List
