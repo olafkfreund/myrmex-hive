@@ -45,6 +45,12 @@ var nonSecretFields = map[string]bool{
 	"PeerInsecureSkipVerify": true, "TracingEnabled": true,
 	"OTLPEndpoint": true, "OTLPInsecure": true, "TraceSampleRatio": true,
 	"TraceServiceName": true, "MetricsEnabled": true,
+	// OIDC (#114): none of these are secrets. The gateway VALIDATES tokens
+	// against a public JWKS; it never obtains them, so there is no client
+	// secret. Issuer/audience are public (the audience is in every JWT), the
+	// claim name is a field name, and the role map is group->role with no
+	// credentials in it.
+	"OIDCIssuer": true, "OIDCAudience": true, "OIDCRoleClaim": true, "OIDCRoleMap": true,
 }
 
 // This is the guard for #131. Redaction was a hand-maintained list of four

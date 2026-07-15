@@ -3117,6 +3117,7 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 		trustedProxySecretHeader := currentConfig.TrustedProxySecretHeader
 		trustedProxySecret := currentConfig.TrustedProxySecret
 		trustedProxyRole := currentConfig.TrustedProxyRole
+		oidcCfg := currentConfig
 		currentConfigMu.RUnlock()
 
 		// Get the bearer token. The ?token= query param is only honored for the
@@ -3167,6 +3168,38 @@ func requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 					role = "operator"
 				}
 				reqToken = identity // carried into context below for the audit trail
+			}
+		}
+
+		// Native OIDC (#114). After mTLS/trusted-proxy, before the static
+		// tokens: a JWT arrives as a bearer, so it has to be resolved before
+		// the static lookup simply fails to find it.
+		//
+		// Fail-closed asymmetry that matters: a token that is NOT a JWT (or
+		// OIDC off) returns ("", nil) and falls through to the static path —
+		// that is the backward-compatibility guarantee. A token that IS a JWT
+		// but fails validation returns an error and is denied outright; it must
+		// never fall through, or a forged/expired JWT would get a second chance
+		// at being a static token.
+		if role == "" && reqToken != "" {
+			oidcRole, subject, err := authenticateOIDC(r.Context(), oidcCfg, reqToken)
+			if err != nil {
+				log.Printf("[AUTH] OIDC rejected a token for %s: %v", path, err)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if oidcRole != "" {
+				role = oidcRole
+				// Carry the subject rather than the raw JWT, matching what the
+				// mTLS (CN) and trusted-proxy (identity) paths already do.
+				//
+				// NOTE: logAuditEvent then runs anonymizeToken over this, so
+				// the audit entry reads "alic....com" rather than
+				// alice@example.com. That is a redactor for SECRETS being
+				// applied to an IDENTITY, and it collides (alice@ and alicia@
+				// both render "alic....com"). Pre-existing for mTLS/proxy;
+				// tracked in #143 rather than widened here.
+				reqToken = subject
 			}
 		}
 

@@ -166,6 +166,8 @@ Configures the receiver, TLS certs, OIDC/Tokens RBAC role mapping (`admin`, `ope
 ```
 *Note: If `audit_log_path` is set, Myrmex Gateway records all `/api/call` and `/api/chat` executions alongside a cryptographic signature generated using the Gateway's private SSH host key.*
 
+*Note: `oidc_issuer` enables native OIDC/JWKS validation of real SSO tokens (opt-in; static tokens keep working alongside). See [docs/SECRETS.md](docs/SECRETS.md).*
+
 *Note: `metrics_enabled` exposes a Prometheus endpoint at `/metrics` (opt-in; behind the same bearer-token auth as the rest of the API). Myrmex Gateway can also route threshold alerts to a webhook/Alertmanager and export OpenTelemetry traces over OTLP — all opt-in. See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the metric reference, a `scrape_config`, the Grafana dashboard, alert routing and tracing.*
 
 ### Fail-closed defaults
