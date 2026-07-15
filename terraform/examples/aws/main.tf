@@ -25,7 +25,7 @@ module "gateway" {
   source = "../../modules/aws-gateway"
 
   name            = "myrmex-gateway"
-  gateway_version = "1.0.3"
+  gateway_version = "1.1.0"
 
   vpc_id    = var.vpc_id
   subnet_id = var.subnet_id
