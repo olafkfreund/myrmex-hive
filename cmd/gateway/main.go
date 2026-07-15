@@ -3831,9 +3831,23 @@ func handleApiStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamClientsMu.RUnlock()
 
+	// Pending-approval count (#112). Additive, and carried here rather than on
+	// a new endpoint because the portal already polls /api/status every 5s from
+	// whichever tab you are on — which is exactly the "operators may miss
+	// pending approvals" problem. No new endpoint, timer or poll.
+	approvalsMu.Lock()
+	pendingApprovals := 0
+	for _, a := range approvals {
+		if a.Status == "pending" {
+			pendingApprovals++
+		}
+	}
+	approvalsMu.Unlock()
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"agents":    agentList,
-		"upstreams": upstreams,
+		"agents":            agentList,
+		"upstreams":         upstreams,
+		"pending_approvals": pendingApprovals,
 	})
 }
 
@@ -5023,6 +5037,20 @@ const portalHead = `<!DOCTYPE html>
             border-bottom: 1px solid var(--border-color);
         }
 
+        /* Pending-approval count on the tab (#112). [hidden] does the hiding —
+           the attribute is the native way, no display juggling in JS. */
+        .tab-badge {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 1px 7px;
+            border-radius: 10px;
+            background-color: var(--warning);
+            color: var(--bg-primary);
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .tab-badge[hidden] { display: none; }
+
         .tab-btn {
             background: transparent;
             border: none;
@@ -5831,7 +5859,7 @@ const portalHead = `<!DOCTYPE html>
     <nav class="nav-tabs" aria-label="Portal sections">
         <button class="tab-btn active" aria-current="true" onclick="switchTab('dashboard')">Dashboard</button>
         <button class="tab-btn" onclick="switchTab('fleet')">Fleet</button>
-        <button class="tab-btn" onclick="switchTab('approvals')">Approvals</button>
+        <button class="tab-btn" onclick="switchTab('approvals')">Approvals<span class="tab-badge" id="approvals-badge" hidden></span></button>
         <button class="tab-btn" onclick="switchTab('audit')">Audit</button>
         <button class="tab-btn" onclick="switchTab('playground')">Playground</button>
         <button class="tab-btn" onclick="switchTab('keys')">SSH Authorized Keys</button>
