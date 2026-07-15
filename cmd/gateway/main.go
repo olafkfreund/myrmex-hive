@@ -4904,6 +4904,11 @@ const portalHead = `<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
+            /* Native controls (inputs, scrollbars, date pickers) follow this.
+               "dark" only — see #139: the CSS hardcodes ~50 dark colours
+               outside these variables, so there is no light theme to promise. */
+            color-scheme: dark;
+
             --bg-primary: #1d2021;
             --bg-secondary: #282828;
             --border-color: #3c3836;
@@ -4914,6 +4919,22 @@ const portalHead = `<!DOCTYPE html>
             --success: #b8bb26;
             --danger: #fb4934;
             --warning: #fabd2f;
+        }
+
+        /* Keyboard users could not see where they were: the portal had two
+           :focus rules total. :focus-visible so it shows for keyboard nav
+           without ringing every mouse click. */
+        :focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
         }
 
         * {
@@ -5807,15 +5828,15 @@ const portalHead = `<!DOCTYPE html>
         </div>
     </header>
 
-    <div class="nav-tabs">
-        <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+    <nav class="nav-tabs" aria-label="Portal sections">
+        <button class="tab-btn active" aria-current="true" onclick="switchTab('dashboard')">Dashboard</button>
         <button class="tab-btn" onclick="switchTab('fleet')">Fleet</button>
         <button class="tab-btn" onclick="switchTab('approvals')">Approvals</button>
         <button class="tab-btn" onclick="switchTab('audit')">Audit</button>
         <button class="tab-btn" onclick="switchTab('playground')">Playground</button>
         <button class="tab-btn" onclick="switchTab('keys')">SSH Authorized Keys</button>
         <button class="tab-btn" onclick="switchTab('config')">Configuration</button>
-    </div>
+    </nav>
 
     <main>
         <!-- Dashboard Tab -->

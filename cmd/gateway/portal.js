@@ -60,11 +60,21 @@
 
         function switchTab(tabId) {
             if (!checkAuth()) return;
-            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            // aria-current tracks .active so screen readers announce which
+            // section is showing. Not role="tab"/aria-selected: that pattern
+            // obliges arrow-key navigation, and a role without its behaviour is
+            // worse than no role at all.
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+                btn.removeAttribute('aria-current');
+            });
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
 
             const activeBtn = Array.from(document.querySelectorAll('.tab-btn')).find(btn => btn.innerText.toLowerCase() === tabId.toLowerCase() || (tabId === 'keys' && btn.innerText.includes('SSH')));
-            if (activeBtn) activeBtn.classList.add('active');
+            if (activeBtn) {
+                activeBtn.classList.add('active');
+                activeBtn.setAttribute('aria-current', 'true');
+            }
             
             const targetContent = document.getElementById(tabId);
             if (targetContent) targetContent.classList.add('active');
