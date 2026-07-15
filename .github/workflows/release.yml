@@ -45,6 +45,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # server.json advertises an image tag to the public MCP registry. It is
+      # hand-bumped, and v1.0.3 shipped with it still saying 1.0.2 — the same
+      # drift that has bitten every hand-maintained list in this repo. Catch it
+      # at the tag, where it is still free to fix.
+      - name: server.json matches the tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          GOT_VERSION=$(jq -r '.version' server.json)
+          GOT_IMAGE=$(jq -r '.packages[0].identifier' server.json)
+          WANT_IMAGE="ghcr.io/olafkfreund/myrmex-gateway:${VERSION}"
+          if [ "$GOT_VERSION" != "$VERSION" ] || [ "$GOT_IMAGE" != "$WANT_IMAGE" ]; then
+            echo "::error::server.json is stale for tag ${GITHUB_REF_NAME}."
+            echo "  version:    got '${GOT_VERSION}'  want '${VERSION}'"
+            echo "  identifier: got '${GOT_IMAGE}'  want '${WANT_IMAGE}'"
+            echo "Bump server.json before tagging — see docs/MCP_REGISTRY.md."
+            exit 1
+          fi
+          echo "server.json matches ${GITHUB_REF_NAME}"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
