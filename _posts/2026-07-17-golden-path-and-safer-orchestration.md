@@ -19,7 +19,7 @@ services and run allowlisted commands, but there is **no arbitrary file write**,
 and every mutation clears six independent gates (RBAC → risk tier → approval →
 rate limit → allowlist → signed audit), each failing closed.
 
-The new [Golden Path guide](https://github.com/olafkfreund/myrmex-hive/blob/main/docs/GOLDEN_PATH.md)
+The new [Golden Path guide]({{ '/golden-path/' | relative_url }})
 lays this out as a capability model and a staged rollout: enroll an agent, get
 value from read-only tools first, grant one controlled mutation behind approval,
 then let the LLM drive remediation. Capability is something you grant on purpose,
@@ -81,5 +81,5 @@ between shifts:
   that makes the assistant "dumber" gets caught automatically.
 
 All of it is opt-in and backward-compatible: an existing config keeps behaving
-exactly as before. See the [Golden Path guide](https://github.com/olafkfreund/myrmex-hive/blob/main/docs/GOLDEN_PATH.md)
+exactly as before. See the [Golden Path guide]({{ '/golden-path/' | relative_url }})
 to put it together.
