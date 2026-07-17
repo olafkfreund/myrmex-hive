@@ -66,6 +66,35 @@ jobs:
           fi
           echo "server.json matches ${GITHUB_REF_NAME}"
 
+      # Validate the tap token BEFORE goreleaser and degrade gracefully: a
+      # present-but-invalid token (e.g. a placeholder or expired PAT) makes
+      # goreleaser's cask push 401 and fail the WHOLE release — which is what
+      # sank v1.2.0's first attempt and skipped the Helm publish below. Here we
+      # probe the tap repo; only a token that actually authenticates (HTTP 200)
+      # is exported. An empty/invalid one leaves HOMEBREW_TAP_TOKEN unset for
+      # goreleaser, so `isEnvSet` is false, the cask is skipped, and the rest of
+      # the release still ships. Registered secrets are masked in the log.
+      - name: Validate Homebrew tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          valid=""
+          if [ -n "$TAP_TOKEN" ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $TAP_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/olafkfreund/homebrew-myrmex)
+            if [ "$code" = "200" ]; then
+              valid="$TAP_TOKEN"
+              echo "Homebrew tap token authenticates — the cask will publish."
+            else
+              echo "::warning::HOMEBREW_TAP_TOKEN did not authenticate (HTTP ${code}). Skipping the Homebrew cask; the rest of the release still ships. Set a valid PAT to publish the cask."
+            fi
+          else
+            echo "No HOMEBREW_TAP_TOKEN configured — skipping the Homebrew cask."
+          fi
+          echo "HOMEBREW_TAP_TOKEN=${valid}" >> "$GITHUB_ENV"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -74,13 +103,11 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # A GitHub secret is NOT an env var until it is mapped here. Without
-          # this line goreleaser's `isEnvSet "HOMEBREW_TAP_TOKEN"` is false, the
-          # cask silently skips, and the release still passes — which is exactly
-          # what happened for v1.0.2, v1.0.3 and v1.1.0. The skip was blamed on
-          # the secret not existing; in fact the secret was never wired through,
-          # so the cask could not have published even once it was set.
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # HOMEBREW_TAP_TOKEN is set by the "Validate Homebrew tap token" step
+          # above — to the real token only when it authenticates, empty
+          # otherwise. goreleaser's `isEnvSet "HOMEBREW_TAP_TOKEN"` (non-empty)
+          # then decides whether the cask publishes, so a bad token degrades to
+          # a skip instead of failing the release.
 
       # Chart version AND appVersion both track the git tag, so the chart's
       # image-tag fallback (.Chart.AppVersion) pins the images published above.
