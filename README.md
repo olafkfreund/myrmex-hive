@@ -282,9 +282,10 @@ The Go-based Myrmex CLI allows operators to interact with the gateway, view agen
   ```bash
   myrmex ask --plan "Restart nginx on agent-nginx if it looks wedged"
   ```
-* **Fleet-wide orchestration**: Run the same orchestration across many agents and aggregate the per-agent summaries. Exposed on the Gateway-native `ask_gemma` tool via `agent_ids` / `all_agents`:
+* **Fleet-wide orchestration**: Run the same orchestration across many agents and aggregate the per-agent summaries. Use `--all` for every connected agent or `--agents` for a subset (combine with `--plan` to preview fleet-wide):
   ```bash
-  myrmex call gateway__ask_gemma --arguments '{"prompt":"Report disk usage","all_agents":true}'
+  myrmex ask --all "Report disk usage and flag anything over 85%"
+  myrmex ask --agents agent-1,agent-2 "How busy are these two?"
   ```
 
 ---

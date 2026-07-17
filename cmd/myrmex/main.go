@@ -30,6 +30,12 @@ type Config struct {
 	// Plan requests dry-run mode for "ask": tool calls the assistant chooses
 	// are reported but never executed. Only meaningful for handleAsk.
 	Plan bool
+	// AllAgents / AgentIDs opt "ask" into fleet-wide orchestration: the prompt
+	// runs against every connected agent (AllAgents) or a comma-separated
+	// subset (AgentIDs), routed through the Gateway's server-side fleet
+	// orchestration. Only meaningful for handleAsk.
+	AllAgents bool
+	AgentIDs  string
 }
 
 // Build information, injected at build time via -ldflags.
@@ -55,64 +61,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Parse custom flags manually for flexibility
-	cfg := Config{
-		URL:      "https://localhost:8080",
-		Token:    os.Getenv("MYRMEX_TOKEN"),
-		Insecure: false,
-		Output:   "text",
-	}
-
-	var cmdArgs []string
-	for i := 2; i < len(os.Args); i++ {
-		arg := os.Args[i]
-		// --plan is a pure boolean switch (no value), handled before the
-		// generic "consume the next token as this flag's value" logic below
-		// so it never swallows the prompt that follows it, e.g.
-		// `myrmex ask --plan "do the thing"`.
-		if arg == "--plan" {
-			cfg.Plan = true
-			continue
-		}
-		if strings.HasPrefix(arg, "--plan=") {
-			cfg.Plan = strings.TrimPrefix(arg, "--plan=") != "false"
-			continue
-		}
-		if strings.HasPrefix(arg, "--") || strings.HasPrefix(arg, "-") {
-			parts := strings.SplitN(arg, "=", 2)
-			var key, val string
-			if len(parts) == 2 {
-				key = parts[0]
-				val = parts[1]
-			} else {
-				key = arg
-				if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "-") {
-					val = os.Args[i+1]
-					i++
-				}
-			}
-
-			trimmedKey := strings.TrimLeft(key, "-")
-			switch trimmedKey {
-			case "url":
-				cfg.URL = val
-			case "token":
-				cfg.Token = val
-			case "insecure":
-				cfg.Insecure = (val != "false")
-			case "output", "o":
-				cfg.Output = val
-			default:
-				// Pass command-specific flags and values to cmdArgs
-				cmdArgs = append(cmdArgs, key)
-				if val != "" {
-					cmdArgs = append(cmdArgs, val)
-				}
-			}
-		} else {
-			cmdArgs = append(cmdArgs, arg)
-		}
-	}
+	// Parse custom flags manually for flexibility.
+	cfg, cmdArgs := parseFlags(os.Args[2:])
 
 	// "audit verify" runs entirely against a local log file and host key, so it
 	// does not require a Gateway auth token. "enroll", "bootstrap", and
@@ -165,6 +115,86 @@ func main() {
 	}
 }
 
+// parseFlags parses global flags out of argv (the arguments that follow the
+// subcommand), returning the resolved Config and the remaining command-specific
+// args. Boolean switches (--plan/--all) are matched before the generic
+// "consume the next token as this flag's value" logic so they never swallow a
+// following positional — e.g. the prompt in `ask --plan "..."`.
+func parseFlags(argv []string) (Config, []string) {
+	cfg := Config{
+		URL:      "https://localhost:8080",
+		Token:    os.Getenv("MYRMEX_TOKEN"),
+		Insecure: false,
+		Output:   "text",
+	}
+
+	var cmdArgs []string
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--plan" {
+			cfg.Plan = true
+			continue
+		}
+		if strings.HasPrefix(arg, "--plan=") {
+			cfg.Plan = strings.TrimPrefix(arg, "--plan=") != "false"
+			continue
+		}
+		// --all is a boolean switch (fleet: all agents).
+		if arg == "--all" {
+			cfg.AllAgents = true
+			continue
+		}
+		// --agents takes a comma-separated value; consume the next token unless
+		// given as --agents=... form.
+		if arg == "--agents" {
+			if i+1 < len(argv) {
+				cfg.AgentIDs = argv[i+1]
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--agents=") {
+			cfg.AgentIDs = strings.TrimPrefix(arg, "--agents=")
+			continue
+		}
+		if strings.HasPrefix(arg, "--") || strings.HasPrefix(arg, "-") {
+			parts := strings.SplitN(arg, "=", 2)
+			var key, val string
+			if len(parts) == 2 {
+				key = parts[0]
+				val = parts[1]
+			} else {
+				key = arg
+				if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+					val = argv[i+1]
+					i++
+				}
+			}
+
+			trimmedKey := strings.TrimLeft(key, "-")
+			switch trimmedKey {
+			case "url":
+				cfg.URL = val
+			case "token":
+				cfg.Token = val
+			case "insecure":
+				cfg.Insecure = (val != "false")
+			case "output", "o":
+				cfg.Output = val
+			default:
+				// Pass command-specific flags and values to cmdArgs.
+				cmdArgs = append(cmdArgs, key)
+				if val != "" {
+					cmdArgs = append(cmdArgs, val)
+				}
+			}
+		} else {
+			cmdArgs = append(cmdArgs, arg)
+		}
+	}
+	return cfg, cmdArgs
+}
+
 func printHelp() {
 	helpText := `Myrmex Hive Command Line Interface (myrmex)
 
@@ -210,6 +240,9 @@ Real-Life Scenarios:
 
   5. Ask the AI assistant to inspect memory usage:
      myrmex ask "Check memory usage on agent-nginx and explain it" --token <token>
+     myrmex ask --plan "Restart nginx on agent-nginx if it's wedged"   (dry-run: plans, never executes)
+     myrmex ask --all "Report disk usage and flag anything over 85%"   (fleet: every connected agent)
+     myrmex ask --agents agent-1,agent-2 "How busy are these two?"      (fleet: a subset)
 
   6. Verify the integrity of the gateway's signed audit log:
      myrmex audit verify --log audit.log --host-key host_key.pub
@@ -616,6 +649,14 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 
 	prompt := args[0]
 
+	// Fleet mode (--all / --agents) reuses the Gateway's server-side fleet
+	// orchestration via the gateway__ask_gemma tool instead of the client-side
+	// loop below, so the per-agent aggregation lives in exactly one place.
+	if cfg.AllAgents || cfg.AgentIDs != "" {
+		handleFleetAsk(client, cfg, prompt)
+		return
+	}
+
 	// 1. Get the list of all tools to provide context to the model
 	toolsData, err := makeRequest(client, cfg, "GET", "/api/tools", nil)
 	if err != nil {
@@ -796,6 +837,82 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 	}
 
 	fmt.Println(renderMarkdown(finalResponse))
+}
+
+// fleetAskArguments builds the arguments object for the gateway__ask_gemma tool
+// when "ask" runs in fleet mode. AllAgents wins over AgentIDs; a comma-separated
+// AgentIDs list is split and trimmed. Plan carries the dry-run flag through.
+func fleetAskArguments(cfg Config, prompt string) map[string]interface{} {
+	args := map[string]interface{}{"prompt": prompt}
+	if cfg.AllAgents {
+		args["all_agents"] = true
+	} else if cfg.AgentIDs != "" {
+		var ids []string
+		for _, id := range strings.Split(cfg.AgentIDs, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		args["agent_ids"] = ids
+	}
+	if cfg.Plan {
+		args["plan"] = true
+	}
+	return args
+}
+
+// handleFleetAsk runs a fleet-wide "ask" by invoking the gateway__ask_gemma tool
+// over /api/call, then renders the aggregated per-agent summary the Gateway
+// returns.
+func handleFleetAsk(client *http.Client, cfg Config, prompt string) {
+	callBody, _ := json.Marshal(map[string]interface{}{
+		"name":      "gateway__ask_gemma",
+		"arguments": fleetAskArguments(cfg, prompt),
+	})
+
+	data, err := makeRequest(client, cfg, "POST", "/api/call", bytes.NewReader(callBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error calling assistant: %v\n", err)
+		os.Exit(1)
+	}
+
+	var rpcResp struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &rpcResp); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing assistant response: %v\n", err)
+		os.Exit(1)
+	}
+	if rpcResp.Error != nil {
+		fmt.Fprintf(os.Stderr, "Assistant error: %s\n", rpcResp.Error.Message)
+		os.Exit(1)
+	}
+
+	text := extractContentText(rpcResp.Result)
+	if cfg.Output == "json" {
+		outBytes, _ := json.MarshalIndent(map[string]string{"response": text}, "", "  ")
+		fmt.Println(string(outBytes))
+		return
+	}
+	fmt.Println(renderMarkdown(text))
+}
+
+// extractContentText pulls the first text content block out of an MCP tool
+// result ({"content":[{"type":"text","text":"..."}]}), falling back to the raw
+// JSON when the shape is unexpected so nothing is silently dropped.
+func extractContentText(result json.RawMessage) string {
+	var shaped struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(result, &shaped); err == nil && len(shaped.Content) > 0 {
+		return shaped.Content[0].Text
+	}
+	return string(result)
 }
 
 // handleAudit dispatches "audit" subcommands: "verify" checks integrity,

@@ -103,11 +103,11 @@ myrmex ask --plan "Restart nginx on agent-nginx if the logs show it's wedged"
 
 Happy with the plan? Drop `--plan`.
 
-<b>Stage 4 — Scale out and let it run itself.</b> One prompt across the fleet:
+<b>Stage 4 — Scale out and let it run itself.</b> One prompt across the fleet
+(`--agents a,b` for a subset, `--plan` to preview):
 
 ```bash
-myrmex call gateway__ask_gemma \
-  --arguments '{"prompt":"Report disk usage and flag anything over 85%","all_agents":true}'
+myrmex ask --all "Report disk usage and flag anything over 85%"
 ```
 
 …and unattended health checks on a timer, routed to your alerts:

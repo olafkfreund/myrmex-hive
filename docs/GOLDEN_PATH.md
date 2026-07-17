@@ -213,14 +213,13 @@ against every selected agent and aggregates the summaries — "how's the whole
 fleet doing?" in one call:
 
 ```bash
-myrmex call gateway__ask_gemma \
-  --arguments '{"prompt":"Report disk usage and flag anything over 85%","all_agents":true}' \
-  --token "$MYRMEX_TOKEN"
+myrmex ask --all "Report disk usage and flag anything over 85%" --token "$MYRMEX_TOKEN"
 ```
 
-Use `"agent_ids":["a","b"]` to target a subset. Each agent gets the exact same
-six-gate treatment; fleet mode is just the single-agent loop in a loop. Combine
-with `"plan":true` to preview a fleet-wide action before it runs.
+Use `--agents a,b` to target a subset, and add `--plan` to preview a fleet-wide
+action before it runs. Each agent gets the exact same six-gate treatment; fleet
+mode is just the single-agent loop in a loop. (Equivalent under the hood to
+calling the `gateway__ask_gemma` tool with `all_agents`/`agent_ids`.)
 
 **Unattended health checks.** `scheduled_tasks` in the Gateway config run an
 orchestration prompt on a timer and route the summary through your alert
