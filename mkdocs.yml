@@ -21,6 +21,7 @@ exclude_docs: |
 
 nav:
   - Overview: index.md
+  - Golden Path: GOLDEN_PATH.md
   - Deployment: DEPLOYMENT.md
   - Observability: OBSERVABILITY.md
   - Secrets: SECRETS.md
