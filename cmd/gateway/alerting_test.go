@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -94,6 +95,45 @@ func TestNotifyAlertWebhookPayload(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("webhook never received the alert")
+	}
+}
+
+// A pending approval should page on-call the same way a threshold breach
+// does (#2), so a legitimate mutation doesn't silently expire because nobody
+// happened to be watching the CLI/portal.
+func TestCreatePendingApprovalNotifiesAlert(t *testing.T) {
+	ch := make(chan alertEvent, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ev alertEvent
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &ev)
+		ch <- ev
+	}))
+	defer srv.Close()
+
+	withAlertConfig(t, &config.GatewayConfig{AlertWebhookURL: srv.URL})
+
+	ctx := context.WithValue(context.Background(), contextKeyRole, "admin")
+	approval, err := createPendingApproval(ctx, "edge-1", "run_command", `{"name":"rm"}`, "destructive")
+	if err != nil {
+		t.Fatalf("createPendingApproval failed: %v", err)
+	}
+
+	select {
+	case ev := <-ch:
+		if ev.AgentID != "edge-1" {
+			t.Errorf("agent_id: got %q, want edge-1", ev.AgentID)
+		}
+		for _, want := range []string{approval.ID, "run_command", "destructive"} {
+			if !strings.Contains(ev.Dimension, want) {
+				t.Errorf("dimension %q missing %q", ev.Dimension, want)
+			}
+		}
+		if ev.Status != "firing" {
+			t.Errorf("status: got %q, want firing", ev.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("approval creation never triggered a notifyAlert delivery")
 	}
 }
 

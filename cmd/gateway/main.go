@@ -2912,6 +2912,19 @@ func createPendingApproval(ctx context.Context, agentID, tool, args, tier string
 	approvals[id] = approval
 	approvalsMu.Unlock()
 
+	// Page on-call the same way a threshold breach does (#100/#2): otherwise a
+	// pending approval only surfaces in the CLI/portal, and a legitimate
+	// mutation silently expires after approvalTTL if nobody happens to look.
+	// notifyAlert no-ops when no webhook/Alertmanager target is configured, so
+	// this is opt-in and doesn't change approval semantics or the TTL.
+	notifyAlert(alertEvent{
+		AgentID: agentID,
+		Dimension: fmt.Sprintf("approval id=%s tool=%s tier=%s requester=%s ttl=%s",
+			id, tool, tier, approval.TokenID, approvalTTL),
+		Status:    "firing",
+		Timestamp: time.Now(),
+	})
+
 	return approval, nil
 }
 
