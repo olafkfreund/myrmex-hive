@@ -464,7 +464,12 @@ func (c *AgentClient) cleanup(err error) {
 		}
 		delete(c.pending, id)
 	}
-	removeAgent(c.agentID)
+	// Identity-scoped removal: only drop the registry entry if it still points
+	// at THIS client. A dropped connection's readLoop can run after the same
+	// agent-id has already reconnected (HA failover, flaky link); an
+	// unconditional delete here would evict the live replacement. This also
+	// makes the fake-agent tests hermetic under -count>1.
+	removeAgentClient(c)
 }
 
 func (c *AgentClient) Call(req JsonRpcRequest) JsonRpcResponse {
@@ -866,6 +871,18 @@ func removeAgent(agentID string) {
 	defer agentsMu.Unlock()
 	delete(agents, agentID)
 	log.Printf("Agent removed: %s", agentID)
+}
+
+// removeAgentClient drops agentID from the registry only if the currently
+// stored client is c. Used by a connection's own readLoop on teardown so a
+// stale connection cannot evict a newer reconnection under the same agent-id.
+func removeAgentClient(c *AgentClient) {
+	agentsMu.Lock()
+	defer agentsMu.Unlock()
+	if agents[c.agentID] == c {
+		delete(agents, c.agentID)
+		log.Printf("Agent removed: %s", c.agentID)
+	}
 }
 
 func getAgent(agentID string) *AgentClient {
