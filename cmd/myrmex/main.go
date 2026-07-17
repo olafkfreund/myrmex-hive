@@ -27,6 +27,9 @@ type Config struct {
 	Token    string
 	Insecure bool
 	Output   string
+	// Plan requests dry-run mode for "ask": tool calls the assistant chooses
+	// are reported but never executed. Only meaningful for handleAsk.
+	Plan bool
 }
 
 // Build information, injected at build time via -ldflags.
@@ -63,6 +66,18 @@ func main() {
 	var cmdArgs []string
 	for i := 2; i < len(os.Args); i++ {
 		arg := os.Args[i]
+		// --plan is a pure boolean switch (no value), handled before the
+		// generic "consume the next token as this flag's value" logic below
+		// so it never swallows the prompt that follows it, e.g.
+		// `myrmex ask --plan "do the thing"`.
+		if arg == "--plan" {
+			cfg.Plan = true
+			continue
+		}
+		if strings.HasPrefix(arg, "--plan=") {
+			cfg.Plan = strings.TrimPrefix(arg, "--plan=") != "false"
+			continue
+		}
 		if strings.HasPrefix(arg, "--") || strings.HasPrefix(arg, "-") {
 			parts := strings.SplitN(arg, "=", 2)
 			var key, val string
@@ -178,6 +193,7 @@ Global Options:
   --token       Secure Gateway Auth Token (or MYRMEX_TOKEN env var)
   --insecure    Skip TLS verification (default: false)
   --output, -o  Output format: text, json (default: text)
+  --plan        With "ask": show what tools would be called, without executing them
 
 Real-Life Scenarios:
   1. Check the general status of all agents:
@@ -651,6 +667,7 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 	maxLoops := 5
 
 	var finalResponse string
+	var plannedCalls []string
 
 	for loopCount < maxLoops {
 		loopCount++
@@ -708,44 +725,55 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 		}
 
 		if isToolCall {
-			if cfg.Output != "json" {
-				fmt.Printf("[Myrmex Agent Action]: Executing tool %q with arguments: %s\n", toolCallObj.Call, string(toolCallObj.Arguments))
-			}
-
 			// Add to history
 			history = append(history, map[string]string{"role": "user", "text": promptToModel})
 			history = append(history, map[string]string{"role": "assistant", "text": reply})
 
-			// Execute tool call via /api/call
-			callBody, _ := json.Marshal(map[string]interface{}{
-				"name":      toolCallObj.Call,
-				"arguments": toolCallObj.Arguments,
-			})
-
-			callData, err := makeRequest(client, cfg, "POST", "/api/call", bytes.NewReader(callBody))
 			var toolResult string
-			if err != nil {
-				toolResult = fmt.Sprintf("Error calling tool: %v", err)
+			if cfg.Plan {
+				// Plan mode: the assistant is still driven through the loop
+				// so it can plan multiple steps, but nothing is dispatched
+				// to /api/call — never touches an agent.
+				if cfg.Output != "json" {
+					fmt.Printf("[Myrmex Plan]: would execute tool %q with arguments: %s\n", toolCallObj.Call, string(toolCallObj.Arguments))
+				}
+				plannedCalls = append(plannedCalls, fmt.Sprintf("%s(%s)", toolCallObj.Call, string(toolCallObj.Arguments)))
+				toolResult = "(dry-run: not executed)"
 			} else {
-				var rpcResp struct {
-					Result json.RawMessage `json:"result"`
-					Error  *struct {
-						Message string `json:"message"`
-					} `json:"error"`
+				if cfg.Output != "json" {
+					fmt.Printf("[Myrmex Agent Action]: Executing tool %q with arguments: %s\n", toolCallObj.Call, string(toolCallObj.Arguments))
 				}
-				if err := json.Unmarshal(callData, &rpcResp); err != nil {
-					toolResult = fmt.Sprintf("Error parsing tool response: %v", err)
-				} else if rpcResp.Error != nil {
-					toolResult = fmt.Sprintf("Tool error: %s", rpcResp.Error.Message)
-				} else {
-					toolResult = string(rpcResp.Result)
-				}
-			}
 
-			if cfg.Output != "json" {
-				fmt.Printf("[Myrmex Tool Result]:\n")
-				printReadableText(toolResult)
-				fmt.Println()
+				// Execute tool call via /api/call
+				callBody, _ := json.Marshal(map[string]interface{}{
+					"name":      toolCallObj.Call,
+					"arguments": toolCallObj.Arguments,
+				})
+
+				callData, err := makeRequest(client, cfg, "POST", "/api/call", bytes.NewReader(callBody))
+				if err != nil {
+					toolResult = fmt.Sprintf("Error calling tool: %v", err)
+				} else {
+					var rpcResp struct {
+						Result json.RawMessage `json:"result"`
+						Error  *struct {
+							Message string `json:"message"`
+						} `json:"error"`
+					}
+					if err := json.Unmarshal(callData, &rpcResp); err != nil {
+						toolResult = fmt.Sprintf("Error parsing tool response: %v", err)
+					} else if rpcResp.Error != nil {
+						toolResult = fmt.Sprintf("Tool error: %s", rpcResp.Error.Message)
+					} else {
+						toolResult = string(rpcResp.Result)
+					}
+				}
+
+				if cfg.Output != "json" {
+					fmt.Printf("[Myrmex Tool Result]:\n")
+					printReadableText(toolResult)
+					fmt.Println()
+				}
 			}
 
 			// Feed the result back to the model in the next step of the loop
@@ -754,6 +782,11 @@ func handleAsk(client *http.Client, cfg Config, args []string) {
 			finalResponse = reply
 			break
 		}
+	}
+
+	if cfg.Plan && len(plannedCalls) > 0 {
+		finalResponse = fmt.Sprintf("PLAN (dry-run — no tools were executed):\n- %s\n\n%s",
+			strings.Join(plannedCalls, "\n- "), finalResponse)
 	}
 
 	if cfg.Output == "json" {

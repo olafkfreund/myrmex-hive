@@ -80,6 +80,10 @@ type CallToolParams struct {
 type AskGemmaArgs struct {
 	AgentID string `json:"agent_id"`
 	Prompt  string `json:"prompt"`
+	// Plan requests dry-run orchestration: the model is still consulted at
+	// each step, but the chosen tool is never executed — see
+	// executeGemmaOrchestration's plan branch.
+	Plan bool `json:"plan,omitempty"`
 }
 
 type HumanizeSyslogArgs struct {
@@ -2072,7 +2076,7 @@ func handleGatewayToolCall(ctx context.Context, name string, argsRaw json.RawMes
 		}
 
 		// Implement Gemma-orchestrated security loop
-		executeGemmaOrchestration(ctx, args.AgentID, cli, args.Prompt, reqID, send)
+		executeGemmaOrchestration(ctx, args.AgentID, cli, args.Prompt, args.Plan, reqID, send)
 
 	default:
 		sendErrorDirect(send, reqID, -32601, fmt.Sprintf("Tool not found: %s", name))
@@ -2261,7 +2265,7 @@ Summary:`, untrustedOutputHeader, untrustedOutputFooter, obsBuf.String())
 // finalizeOrchestration sends the terminal MCP response for
 // executeGemmaOrchestration, generating a summary from observations when the
 // caller didn't already have one (the model's own "done" summary).
-func finalizeOrchestration(send ResponseSender, reqID interface{}, summary string, observations []orchestrationObservation) {
+func finalizeOrchestration(send ResponseSender, reqID interface{}, summary string, observations []orchestrationObservation, plan bool) {
 	if summary == "" {
 		summary = summarizeOrchestration(observations)
 	}
@@ -2271,19 +2275,29 @@ func finalizeOrchestration(send ResponseSender, reqID interface{}, summary strin
 		fmt.Fprintf(&raw, "[Step %d] %s(%s):\n%s\n\n", o.Step, o.ToolName, o.Arguments, o.Output)
 	}
 
+	content := []map[string]interface{}{
+		{
+			"type": "text",
+			"text": summary,
+		},
+		{
+			"type": "text",
+			"text": fmt.Sprintf("\n[Raw Execution Output]\n%s", raw.String()),
+		},
+	}
+	if plan {
+		// Label the response as a plan up front so it can never be mistaken
+		// for a report of actions actually taken.
+		content = append([]map[string]interface{}{{
+			"type": "text",
+			"text": "PLAN (dry-run — no tools were executed):",
+		}}, content...)
+	}
+
 	finalResponse := JsonRpcResponse{
 		JsonRpc: "2.0",
 		Result: map[string]interface{}{
-			"content": []map[string]interface{}{
-				{
-					"type": "text",
-					"text": summary,
-				},
-				{
-					"type": "text",
-					"text": fmt.Sprintf("\n[Raw Execution Output]\n%s", raw.String()),
-				},
-			},
+			"content": content,
 		},
 		ID: reqID,
 	}
@@ -2303,7 +2317,7 @@ func finalizeOrchestration(send ResponseSender, reqID interface{}, summary strin
 // own allowlist (pkg/command.ExecuteCommand) remains the sole execution
 // safety boundary regardless — this is defense in depth, not a replacement
 // for it.
-func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentClient, userPrompt string, reqID interface{}, send ResponseSender) {
+func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentClient, userPrompt string, plan bool, reqID interface{}, send ResponseSender) {
 	// Parent span for the whole multi-step loop (#98). This is the path traces
 	// help most: without one, a slow ask_gemma is a single opaque number with
 	// no way to see which step burned the time.
@@ -2359,7 +2373,7 @@ func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentCl
 		}
 
 		if decision.Done {
-			finalizeOrchestration(send, reqID, decision.Summary, observations)
+			finalizeOrchestration(send, reqID, decision.Summary, observations, plan)
 			return
 		}
 
@@ -2373,6 +2387,21 @@ func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentCl
 				Arguments: string(decision.Arguments),
 				Output:    fmt.Sprintf("rejected: %q is not one of the tools this agent allows", decision.ToolName),
 				Failed:    true,
+			})
+			continue
+		}
+
+		if plan {
+			// Plan mode: the model is consulted and its choice is recorded,
+			// but nothing is actually dispatched to the agent. Feeding back a
+			// synthetic "not executed" observation lets the loop continue
+			// exactly as it would after a real call, so a multi-step plan is
+			// still assembled.
+			observations = append(observations, orchestrationObservation{
+				Step:      step,
+				ToolName:  decision.ToolName,
+				Arguments: string(decision.Arguments),
+				Output:    "(dry-run: not executed)",
 			})
 			continue
 		}
@@ -2411,7 +2440,7 @@ func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentCl
 
 	// Step budget exhausted without the model signaling done: summarize
 	// whatever was accomplished rather than leaving the caller with nothing.
-	finalizeOrchestration(send, reqID, "", observations)
+	finalizeOrchestration(send, reqID, "", observations, plan)
 }
 
 var writeMu sync.Mutex

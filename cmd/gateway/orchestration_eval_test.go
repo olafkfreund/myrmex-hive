@@ -140,6 +140,13 @@ func newFakeAgent(t *testing.T, respond func(JsonRpcRequest) JsonRpcResponse) *f
 // and fake agent, returning the marshaled final response the caller received.
 func runOrchestration(t *testing.T, engine llm.Engine, ch *fakeAgentChannel, maxSteps int, prompt string) string {
 	t.Helper()
+	return runOrchestrationMode(t, engine, ch, maxSteps, prompt, false)
+}
+
+// runOrchestrationMode is runOrchestration with an explicit plan flag, for
+// scenarios that need dry-run mode.
+func runOrchestrationMode(t *testing.T, engine llm.Engine, ch *fakeAgentChannel, maxSteps int, prompt string, plan bool) string {
+	t.Helper()
 
 	prevEngine := llmEngine
 	llmEngine = engine
@@ -168,7 +175,7 @@ func runOrchestration(t *testing.T, engine llm.Engine, ch *fakeAgentChannel, max
 		b, _ := json.Marshal(resp)
 		got = string(b)
 	}
-	executeGemmaOrchestration(context.Background(), "web-1", cli, prompt, "req-1", send)
+	executeGemmaOrchestration(context.Background(), "web-1", cli, prompt, plan, "req-1", send)
 	return got
 }
 
@@ -287,6 +294,32 @@ func TestOrchestrationWrapsMaliciousToolOutput(t *testing.T) {
 	// The output is still present (the model needs to see it) — just fenced.
 	if !strings.Contains(step2, evil) {
 		t.Error("tool output was dropped entirely; it should be fed back, wrapped")
+	}
+}
+
+// Plan mode: the model is consulted and picks a tool, but that tool must
+// NEVER actually be dispatched to the agent. The final response still names
+// the intended tool so the operator can see what would have happened.
+func TestOrchestrationPlanModeDoesNotExecute(t *testing.T) {
+	engine := &scriptedEngine{outputs: []string{
+		`{"tool_name":"get_metrics","arguments":{}}`,
+		`{"done":true,"summary":"would check CPU usage"}`,
+	}}
+	ch := newFakeAgent(t, agentRespond([]string{"get_metrics"}, map[string]string{"get_metrics": "cpu: 12%"}))
+
+	got := runOrchestrationMode(t, engine, ch, 3, "how busy is the box?", true)
+
+	if calls := ch.executedTools(); len(calls) != 0 {
+		t.Errorf("plan mode executed tool(s) %v, want none", calls)
+	}
+	if engine.i != 2 {
+		t.Errorf("model consulted %d times, want 2 (the model is still driven even though nothing runs)", engine.i)
+	}
+	if !strings.Contains(got, "get_metrics") {
+		t.Errorf("final response does not name the intended tool: %s", got)
+	}
+	if !strings.Contains(got, "PLAN") {
+		t.Errorf("final response is not labeled as a plan: %s", got)
 	}
 }
 
