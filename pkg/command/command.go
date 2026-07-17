@@ -30,10 +30,18 @@ func validateCommand(name string, args []string, allowedCommands []config.Allowe
 		return "", fmt.Errorf("command %q is not in the approved allowlist", name)
 	}
 
-	// 2. Validate arguments against regex
+	// 2. Validate arguments against regex.
+	//
+	// The pattern is anchored to the WHOLE joined argument string with
+	// ^(?:...)$ before compiling. regexp.MatchString matches anywhere, so an
+	// un-anchored ArgsRegex ("nginx") would substring-match and silently accept
+	// injected content ("evil nginx") — a command-injection hazard on the
+	// agent's security boundary (#151). Anchoring here means the allowlist
+	// author cannot forget to; wrapping an already-anchored pattern
+	// (^(?:^-h$)$) is harmless and still matches only "-h".
 	fullArgsStr := strings.Join(args, " ")
 	if matchedCmd.ArgsRegex != "" {
-		re, err := regexp.Compile(matchedCmd.ArgsRegex)
+		re, err := regexp.Compile("^(?:" + matchedCmd.ArgsRegex + ")$")
 		if err != nil {
 			return "", fmt.Errorf("invalid regex pattern in allowlist config for command %q: %w", name, err)
 		}

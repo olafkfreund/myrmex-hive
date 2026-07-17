@@ -182,21 +182,32 @@ func TestDryRunValidatesWithoutExecuting(t *testing.T) {
 	}
 }
 
-// HAZARD, documented by test: validateCommand uses regexp.MatchString, which
-// matches ANYWHERE in the joined argument string, not the whole string. An
-// un-anchored ArgsRegex in an allowlist therefore silently accepts extra
-// content around the intended match. The author MUST anchor with ^...$.
-//
-// This test passing is the confirmation of the hazard, not a feature. See the
-// follow-up on whether ExecuteCommand should reject un-anchored patterns.
-func TestUnanchoredRegexMatchesAsSubstring(t *testing.T) {
-	// Author intended "only the argument 'nginx'": but forgot ^...$.
+// The hazard from #151, now CLOSED: validateCommand anchors every ArgsRegex to
+// the whole joined argument string, so an un-anchored pattern no longer
+// substring-matches. An author who writes "nginx" meaning "only nginx" is
+// protected even though they forgot ^...$.
+func TestUnanchoredRegexIsAnchoredForYou(t *testing.T) {
 	list := []config.AllowedCommand{{Name: "echo", ArgsRegex: "nginx"}}
 
-	// Joined args = "these are not the args you approved nginx" — 'nginx' is
-	// found as a substring, so validation PASSES.
-	_, err := validateCommand("echo", []string{"these", "are", "not", "the", "args", "you", "approved", "nginx"}, list)
-	if err != nil {
-		t.Fatalf("un-anchored regex was expected to substring-match (hazard); got rejection: %v", err)
+	// Injected content around the intended match must NOT pass.
+	if _, err := validateCommand("echo", []string{"evil", "nginx"}, list); err == nil {
+		t.Fatal("un-anchored regex substring-matched injected args — #151 not fixed")
+	}
+
+	// The intended exact match still works.
+	if _, err := validateCommand("echo", []string{"nginx"}, list); err != nil {
+		t.Fatalf("the intended exact arg was rejected: %v", err)
+	}
+}
+
+// Anchoring must not break an author who already anchored: ^(?:^-h$)$ still
+// matches only "-h".
+func TestAlreadyAnchoredRegexStillWorks(t *testing.T) {
+	list := []config.AllowedCommand{{Name: "echo", ArgsRegex: "^-h$"}}
+	if _, err := validateCommand("echo", []string{"-h"}, list); err != nil {
+		t.Errorf("already-anchored pattern rejected its intended arg: %v", err)
+	}
+	if _, err := validateCommand("echo", []string{"-h", "extra"}, list); err == nil {
+		t.Error("already-anchored pattern accepted extra args")
 	}
 }
