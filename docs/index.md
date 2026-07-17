@@ -18,6 +18,7 @@ daemon, no management port for scanners to find.
 
 | If you want to… | Read |
 |---|---|
+| **Understand what agents can do & get value fast** | **[Golden Path](GOLDEN_PATH.md)** |
 | Deploy with Helm or containers | [Deployment](DEPLOYMENT.md) |
 | Scrape metrics, route alerts, or trace calls | [Observability](OBSERVABILITY.md) |
 | Keep tokens out of config files | [Secrets](SECRETS.md) |
