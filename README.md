@@ -107,7 +107,7 @@ Versioned container images and a Helm chart are published to GHCR on every relea
 
 ```bash
 helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
-  --version 1.1.0 \
+  --version 1.2.0 \
   --namespace myrmex --create-namespace
 ```
 

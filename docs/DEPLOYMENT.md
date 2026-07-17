@@ -25,13 +25,13 @@ Three multi-arch (`linux/amd64` + `linux/arm64`) images are published per releas
 Each is tagged with the release version and `latest`:
 
 ```bash
-docker pull ghcr.io/olafkfreund/myrmex-gateway:1.1.0
-docker pull ghcr.io/olafkfreund/myrmex-agent:1.1.0
+docker pull ghcr.io/olafkfreund/myrmex-gateway:1.2.0
+docker pull ghcr.io/olafkfreund/myrmex-agent:1.2.0
 ```
 
 Pin the version tag in production. `latest` moves on every release.
 
-Per-arch tags (`:1.1.0-amd64`, `:1.1.0-arm64`) are published as the backing
+Per-arch tags (`:1.2.0-amd64`, `:1.2.0-arm64`) are published as the backing
 manifests. Pull the plain version tag — Docker resolves the right architecture.
 
 ### Verifying release artifacts
@@ -54,13 +54,13 @@ Images are cosign-signed (keyless, via Sigstore) **from v1.0.3 onward** —
 v1.0.1 and v1.0.2 predate image signing and carry no signature:
 
 ```bash
-cosign verify ghcr.io/olafkfreund/myrmex-gateway:1.1.0 \
+cosign verify ghcr.io/olafkfreund/myrmex-gateway:1.2.0 \
   --certificate-identity-regexp 'https://github.com/olafkfreund/myrmex-hive.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Both the multi-arch manifest (the plain `:1.1.0` tag you pull) and the
-per-arch images (`:1.1.0-amd64`) are signed, so verifying either works.
+Both the multi-arch manifest (the plain `:1.2.0` tag you pull) and the
+per-arch images (`:1.2.0-amd64`) are signed, so verifying either works.
 
 There is no signing key to manage: signatures are tied to the GitHub Actions
 workload identity that built them, which is what the `--certificate-identity`
@@ -72,7 +72,7 @@ The chart is published as an OCI artifact. There is no chart repo to add:
 
 ```bash
 helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
-  --version 1.1.0 \
+  --version 1.2.0 \
   --namespace myrmex --create-namespace
 ```
 
@@ -84,8 +84,8 @@ moves both. Override per-image with `image.tag`, `gateway.image.tag`, or
 Inspect before installing:
 
 ```bash
-helm show values oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.1.0
-helm template hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.1.0
+helm show values oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.2.0
+helm template hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.2.0
 ```
 
 ### What it deploys
@@ -110,7 +110,7 @@ trusts its key. Generate a keypair, then pass both sides:
 ssh-keygen -t ed25519 -N '' -C k8s-node -f ./agent_key
 
 helm install hive oci://ghcr.io/olafkfreund/charts/myrmex-hive \
-  --version 1.1.0 \
+  --version 1.2.0 \
   --namespace myrmex --create-namespace \
   --set-file gateway.authorizedKeys=./agent_key.pub \
   --set-file agent.privateKey=./agent_key
@@ -152,7 +152,7 @@ also the GitOps/sealed-secrets path. See [SECRETS.md](SECRETS.md).
 ### Upgrading
 
 ```bash
-helm upgrade hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.1.0
+helm upgrade hive oci://ghcr.io/olafkfreund/charts/myrmex-hive --version 1.2.0
 ```
 
 Rolling the gateway drops agent tunnels; agents reconnect on their own. Give
