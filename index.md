@@ -214,9 +214,9 @@ The Go-based Myrmex CLI allows operators to interact with the gateway, view agen
   ```bash
   myrmex ask --plan "Restart nginx on agent-nginx if it looks wedged"
   ```
-* **Fleet-wide orchestration**: One prompt across many agents, summaries aggregated (via the Gateway-native `ask_gemma` tool):
+* **Fleet-wide orchestration**: One prompt across many agents, summaries aggregated. `--all` for the whole fleet, `--agents a,b` for a subset:
   ```bash
-  myrmex call gateway__ask_gemma --arguments '{"prompt":"Report disk usage","all_agents":true}'
+  myrmex ask --all "Report disk usage and flag anything over 85%"
   ```
 
 New to Myrmex? Start with the **[Golden Path]({{ '/golden-path/' | relative_url }})** — what agents can do to your hosts, the six safety gates, and a staged rollout from read-only to LLM-driven remediation.
