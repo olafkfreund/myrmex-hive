@@ -27,7 +27,7 @@ general "run anything" and no arbitrary file write.
 
 | Tool | Effect | Changes the host? |
 |---|---|---|
-| `get_metrics` | CPU / memory / disk sample | No |
+| `get_metrics` | CPU / memory / disk sample (plus recent trend history when the Gateway is polling) | No |
 | `get_system_info` | OS, kernel, uptime, hostname | No |
 | `read_logs` | Tail a log file (bounded) | No |
 | `file_read` | Read one file (absolute path, no `..`, size-capped) | No |
@@ -80,12 +80,19 @@ flowchart LR
 1. **RBAC** — the bearer token maps to a role (`admin` / `operator` /
    `read-only`); the role's capability matrix decides whether the call is even
    allowed to be attempted.
-2. **Risk tier** — you classify each tool (`RiskTiers`: tool → `read`/`write`/
-   `admin`). Unclassified defaults to `read`, so tiering is opt-in and
+2. **Risk tier** — each tool has a tier (`read`/`write`/`admin`). Your
+   `RiskTiers` config overrides per tool; built-in **mutating** tools
+   (`service_control`, `run_command`) default to a non-`read` tier so they
+   can't slip past gating just because nobody classified them, and a
+   genuinely unknown tool still defaults to `read`. Tiering only *acts* when
+   `RequireApprovalTiers`/rate limits are set, so this stays
    backward-compatible.
 3. **Approval** — tiers listed in `RequireApprovalTiers` become *pending
    approvals*: a second operator must approve within a 15-minute TTL before the
-   call runs. This is your "two people to stop prod nginx" control.
+   call runs. This is your "two people to stop prod nginx" control. A new
+   pending approval also **pages your configured alert targets**, so a
+   legitimate mutation can't quietly expire because nobody was watching the
+   portal.
 4. **Rate limit** — `RateLimitPerMinute` caps calls in a sliding 60-second
    window, so a runaway loop (or a hijacked LLM) can't hammer the fleet.
 5. **Allowlist** — on the agent itself, the command name must match an
@@ -172,7 +179,16 @@ myrmex approvals            # a second operator reviews and approves
 ### Stage 3 — Let the LLM drive remediation (day N)
 
 Once read tools and a couple of reviewed mutations are trusted, hand the LLM a
-goal instead of a command:
+goal instead of a command. **Preview it first with `--plan`** — the model is
+consulted at every step but nothing is executed; the response lists the tool
+calls it *would* have made:
+
+```bash
+myrmex ask --plan "nginx on agent-nginx looks unhealthy — check it and restart it if the logs show it's wedged" \
+  --token "$MYRMEX_TOKEN"
+```
+
+Happy with the plan? Drop `--plan` to let it act:
 
 ```bash
 myrmex ask "nginx on agent-nginx looks unhealthy — check it and restart it if the logs show it's wedged" \
@@ -189,6 +205,36 @@ LLM proposes; the funnel disposes.
 > **This is the payoff.** You describe intent in English; a local model triages
 > across the fleet and proposes the fix; your policy decides whether it runs.
 > No agent ever accepted an inbound connection to make it happen.
+
+### Stage 4 — Scale it across the fleet and let it run itself
+
+**One prompt, many agents.** Fleet mode runs the same bounded orchestration
+against every selected agent and aggregates the summaries — "how's the whole
+fleet doing?" in one call:
+
+```bash
+myrmex call gateway__ask_gemma \
+  --arguments '{"prompt":"Report disk usage and flag anything over 85%","all_agents":true}' \
+  --token "$MYRMEX_TOKEN"
+```
+
+Use `"agent_ids":["a","b"]` to target a subset. Each agent gets the exact same
+six-gate treatment; fleet mode is just the single-agent loop in a loop. Combine
+with `"plan":true` to preview a fleet-wide action before it runs.
+
+**Unattended health checks.** `scheduled_tasks` in the Gateway config run an
+orchestration prompt on a timer and route the summary through your alert
+targets — so the LLM works for you between shifts:
+
+```jsonc
+// gateway_config.json
+"scheduled_tasks": [
+  { "name": "nightly-disk-check", "agent_id": "agent-nginx",
+    "prompt": "Report disk usage and flag anything over 85%", "interval_seconds": 3600 }
+]
+```
+
+Empty/unset = off. `interval_seconds` only — no cron expressions.
 
 ---
 

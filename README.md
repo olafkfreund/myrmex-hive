@@ -170,6 +170,25 @@ Configures the receiver, TLS certs, OIDC/Tokens RBAC role mapping (`admin`, `ope
 
 *Note: `metrics_enabled` exposes a Prometheus endpoint at `/metrics` (opt-in; behind the same bearer-token auth as the rest of the API). Myrmex Gateway can also route threshold alerts to a webhook/Alertmanager and export OpenTelemetry traces over OTLP — all opt-in. See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the metric reference, a `scrape_config`, the Grafana dashboard, alert routing and tracing.*
 
+**Governance & scheduling (all opt-in, backward-compatible — empty/unset means off):**
+```json
+{
+  "risk_tiers": { "run_command": "admin", "service_control": "write" },
+  "require_approval_tiers": ["write", "admin"],
+  "rate_limit_per_minute": 30,
+  "scheduled_tasks": [
+    { "name": "nightly-disk-check", "agent_id": "agent-nginx",
+      "prompt": "Report disk usage and flag anything over 85%", "interval_seconds": 3600 }
+  ]
+}
+```
+- `risk_tiers` classifies each tool (`read`/`write`/`admin`). Built-in mutating tools (`service_control`, `run_command`) now default to a non-`read` tier even when unlisted, so they can't slip past gating unclassified; your explicit entries still override.
+- `require_approval_tiers` makes calls in those tiers wait for a second operator (`myrmex approvals`), and a new pending approval also **pages your configured alert targets** so it can't expire unnoticed. 15-minute TTL.
+- `rate_limit_per_minute` caps tool calls in a sliding 60-second window.
+- `scheduled_tasks` periodically run an LLM orchestration prompt against an agent and route the summary through the alerting subsystem — unattended fleet health checks. `interval_seconds` only (no cron).
+
+See [Golden Path](docs/GOLDEN_PATH.md) for how these six gates fit together and a staged rollout.
+
 ### Fail-closed defaults
 
 Myrmex Gateway **fails closed**: it refuses to start (or rejects a connection) rather than run in an insecure state. When preparing configs and keys, three rules are enforced:
@@ -258,6 +277,14 @@ The Go-based Myrmex CLI allows operators to interact with the gateway, view agen
 * **Ask with JSON output**: Forward the final AI response directly to other automated tools or agents:
   ```bash
   myrmex ask "Check system metrics" -o json
+  ```
+* **Ask in plan (dry-run) mode**: The model is still consulted at every step, but no tool is executed — the response lists the calls it *would* have made. Use it to preview an action before trusting the loop:
+  ```bash
+  myrmex ask --plan "Restart nginx on agent-nginx if it looks wedged"
+  ```
+* **Fleet-wide orchestration**: Run the same orchestration across many agents and aggregate the per-agent summaries. Exposed on the Gateway-native `ask_gemma` tool via `agent_ids` / `all_agents`:
+  ```bash
+  myrmex call gateway__ask_gemma --arguments '{"prompt":"Report disk usage","all_agents":true}'
   ```
 
 ---
