@@ -652,6 +652,50 @@ func extractToolResultText(result interface{}) (string, bool) {
 	return textVal, true
 }
 
+// attachMetricsHistoryIfAvailable enriches a get_metrics tool response with
+// the trend data the gateway has already been collecting via metricsPoller
+// (opt-in, GatewayConfig.MetricsPollSeconds). A single instantaneous sample
+// is weak for LLM triage ("is 80% CPU a spike or sustained?"); the poller
+// already answers that internally for alerting (checkAlerts) but never
+// surfaced it back through the tool call itself. This closes that gap
+// without adding any new polling: when history hasn't been collected
+// (MetricsPollSeconds unset, or too few samples yet), it's a no-op and the
+// response is unchanged.
+func attachMetricsHistoryIfAvailable(resp JsonRpcResponse, history []MetricSample) JsonRpcResponse {
+	if len(history) < 2 {
+		return resp
+	}
+	text, ok := extractToolResultText(resp.Result)
+	if !ok {
+		return resp
+	}
+	// Decode into raw messages so existing numeric fields pass through
+	// byte-for-byte instead of being reformatted by a float round-trip.
+	var current map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(text), &current); err != nil {
+		return resp
+	}
+	historyJSON, err := json.Marshal(history)
+	if err != nil {
+		return resp
+	}
+	current["history"] = historyJSON
+	enriched, err := json.Marshal(current)
+	if err != nil {
+		return resp
+	}
+	// Shaped as []interface{} of map[string]interface{}, matching what
+	// extractToolResultText expects (the shape a real JSON-RPC response
+	// decodes into), so the enriched result stays introspectable the same
+	// way the original was.
+	resp.Result = map[string]interface{}{
+		"content": []interface{}{
+			map[string]interface{}{"type": "text", "text": string(enriched)},
+		},
+	}
+	return resp
+}
+
 // metricsPoller runs for the lifetime of an agent connection when
 // GatewayConfig.MetricsPollSeconds > 0 (set at connect time in
 // NewAgentClient), periodically calling the agent's get_metrics tool,
@@ -1994,6 +2038,12 @@ func handleCallTool(ctx context.Context, req JsonRpcRequest, send ResponseSender
 		attribute.String("myrmex.tool", agentToolName),
 	)
 	resp := cli.Call(agentReq)
+	if agentToolName == "get_metrics" && resp.Error == nil {
+		cli.mu.Lock()
+		history := append([]MetricSample(nil), cli.metricsHistory...)
+		cli.mu.Unlock()
+		resp = attachMetricsHistoryIfAvailable(resp, history)
+	}
 	endSpanWithRPCResult(tunnelSpan, resp)
 	send(resp)
 }
