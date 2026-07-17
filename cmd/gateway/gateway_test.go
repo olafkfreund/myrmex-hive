@@ -635,6 +635,22 @@ func TestEveryBuiltinToolHasAnExplicitTier(t *testing.T) {
 func TestRateLimitAllow(t *testing.T) {
 	const limit = 3
 	key := "TestRateLimitAllow|token|agent|run_command"
+	otherKey := "TestRateLimitAllow|other-token|agent|run_command"
+
+	// rateLimitWindows is a package global keyed by these strings. Reset this
+	// test's keys up front (and on cleanup) so the test is hermetic: without
+	// this it fails under `go test -count>1` because the prior iteration's
+	// still-fresh timestamps leave the window already at the limit.
+	rateLimitMu.Lock()
+	delete(rateLimitWindows, key)
+	delete(rateLimitWindows, otherKey)
+	rateLimitMu.Unlock()
+	t.Cleanup(func() {
+		rateLimitMu.Lock()
+		delete(rateLimitWindows, key)
+		delete(rateLimitWindows, otherKey)
+		rateLimitMu.Unlock()
+	})
 
 	for i := 0; i < limit; i++ {
 		if !rateLimitAllow(key, limit) {
@@ -647,7 +663,6 @@ func TestRateLimitAllow(t *testing.T) {
 
 	// A distinct key gets its own independent window and is unaffected by a
 	// different key's exhausted window.
-	otherKey := "TestRateLimitAllow|other-token|agent|run_command"
 	if !rateLimitAllow(otherKey, limit) {
 		t.Errorf("expected distinct key to have its own independent window")
 	}
