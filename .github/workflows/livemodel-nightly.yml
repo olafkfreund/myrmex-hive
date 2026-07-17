@@ -1,0 +1,54 @@
+name: Live Model Eval (nightly)
+
+# Opt-in regression gate for the real Ollama-backed orchestration loop
+# (cmd/gateway/livemodel_eval_test.go, //go:build livemodel). Never runs as
+# part of the normal `go test ./...` CI — only here, nightly or on demand.
+on:
+  schedule:
+    # 03:17 UTC: off-peak, minute offset to avoid the shared cron stampede.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Ollama model to grade (must already be pullable from the public library)'
+        required: false
+        default: 'qwen2.5:0.5b'
+
+env:
+  # qwen2.5:0.5b, not the test's gemma4:e4b default: gemma4 isn't a real
+  # pullable tag in the public Ollama library, and this needs to be small/fast
+  # enough for a CPU-only GitHub runner. Override via workflow_dispatch input.
+  MYRMEX_LIVE_MODEL: ${{ github.event.inputs.model || 'qwen2.5:0.5b' }}
+
+jobs:
+  live-model-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama
+        run: |
+          ollama serve &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:11434 >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::Ollama did not become reachable"; exit 1
+
+      - name: Pull model
+        timeout-minutes: 15
+        run: ollama pull "$MYRMEX_LIVE_MODEL"
+
+      - name: Run live-model eval
+        timeout-minutes: 15
+        run: |
+          MYRMEX_LIVE_MODEL_TEST=1 go test -tags livemodel -run LiveModel -v ./cmd/gateway/
