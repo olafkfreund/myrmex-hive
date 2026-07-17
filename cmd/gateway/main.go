@@ -212,16 +212,38 @@ func authorizeToolCall(scope *config.TokenScope, agentTags map[string][]string, 
 	return nil
 }
 
+// defaultToolTiers is the fail-closed fallback for built-in tools that the
+// operator hasn't explicitly classified in cfg.RiskTiers. Without this, an
+// unlisted mutating tool silently fell back to "read" and bypassed
+// RequireApprovalTiers gating. Add every new agent or gateway-native tool
+// here (see TestEveryBuiltinToolHasAnExplicitTier, which enforces it).
+var defaultToolTiers = map[string]string{
+	// Agent-native tools (cmd/agent/main.go tools/list).
+	"get_metrics":     "read",
+	"get_system_info": "read",
+	"read_logs":       "read",
+	"file_read":       "read",
+	"container_ps":    "read",
+	"k8s_get":         "read",
+	"package_query":   "read",
+	"run_command":     "write",
+	"service_control": "write",
+	// Gateway-native tools (handleGatewayToolCall).
+	"ask_gemma":       "read",
+	"humanize_syslog": "read",
+}
+
 // toolTier returns the configured risk tier for an unprefixed tool name
-// ("run_command", "service_control", ...), defaulting to "read" when the
-// tool is unlisted in RiskTiers or cfg is nil. Defaulting to "read" means an
-// unconfigured RiskTiers map never gates or throttles any call, preserving
-// backward compatibility.
+// ("run_command", "service_control", ...). The operator's cfg.RiskTiers
+// takes priority (explicit override), then defaultToolTiers (fail-closed
+// for known built-ins), then "read" for genuinely unknown tools.
 func toolTier(cfg *config.GatewayConfig, tool string) string {
-	if cfg == nil {
-		return "read"
+	if cfg != nil {
+		if tier, ok := cfg.RiskTiers[tool]; ok && tier != "" {
+			return tier
+		}
 	}
-	if tier, ok := cfg.RiskTiers[tool]; ok && tier != "" {
+	if tier, ok := defaultToolTiers[tool]; ok {
 		return tier
 	}
 	return "read"

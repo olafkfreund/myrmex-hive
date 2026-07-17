@@ -567,21 +567,27 @@ func TestToolTier(t *testing.T) {
 		want string
 	}{
 		{
-			name: "nil config defaults to read",
+			name: "nil config falls back to the built-in default tier",
 			cfg:  nil,
 			tool: "run_command",
-			want: "read",
+			want: "write",
 		},
 		{
-			name: "unconfigured risk tiers defaults to read",
+			name: "unconfigured risk tiers falls back to the built-in default tier",
 			cfg:  &config.GatewayConfig{},
 			tool: "run_command",
+			want: "write",
+		},
+		{
+			name: "unlisted read tool defaults to read via built-in default",
+			cfg:  &config.GatewayConfig{RiskTiers: map[string]string{"service_control": "mutate"}},
+			tool: "get_metrics",
 			want: "read",
 		},
 		{
-			name: "unlisted tool defaults to read",
-			cfg:  &config.GatewayConfig{RiskTiers: map[string]string{"service_control": "mutate"}},
-			tool: "get_metrics",
+			name: "genuinely unknown tool defaults to read",
+			cfg:  &config.GatewayConfig{},
+			tool: "some_future_tool_nobody_classified_yet",
 			want: "read",
 		},
 		{
@@ -604,6 +610,25 @@ func TestToolTier(t *testing.T) {
 				t.Errorf("toolTier(%+v, %q) = %q, want %q", tt.cfg, tt.tool, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestEveryBuiltinToolHasAnExplicitTier guards against RiskTiers failing
+// open: toolTier's fallback is "read" for anything absent from
+// defaultToolTiers, so a new mutating tool that isn't added there is
+// silently treated as low-risk and bypasses RequireApprovalTiers gating.
+// When you add a new agent or gateway-native tool, add it to
+// defaultToolTiers in main.go too, or this test fails.
+func TestEveryBuiltinToolHasAnExplicitTier(t *testing.T) {
+	builtinTools := []string{
+		"get_metrics", "get_system_info", "read_logs", "file_read",
+		"container_ps", "k8s_get", "package_query", "run_command",
+		"service_control", "ask_gemma", "humanize_syslog",
+	}
+	for _, tool := range builtinTools {
+		if _, ok := defaultToolTiers[tool]; !ok {
+			t.Errorf("built-in tool %q has no entry in defaultToolTiers; it would fail open to tier %q", tool, toolTier(nil, tool))
+		}
 	}
 }
 
