@@ -26,12 +26,16 @@ import (
 // recovery ("resolved") for a single agent/dimension pair.
 type alertEvent struct {
 	AgentID   string    `json:"agent_id"`
-	Dimension string    `json:"dimension"` // "cpu" | "mem" | "disk"
+	Dimension string    `json:"dimension"` // "cpu" | "mem" | "disk", or "scheduled:<task name>"
 	Status    string    `json:"status"`    // "firing" | "resolved"
 	Value     float64   `json:"value"`
 	Threshold float64   `json:"threshold"`
 	Timestamp time.Time `json:"timestamp"`
 	GatewayID string    `json:"gateway_id,omitempty"`
+	// Message, when set, overrides the default "value exceeded threshold"
+	// annotation text (see alertmanagerPayload) - used by scheduled
+	// orchestration tasks (#6) to carry the LLM's summary instead.
+	Message string `json:"message,omitempty"`
 }
 
 // alertHTTPClient is a package-level client so tests can point delivery at an
@@ -119,7 +123,7 @@ func alertmanagerPayload(ev alertEvent) ([]byte, error) {
 			"gateway_id": ev.GatewayID,
 		},
 		"annotations": map[string]string{
-			"summary":   fmt.Sprintf("%s %s usage %.2f%% exceeded threshold %.2f%%", ev.AgentID, ev.Dimension, ev.Value, ev.Threshold),
+			"summary":   alertSummary(ev),
 			"value":     fmt.Sprintf("%.2f", ev.Value),
 			"threshold": fmt.Sprintf("%.2f", ev.Threshold),
 		},
@@ -129,6 +133,16 @@ func alertmanagerPayload(ev alertEvent) ([]byte, error) {
 		alert["endsAt"] = ev.Timestamp.UTC().Format(time.RFC3339)
 	}
 	return json.Marshal([]interface{}{alert})
+}
+
+// alertSummary is the human-readable annotation text for ev: the LLM's own
+// summary when one was provided (scheduled orchestration tasks, #6), else the
+// default threshold-breach wording.
+func alertSummary(ev alertEvent) string {
+	if ev.Message != "" {
+		return ev.Message
+	}
+	return fmt.Sprintf("%s %s usage %.2f%% exceeded threshold %.2f%%", ev.AgentID, ev.Dimension, ev.Value, ev.Threshold)
 }
 
 // deliverWithRetry POSTs body to url, retrying with exponential backoff on

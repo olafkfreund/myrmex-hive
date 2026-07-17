@@ -206,6 +206,12 @@ type GatewayConfig struct {
 	// it expires. A value <= 0 (including unset) defaults to 900 (15
 	// minutes) at the point the gateway issues a token.
 	EnrollmentTokenTTLSeconds int `json:"enrollment_token_ttl_seconds,omitempty"`
+	// ScheduledTasks configures recurring LLM orchestration runs (issue #6):
+	// every IntervalSeconds, the gateway runs Prompt as an ask_gemma-style
+	// orchestration against AgentID and routes the resulting summary through
+	// notifyAlert (the same webhook/Alertmanager delivery threshold alerts
+	// use). Empty/unset (the default) starts no scheduler goroutines.
+	ScheduledTasks []ScheduledTask `json:"scheduled_tasks,omitempty"`
 
 	// --- Operator authentication: mTLS (#59) ---
 	//
@@ -382,6 +388,14 @@ type AlertThresholds struct {
 	CPUPercent  float64 `json:"cpu_percent"`
 	MemPercent  float64 `json:"mem_percent"`
 	DiskPercent float64 `json:"disk_percent"`
+}
+
+// ScheduledTask is one recurring orchestration job (see GatewayConfig.ScheduledTasks).
+type ScheduledTask struct {
+	Name            string `json:"name"`
+	AgentID         string `json:"agent_id"`
+	Prompt          string `json:"prompt"`
+	IntervalSeconds int    `json:"interval_seconds"`
 }
 
 // Validate checks the GatewayConfig for missing/inconsistent required fields

@@ -51,6 +51,9 @@ var nonSecretFields = map[string]bool{
 	// claim name is a field name, and the role map is group->role with no
 	// credentials in it.
 	"OIDCIssuer": true, "OIDCAudience": true, "OIDCRoleClaim": true, "OIDCRoleMap": true,
+	// Scheduled orchestration (#6): agent ID, prompt text, and an interval -
+	// none of it secret.
+	"ScheduledTasks": true,
 }
 
 // This is the guard for #131. Redaction was a hand-maintained list of four

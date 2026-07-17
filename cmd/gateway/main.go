@@ -1536,6 +1536,11 @@ func main() {
 	// Start Upstream MCP clients if configured
 	reloadUpstreamClients(cfg)
 
+	// Scheduled recurring orchestration (#6). Opt-in via ScheduledTasks;
+	// empty/unset starts no goroutines, preserving today's on-demand-only
+	// behavior byte-for-byte.
+	startScheduledTasks(cfg)
+
 	// Graceful shutdown (issue #50): flush current state to disk (a no-op
 	// when stateStore is nil) on SIGINT/SIGTERM, then exit. This handler is
 	// installed unconditionally, not just when StatePath is set, so
