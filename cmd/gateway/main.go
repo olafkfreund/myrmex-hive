@@ -84,6 +84,12 @@ type AskGemmaArgs struct {
 	// each step, but the chosen tool is never executed — see
 	// executeGemmaOrchestration's plan branch.
 	Plan bool `json:"plan,omitempty"`
+	// AgentIDs and AllAgents opt into fleet-wide orchestration (#5): the same
+	// per-agent executeGemmaOrchestration loop runs once per target agent and
+	// the summaries are aggregated. Both are empty/false by default, which is
+	// byte-for-byte the original single-agent behavior via AgentID.
+	AgentIDs  []string `json:"agent_ids,omitempty"`
+	AllAgents bool     `json:"all_agents,omitempty"`
 }
 
 type HumanizeSyslogArgs struct {
@@ -1824,20 +1830,29 @@ func handleListTools(req JsonRpcRequest, send ResponseSender) {
 	if isLLMEnabled(llmEngine) {
 		tools = append(tools, map[string]interface{}{
 			"name":        "gateway__ask_gemma",
-			"description": "Instruct Gemma LLM to decide on actions and coordinate execution securely on a target agent.",
+			"description": "Instruct Gemma LLM to decide on actions and coordinate execution securely on a target agent, or across the whole fleet.",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"agent_id": map[string]interface{}{
 						"type":        "string",
-						"description": "The target Agent Node ID",
+						"description": "The target Agent Node ID. Ignored if agent_ids or all_agents is set.",
+					},
+					"agent_ids": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "Run the orchestration independently on each of these agents and aggregate the summaries.",
+					},
+					"all_agents": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Run the orchestration independently on every currently-connected agent and aggregate the summaries.",
 					},
 					"prompt": map[string]interface{}{
 						"type":        "string",
-						"description": "What you want to accomplish on the agent (e.g. 'check memory and explain it')",
+						"description": "What you want to accomplish on the agent(s) (e.g. 'check memory and explain it')",
 					},
 				},
-				"required": []string{"agent_id", "prompt"},
+				"required": []string{"prompt"},
 			},
 		})
 
@@ -2138,6 +2153,19 @@ func handleGatewayToolCall(ctx context.Context, name string, argsRaw json.RawMes
 
 		if !isLLMEnabled(llmEngine) {
 			sendErrorDirect(send, reqID, -32603, "Local LLM is not configured on this Gateway")
+			return
+		}
+
+		if args.AllAgents || len(args.AgentIDs) > 0 {
+			targets := args.AgentIDs
+			if args.AllAgents {
+				targets = listAgentIDs()
+			}
+			if len(targets) == 0 {
+				sendErrorDirect(send, reqID, -32603, "Fleet orchestration requested but no agents are connected")
+				return
+			}
+			executeFleetGemmaOrchestration(ctx, targets, args.Prompt, args.Plan, reqID, send)
 			return
 		}
 
@@ -2513,6 +2541,56 @@ func executeGemmaOrchestration(ctx context.Context, agentID string, cli *AgentCl
 	// Step budget exhausted without the model signaling done: summarize
 	// whatever was accomplished rather than leaving the caller with nothing.
 	finalizeOrchestration(send, reqID, "", observations, plan)
+}
+
+// executeFleetGemmaOrchestration runs executeGemmaOrchestration once per
+// agent in agentIDs and aggregates the per-agent summaries into a single
+// response (#5). It never forks the per-agent loop's logic — each agent gets
+// the exact same bounded, defense-in-depth orchestration as the single-agent
+// path, just driven in a loop.
+//
+// ponytail: iterates sequentially, one agent at a time. Each agent's
+// orchestration is independent so this is safe to parallelize, but sequential
+// is the simplest correct version; upgrade to a bounded goroutine fan-out if
+// fleet-wide latency becomes a problem.
+func executeFleetGemmaOrchestration(ctx context.Context, agentIDs []string, userPrompt string, plan bool, reqID interface{}, send ResponseSender) {
+	ctx, fleetSpan := startSpan(ctx, "gemma.fleet_orchestration",
+		attribute.Int("myrmex.fleet_size", len(agentIDs)),
+	)
+	defer fleetSpan.End()
+
+	var body strings.Builder
+	for _, agentID := range agentIDs {
+		cli := getAgent(agentID)
+		if cli == nil {
+			fmt.Fprintf(&body, "== %s (failed) ==\n%s\n\n", agentID, fmt.Sprintf("Agent %q is not connected", agentID))
+			continue
+		}
+
+		var captured JsonRpcResponse
+		capture := func(resp JsonRpcResponse) { captured = resp }
+		executeGemmaOrchestration(ctx, agentID, cli, userPrompt, plan, fmt.Sprintf("fleet-%s", agentID), capture)
+
+		summary, failed := orchestrationResultText(captured)
+		status := "ok"
+		if failed {
+			status = "failed"
+		}
+		fmt.Fprintf(&body, "== %s (%s) ==\n%s\n\n", agentID, status, summary)
+	}
+
+	send(JsonRpcResponse{
+		JsonRpc: "2.0",
+		Result: map[string]interface{}{
+			"content": []map[string]interface{}{
+				{
+					"type": "text",
+					"text": strings.TrimSpace(body.String()),
+				},
+			},
+		},
+		ID: reqID,
+	})
 }
 
 var writeMu sync.Mutex
