@@ -79,9 +79,24 @@ It is one script rather than raw `tc`/`kill` entries for two reasons: an
 fixed verb set, and chaos needs *cleanup* — a `netem` rule outlives the
 command that added it.
 
-**Every timed action self-reverts, and durations are capped at 300s.** The
-`tc` teardown is trapped before the sleep, so even a killed shell removes the
-rule. A fault that outlives the test is an outage, not an experiment.
+**Every timed action self-reverts, and durations are capped at 300s.** A fault
+that outlives the test is an outage, not an experiment.
+
+**Timed actions return immediately and revert in the background.** That is
+load-bearing, for three reasons:
+
+1. The agent kills any command at 30s, and it kills with **SIGKILL** — which
+   runs no shell EXIT traps. A fault that blocked for 60s would be killed
+   mid-sleep with its `netem` rule still installed, *permanently*. So the
+   teardown is scheduled in an independent session (`setsid`) before the fault
+   is applied, and survives even the agent dying.
+2. Tool output is buffered until the command exits, so a blocking fault means
+   you can observe nothing *while* it is happening — the entire point of
+   injecting it.
+3. It is why a 300s fault works despite a 30s command timeout.
+
+So `chaos.sh latency 60 250 eth0` returns at once with
+`auto-reverts in 60s`, and you spend those 60 seconds probing.
 
 ---
 
@@ -174,11 +189,16 @@ agent is deliberately not one.
 
 ## 7. Two sharp edges
 
-- **Commands are killed at 30 seconds** (`pkg/command`). Fine for restarts,
-  probes and short faults; a long soak must be a scheduled task that pokes
-  repeatedly, not one long command.
+- **Commands are killed at 30 seconds, with SIGKILL** (`pkg/command`). Fine for
+  restarts, probes and short faults. Anything that must outlive 30s has to
+  detach — as `chaos.sh` does — because SIGKILL runs no cleanup. **Never
+  allowlist a long-running command that cleans up after itself in a trap or a
+  `defer`: it will be killed before it can.**
 - **Output is buffered, not streamed.** You get it when the command exits, so
-  there is no live tail *during* a run. Poll `read_logs` instead.
+  there is no live tail *during* a run. Poll `read_logs` between iterations,
+  and prefer faults that return immediately so you can observe while they act.
+
+A long soak is therefore a `scheduled_tasks` poke loop, not one long command.
 
 ---
 
