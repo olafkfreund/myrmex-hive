@@ -7,6 +7,11 @@ title: Home
 
 Myrmex Hive is a decentralized, secure, and geeky agent orchestration framework built on top of the **Model Context Protocol (MCP)**. It is designed to securely monitor, query, and manage distributed edge servers, Docker hosts, and Kubernetes nodes without exposing any ingress ports on your target systems.
 
+> **New here?** [**What it's for →**]({{ '/use-cases/' | relative_url }}) — eight
+> concrete use cases, from chaos-testing your own service to airgapped fleet
+> triage, plus an honest list of what it deliberately is *not*.
+> Then walk the [**Golden Path**]({{ '/golden-path/' | relative_url }}).
+
 ---
 
 ### 1. Architecture & Security Model
@@ -47,7 +52,7 @@ flowchart TD
 #### Security Principles (Why We Made These Choices)
 * **Zero Inbound Ports**: Instead of running an SSH daemon or exposing management ports (like HTTP/gRPC) on your target servers, the **Myrmex Agent** initiates a secure, outbound connection to the **Myrmex Gateway**. This eliminates the primary attack vector of public scanner discovery and automated brute-force attacks.
 * **OS-Grade Encryption**: Outbound tunnels utilize standard SSH protocol channels managed via Go's native `crypto/ssh` package, enforcing secure Ed25519 signature validation and high-grade ciphers (ChaCha20-Poly1305, AES-GCM).
-* **Defense-in-Depth Allowlist**: The Agent executes binaries directly via OS process forks (`os/exec`) rather than invoking a shell shell (like `/bin/sh` or `bash`). This completely bypasses shell shell expansion, neutralizing shell injection vulnerabilities. Arguments are strictly validated against developer-defined regular expressions in `config.json`.
+* **Defense-in-Depth Allowlist**: The Agent executes binaries directly via OS process forks (`os/exec`) rather than invoking a shell (like `/bin/sh` or `bash`). This completely bypasses shell expansion, neutralizing shell injection vulnerabilities. Arguments are strictly validated against developer-defined regular expressions in `config.json`.
 * **Central Token Authorization**: Access to the Gateway's control API is guarded via secure bearer token authentication.
 
 ---

@@ -3,6 +3,19 @@ description: "Myrmex Hive: Secure Agent Orchestrator & Gateway with multi-transp
 url: "https://myrmex-hive.freundcloud.com"
 baseurl: ""
 exclude:
+  # Anything not excluded here is COPIED INTO THE PUBLISHED SITE, and any .md
+  # with front matter is rendered as a page. That is how 49 vendored Go
+  # dependency pages, the internal CLAUDE.md, and unpublished marketing drafts
+  # all ended up live on myrmex-hive.freundcloud.com. Adding a directory to the
+  # repo? Decide here whether the public site should carry it.
+  - vendor          # 23MB of third-party docs; two thirds of the built site
+  - CLAUDE.md       # internal agent instructions, not a web page
+  - docs/announce   # marketing drafts, also excluded from TechDocs
+  - terraform
+  - charts
+  - dashboards
+  - examples
+  - result
   - cmd
   - pkg
   - bin
