@@ -42,7 +42,7 @@ flowchart TD
 ### Security Principles (Why We Made These Choices)
 * **Zero Inbound Ports**: Instead of running an SSH daemon or exposing management ports (like HTTP/gRPC) on your target servers, the **Myrmex Agent** initiates a secure, outbound connection to the **Myrmex Gateway**. This eliminates the primary attack vector of public scanner discovery and automated brute-force attacks.
 * **OS-Grade Encryption**: Outbound tunnels utilize standard SSH protocol channels managed via Go's native `crypto/ssh` package, enforcing secure Ed25519 signature validation and high-grade ciphers (ChaCha20-Poly1305, AES-GCM).
-* **Defense-in-Depth Allowlist**: The Agent executes binaries directly via OS process forks (`os/exec`) rather than invoking a shell shell (like `/bin/sh` or `bash`). This completely bypasses shell shell expansion, neutralizing shell injection vulnerabilities. Arguments are strictly validated against developer-defined regular expressions in `config.json`.
+* **Defense-in-Depth Allowlist**: The Agent executes binaries directly via OS process forks (`os/exec`) rather than invoking a shell (like `/bin/sh` or `bash`). This completely bypasses shell expansion, neutralizing shell injection vulnerabilities. Arguments are strictly validated against developer-defined regular expressions in `config.json`.
 * **Central Token Authorization**: Access to the Gateway's control API is guarded via secure bearer token authentication.
 
 ---
@@ -320,6 +320,19 @@ An enterprise administrator configures a secure, fully compliance-audited local 
    myrmex ask "Verify the nginx server is running on agent-nginx" --token "operator-token-456"
    ```
 4. **Log & Verify Audit Event**: Since the request has write-like evaluation steps, the gateway logs a cryptographically signed entry in `audit.log` showing the timestamp, token role (`operator`), API route (`/api/chat`), and base64 signature. The security auditor verifies the log authenticity using the gateway's public SSH host key.
+
+### Scenario D: Testing and chaos-testing your own service
+A developer wants to run, break, observe and restart a service on a real host without SSHing in.
+1. **Allowlist the harness**, don't build a feature. Copy the entries from [`examples/service-test-harness/`](examples/service-test-harness/): a `chaos.sh` with a fixed verb set (`cpu`, `mem`, `latency`, `loss`, `kill`), probes pinned to hosts you name, and an apply script for config variants.
+2. **Verify recovery before breaking anything.** Restart the service through the Gateway first — if the restart path doesn't work, you have no business injecting a fault.
+3. **Inject and observe.** Faults are time-bounded and self-reverting, and return immediately so you can watch the effect while it happens:
+   ```bash
+   myrmex call web-1__run_command --arguments '{"name":"/opt/myrmex/chaos.sh","args":["latency","60","250","eth0"]}'
+   # → latency: applied 250 on eth0, auto-reverts in 60s
+   ```
+4. **Get a record.** Every injection lands in the signed audit log, so a chaos run leaves tamper-evident evidence of which fault hit which host and when.
+
+Full guide: [docs/SERVICE_TESTING.md](docs/SERVICE_TESTING.md).
 
 ---
 
