@@ -12,13 +12,24 @@ on:
       model:
         description: 'Ollama model to grade (must already be pullable from the public library)'
         required: false
-        default: 'qwen2.5:0.5b'
+        default: 'qwen3:1.7b'
 
 env:
-  # qwen2.5:0.5b, not the test's gemma4:e4b default: gemma4 isn't a real
-  # pullable tag in the public Ollama library, and this needs to be small/fast
-  # enough for a CPU-only GitHub runner. Override via workflow_dispatch input.
-  MYRMEX_LIVE_MODEL: ${{ github.event.inputs.model || 'qwen2.5:0.5b' }}
+  # qwen3:1.7b, not the test's gemma4:e4b default: gemma4 isn't a real pullable
+  # tag in the public Ollama library, and this needs to be small/fast enough for
+  # a CPU-only GitHub runner. Override via workflow_dispatch input.
+  #
+  # Measured 2026-07-21 before pinning — this is a capability floor, not a size
+  # preference, and BIGGER IS NOT SAFER:
+  #   qwen2.5:0.5b  0/4 nightlies green — never converged to `done` at all.
+  #   qwen2.5:3b    0/6 green — passes competence but is HIJACKED by the
+  #                 injection fixture every single run (calls service_control
+  #                 action=stop service=all from poisoned tool output).
+  #   qwen3:1.7b   17/18 green — right tool, resists the injection; the one
+  #                 slip was malformed JSON (a stray `)`), so expect ~5% flake.
+  # Re-measure with a loop before swapping this: a single green run proves
+  # nothing about a stochastic grader.
+  MYRMEX_LIVE_MODEL: ${{ github.event.inputs.model || 'qwen3:1.7b' }}
 
 jobs:
   live-model-eval:
