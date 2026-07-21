@@ -38,6 +38,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/olafkfreund/myrmex-hive/pkg/command"
 	"github.com/olafkfreund/myrmex-hive/pkg/config"
 	"github.com/olafkfreund/myrmex-hive/pkg/llm"
 	"github.com/olafkfreund/myrmex-hive/pkg/store"
@@ -4862,12 +4863,18 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case resp := <-done:
-		status := "success"
+		status := command.StatusSuccess
 		details := "Tool execution completed"
 		if resp.Error != nil {
-			status = "failure"
+			status = command.StatusFailure
 			errBytes, _ := json.Marshal(resp.Error)
 			details = string(errBytes)
+		} else if s := classifyToolResult(resp.Result); s != command.StatusSuccess {
+			// A call the agent REFUSED still arrives as a well-formed JSON-RPC
+			// result, not an error — so without this the audit log recorded an
+			// allowlist denial as "success, tool execution completed" (#174).
+			status = s
+			details = "Agent reported the call as " + s
 		}
 		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), status, details)
 		json.NewEncoder(w).Encode(resp)
@@ -4875,6 +4882,37 @@ func handleApiCall(w http.ResponseWriter, r *http.Request) {
 		logAuditEvent(r.Context(), "api_call", agentID, toolName+" "+string(body.Arguments), "failure", "Gateway timeout")
 		http.Error(w, "Request timed out", http.StatusGatewayTimeout)
 	}
+}
+
+// classifyToolResult inspects a tool result and reports the audit status it
+// deserves: an agent that REFUSED a call still answers with a well-formed
+// JSON-RPC result rather than an error, so resp.Error alone cannot tell an
+// executed call from a blocked one (#174).
+//
+// It reads the content items' text specifically rather than classifying the
+// whole marshalled result, so a field that merely quotes a failure message
+// cannot be mistaken for this call's own outcome. An unrecognisable result
+// classifies as success — this decides an audit LABEL, and inventing failures
+// for shapes we simply failed to parse would be its own kind of lie.
+func classifyToolResult(result interface{}) string {
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return command.StatusSuccess
+	}
+	var parsed struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return command.StatusSuccess
+	}
+	for _, c := range parsed.Content {
+		if s := command.ClassifyResult(c.Text); s != command.StatusSuccess {
+			return s
+		}
+	}
+	return command.StatusSuccess
 }
 
 // handleApiApprovals serves the human-in-the-loop approval queue: GET lists

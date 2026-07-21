@@ -564,7 +564,10 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 
 		var textContent string
 		if err != nil {
-			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+			// command.ResultFailurePrefix, not a literal: the Gateway matches on
+			// this marker to audit the call as denied/failed rather than
+			// successful (#174), so the two must not drift apart.
+			textContent = fmt.Sprintf("%s %v\nOutput:\n%s", command.ResultFailurePrefix, err, output)
 		} else {
 			textContent = output
 		}
@@ -607,7 +610,10 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 
 		var textContent string
 		if err != nil {
-			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+			// command.ResultFailurePrefix, not a literal: the Gateway matches on
+			// this marker to audit the call as denied/failed rather than
+			// successful (#174), so the two must not drift apart.
+			textContent = fmt.Sprintf("%s %v\nOutput:\n%s", command.ResultFailurePrefix, err, output)
 		} else {
 			textContent = output
 		}
@@ -644,7 +650,10 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 
 		var textContent string
 		if err != nil {
-			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+			// command.ResultFailurePrefix, not a literal: the Gateway matches on
+			// this marker to audit the call as denied/failed rather than
+			// successful (#174), so the two must not drift apart.
+			textContent = fmt.Sprintf("%s %v\nOutput:\n%s", command.ResultFailurePrefix, err, output)
 		} else {
 			textContent = output
 		}
@@ -688,7 +697,10 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 
 		var textContent string
 		if err != nil {
-			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+			// command.ResultFailurePrefix, not a literal: the Gateway matches on
+			// this marker to audit the call as denied/failed rather than
+			// successful (#174), so the two must not drift apart.
+			textContent = fmt.Sprintf("%s %v\nOutput:\n%s", command.ResultFailurePrefix, err, output)
 		} else {
 			textContent = output
 		}
@@ -743,7 +755,10 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 
 		var textContent string
 		if err != nil {
-			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+			// command.ResultFailurePrefix, not a literal: the Gateway matches on
+			// this marker to audit the call as denied/failed rather than
+			// successful (#174), so the two must not drift apart.
+			textContent = fmt.Sprintf("%s %v\nOutput:\n%s", command.ResultFailurePrefix, err, output)
 		} else {
 			textContent = output
 		}
@@ -782,7 +797,8 @@ func handleCallTool(w io.Writer, req JsonRpcRequest, cfg *config.AgentConfig) {
 
 		var textContent string
 		if err != nil {
-			textContent = fmt.Sprintf("Command failed/rejected: %v\nOutput:\n%s", err, output)
+			// See the note on ResultFailurePrefix above: the Gateway audits on it.
+			textContent = fmt.Sprintf("%s %v\nOutput:\n%s", command.ResultFailurePrefix, err, output)
 		} else if len(output) > maxFileReadBytes {
 			textContent = output[:maxFileReadBytes] + "\n...[truncated at 64KB]"
 		} else {
