@@ -7,12 +7,14 @@ Agents dial **out** to a central Gateway over SSH; operators reach the Gateway
 management traffic, which removes the usual attack surface: no exposed SSH
 daemon, no management port for scanners to find.
 
-!!! note "This page intentionally links rather than repeats"
-
-    The [README](https://github.com/olafkfreund/myrmex-hive#readme) is the
-    single source for the architecture overview, quickstart and configuration
-    reference. Duplicating it here would guarantee drift — an earlier attempt
-    at these docs shipped a README copy that was stale within weeks.
+> **This page intentionally links rather than repeats.**
+> The [README](https://github.com/olafkfreund/myrmex-hive#readme) is the
+> single source for the architecture overview, quickstart and configuration
+> reference. Duplicating it here would guarantee drift — an earlier attempt
+> at these docs shipped a README copy that was stale within weeks.
+>
+> (A blockquote, not a `!!!` admonition: these pages are rendered by **both**
+> MkDocs and Jekyll, and Jekyll prints admonition syntax as literal text.)
 
 ## Where to go
 
