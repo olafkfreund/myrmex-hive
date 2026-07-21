@@ -11,8 +11,10 @@ package command_test
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/olafkfreund/myrmex-hive/pkg/command"
 	"github.com/olafkfreund/myrmex-hive/pkg/config"
@@ -113,6 +115,38 @@ func TestHarnessProfileDeniesTheDangerousCalls(t *testing.T) {
 		if allowlistVerdict(t, c.name, c.args, allow) {
 			t.Errorf("SHOULD BE DENIED (%s) but the allowlist approved: %s %s", c.why, c.name, c.args)
 		}
+	}
+}
+
+// Timed chaos actions MUST return immediately rather than blocking for their
+// duration.
+//
+// ExecuteCommand kills at 30s using exec.CommandContext, which sends SIGKILL,
+// and SIGKILL runs no EXIT traps. A blocking `latency 60 ...` would therefore
+// be killed mid-sleep with its netem rule still installed — permanently. The
+// script avoids that by detaching both the fault and its teardown, and this
+// test fails if anyone reintroduces the blocking form.
+func TestChaosScriptDoesNotBlockForItsDuration(t *testing.T) {
+	script := "../../examples/service-test-harness/chaos.sh"
+	if _, err := os.Stat(script); err != nil {
+		t.Skipf("chaos.sh not present: %v", err)
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+
+	// A duration far beyond the assertion window, so a blocking implementation
+	// cannot pass by being quick.
+	start := time.Now()
+	out, err := exec.Command("bash", script, "cpu", "20", "1").CombinedOutput()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("chaos.sh cpu 20 1 failed: %v\n%s", err, out)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("chaos.sh blocked for %v — a timed action must detach and return immediately, "+
+			"or the agent's 30s SIGKILL will strand the fault with its teardown never run", elapsed)
 	}
 }
 
