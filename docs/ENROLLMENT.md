@@ -211,7 +211,7 @@ operational, out-of-band step — the enrollment endpoints only manage
 |---|---|---|
 | `myrmex enroll-token --agent-id X` | admin `--token` | Mint a join token for `X`. |
 | `myrmex enroll --join-token T --agent-id X --public-key-file F` | join token only | Redeem a token, register `X`'s public key. |
-| `myrmex bootstrap --agent-id X [--token \| --join-token T]` | admin `--token` (to mint) or `--join-token` | Generate keypair + enroll + write `agent_config.json`. |
+| `myrmex bootstrap --agent-id X [--token / --join-token T]` | admin `--token` (to mint) or `--join-token` | Generate keypair + enroll + write `agent_config.json`. |
 | `myrmex rotate --agent-id X --public-key-file F [--revoke-old]` | admin `--token` (to mint) or `--join-token` | Enroll a replacement key, optionally revoking all old keys. |
 
 See `myrmex --help` for full flag documentation and example invocations.

@@ -18,6 +18,10 @@ import (
 // inside it. That shipped to the live site and looked broken.
 //
 // Use a blockquote instead — both renderers handle it.
+
+// escapedPipeInCodeSpan matches a `\|` occurring between backticks.
+var escapedPipeInCodeSpan = regexp.MustCompile("`[^`]*\\\\\\|[^`]*`")
+
 func TestDocsAvoidMkDocsOnlyAdmonitions(t *testing.T) {
 	entries, err := os.ReadDir("../../docs")
 	if err != nil {
@@ -37,6 +41,14 @@ func TestDocsAvoidMkDocsOnlyAdmonitions(t *testing.T) {
 			if strings.HasPrefix(line, "!!! ") || strings.HasPrefix(line, "??? ") {
 				t.Errorf("docs/%s:%d uses a MkDocs-only admonition, which Jekyll renders as "+
 					"literal text on the public site. Use a blockquote (\"> **Note.** …\").\n  %s",
+					e.Name(), i+1, line)
+			}
+			// `a\|b` inside a table: the backslash is NOT unescaped inside a
+			// code span, so BOTH renderers print a literal "\|". Separate the
+			// alternatives with "/" instead.
+			if escapedPipeInCodeSpan.MatchString(line) {
+				t.Errorf("docs/%s:%d escapes a pipe inside a code span; both renderers print the "+
+					"backslash literally. Use \"/\" to separate alternatives.\n  %s",
 					e.Name(), i+1, line)
 			}
 		}
