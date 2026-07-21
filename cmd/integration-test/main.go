@@ -243,6 +243,45 @@ func normalizeID(id interface{}) string {
 	}
 }
 
+// expectedAgents is the roster docker-compose.test.yml brings up. The tools
+// assertion later checks the same set, so both grow together.
+var expectedAgents = []string{"agent-1", "agent-2", "agent-3", "agent-nginx", "agent-db"}
+
+// waitForAgents blocks until every named agent has registered with the Gateway
+// or the deadline passes, reading the Gateway's own container logs so it needs
+// no auth and works before the SSE client exists.
+//
+// It does NOT fail on timeout: the tools assertion downstream is the real
+// check and reports which agent is missing, which is a far more useful failure
+// than "waited too long".
+func waitForAgents(agents []string, timeout time.Duration) {
+	log.Printf("Waiting up to %s for %d agents to register...", timeout, len(agents))
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("docker", "logs", "mcp-gateway-test").CombinedOutput()
+		if err == nil {
+			missing := []string{}
+			for _, a := range agents {
+				if !strings.Contains(string(out), "Agent registered: "+a) {
+					missing = append(missing, a)
+				}
+			}
+			if len(missing) == 0 {
+				log.Printf("All %d agents registered.", len(agents))
+				// The Gateway registers an agent when its SSH session is up;
+				// give the 'mcp' channel a moment to be serving before asking
+				// it for a tool list.
+				time.Sleep(1 * time.Second)
+				return
+			}
+			log.Printf("  still waiting on: %s", strings.Join(missing, ", "))
+		}
+		time.Sleep(2 * time.Second)
+	}
+	log.Printf("Timed out waiting for agents; continuing so the assertions can report specifics.")
+}
+
 func main() {
 	log.Println("Starting Docker integration test runner...")
 
@@ -275,9 +314,14 @@ func main() {
 		}()
 	*/
 
-	// 2. Wait for registration
-	log.Println("Waiting 6 seconds for agents to connect and register...")
-	time.Sleep(6 * time.Second)
+	// 2. Wait for registration.
+	//
+	// Polled, not a fixed sleep. Five agents dial out independently and the
+	// slowest lagged the fastest by seconds on a cold start, so a flat 6s made
+	// this fail as "Missing expected tools" — a real-looking failure caused
+	// entirely by asserting too early. Poll until every expected agent has
+	// registered, then continue immediately.
+	waitForAgents(expectedAgents, 90*time.Second)
 
 	// 3. Connect to the Gateway HTTP/SSE server
 	// 3. Connect to the Gateway HTTPS/SSE server loading the generated config token
