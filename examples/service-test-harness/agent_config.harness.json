@@ -17,9 +17,14 @@
       "args_regex": "-s (-o /dev/null -w %\\{http_code\\}:%\\{time_total\\} )?--max-time \\d{1,2} http://(localhost|127\\.0\\.0\\.1|myservice\\.internal)(:\\d{1,5})?/[a-zA-Z0-9/_-]*"
     },
     {
-      "_comment": "TCP reachability to a dependency (is the DB even listening?).",
+      "_comment": "MINIMAL-IMAGE PROBE. Alpine and friends ship no curl and no dig, but busybox always has wget and nc. Check what the target actually has before relying on the curl entry above - an allowlist entry for a missing binary audits as 'failure', not 'denied'.",
+      "name": "wget",
+      "args_regex": "-q -O - -T \\d{1,2} http://(127\\.0\\.0\\.1|myservice\\.internal)(:\\d{1,5})?/[a-zA-Z0-9/_.-]*"
+    },
+    {
+      "_comment": "TCP reachability to a dependency (is the DB even listening?). Prefer 127.0.0.1 over localhost: localhost resolves to ::1 first, so an IPv4-only service reports a FALSE outage.",
       "name": "nc",
-      "args_regex": "-z -w \\d{1,2} (localhost|127\\.0\\.0\\.1|db\\.internal|cache\\.internal) \\d{1,5}"
+      "args_regex": "-z -w \\d{1,2} (127\\.0\\.0\\.1|db\\.internal|cache\\.internal) \\d{1,5}"
     },
     {
       "_comment": "DNS resolution check - the failure nobody suspects until they do.",
@@ -32,9 +37,14 @@
       "args_regex": "(baseline|high-timeout|low-memory|no-cache)"
     },
     {
-      "_comment": "Service lifecycle. service_control covers start/stop/restart/status for these too; this entry is for the non-systemd case.",
+      "_comment": "Service lifecycle on a systemd host. NOT sufficient on its own for a CONTAINER target: service_control also shells out to systemctl, and a container has no systemd - so `kill` works and recovery silently does not. Verify the restart path through the harness BEFORE injecting any fault.",
       "name": "systemctl",
       "args_regex": "(status|restart|start|stop) myservice"
+    },
+    {
+      "_comment": "RECOVERY on a non-systemd target, e.g. a container. The empty alternative permits bare `myservice` (start): `-s reload` needs a running master and cannot help once the process is dead. One entry, not two - the allowlist stops at the first matching command NAME.",
+      "name": "/usr/sbin/myservice",
+      "args_regex": "(-s (reload|quit))?"
     },
     {
       "_comment": "READ-ONLY diagnostics. Safe to grant broadly.",

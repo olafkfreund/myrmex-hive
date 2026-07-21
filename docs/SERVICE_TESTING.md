@@ -202,7 +202,53 @@ A long soak is therefore a `scheduled_tasks` poke loop, not one long command.
 
 ---
 
-## 8. Before you point this at production
+## 8. Lessons from running this against a real service
+
+Everything here was found by pointing the harness at the nginx container in
+`docker-compose.test.yml`, not by reasoning about it. Expect to hit these.
+
+**Verify recovery BEFORE you inject anything.** Restart the service through the
+harness first. If the restart path does not work, you have no business breaking
+it — you will have killed something you cannot bring back. This is not
+hypothetical: `service_control` shells out to `systemctl`, and a container has
+no systemd, so on a container target the documented recovery path silently does
+nothing while `kill` works perfectly.
+
+**Allowlist a start path, not just reload.** `nginx -s reload` needs a running
+master; once the process is dead it cannot help. The recovery entry must be
+able to *start* a stopped service. Remember the allowlist stops at the first
+entry matching a command name, so fold start and reload into one entry:
+
+```json
+{ "name": "nginx", "args_regex": "(-s (reload|quit))?" }
+```
+
+(The empty alternative permits bare `nginx`, i.e. start.)
+
+**Probe `127.0.0.1`, not `localhost`.** `localhost` resolves to `::1` first,
+and a service listening only on IPv4 refuses the connection — so a perfectly
+healthy service reports `Connection refused`. That is a *false outage*, and in
+a chaos run you will blame your own fault injection for it.
+
+**Minimal images do not have your tools.** Alpine — the most common container
+base — ships no `curl` and no `dig`. It does have busybox `wget` and `nc`:
+
+```json
+{ "name": "wget", "args_regex": "-q -O - -T \\d{1,2} http://127\\.0\\.0\\.1(:\\d{1,5})?/[a-zA-Z0-9/_.-]*" }
+```
+
+Check what actually exists on the target before writing the profile; an
+allowlist entry for a missing binary fails as `failure`, not `denied`, which
+at least tells you the two apart.
+
+**`chaos.sh` has to get onto the target.** It is a file, not a protocol — ship
+it with your config management, bake it into the image, or mount it
+(`- ./chaos.sh:/app/chaos.sh:ro`). The allowlist references an absolute path;
+putting the file there is your job.
+
+---
+
+## 9. Before you point this at production
 
 - Give the harness token its own scope (`scoped_tokens`) limited to the test
   agents — chaos capability should not ride on your day-to-day operator token.

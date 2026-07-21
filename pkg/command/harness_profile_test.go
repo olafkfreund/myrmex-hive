@@ -79,8 +79,13 @@ func TestHarnessProfileAllowsTheDocumentedWorkflow(t *testing.T) {
 		{"/opt/myrmex/chaos.sh", "status"},
 		{"curl", "-s -o /dev/null -w %{http_code}:%{time_total} --max-time 5 http://localhost:8080/healthz"},
 		{"curl", "-s --max-time 5 http://myservice.internal/api/v1/status"},
+		{"wget", "-q -O - -T 5 http://127.0.0.1:8080/healthz"},
 		{"nc", "-z -w 2 db.internal 5432"},
 		{"dig", "+short db.internal"},
+		// Recovery. Bare (no args) must be permitted: that is the START path,
+		// and without it the harness can kill a service it cannot bring back.
+		{"/usr/sbin/myservice", ""},
+		{"/usr/sbin/myservice", "-s reload"},
 		{"/opt/myrmex/apply-config.sh", "high-timeout"},
 		{"systemctl", "restart myservice"},
 		{"journalctl", "-u myservice -n 200 --no-pager"},
@@ -111,6 +116,8 @@ func TestHarnessProfileDeniesTheDangerousCalls(t *testing.T) {
 		{"shell metacharacter smuggling", "/opt/myrmex/chaos.sh", "status; rm -rf /"},
 		{"trailing-argument padding (the #151 substring class)", "systemctl", "restart myservice extra"},
 		{"a command that is not on the list at all", "bash", "-c whoami"},
+		{"recovery entry must not become a general runner", "/usr/sbin/myservice", "-c /etc/evil.conf"},
+		{"probe pinned away from arbitrary hosts", "wget", "-q -O - -T 5 http://evil.example.com/"},
 	} {
 		if allowlistVerdict(t, c.name, c.args, allow) {
 			t.Errorf("SHOULD BE DENIED (%s) but the allowlist approved: %s %s", c.why, c.name, c.args)
