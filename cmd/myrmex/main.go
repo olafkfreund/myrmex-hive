@@ -236,7 +236,7 @@ Real-Life Scenarios:
      myrmex tools --token <token>
 
   4. Run 'uptime' command on agent-1:
-     myrmex call agent-1__run_command --arguments '{"cmd":"uptime"}' --token <token>
+     myrmex call agent-1__run_command --arguments '{"name":"uptime","args":[]}' --token <token>
 
   5. Ask the AI assistant to inspect memory usage:
      myrmex ask "Check memory usage on agent-nginx and explain it" --token <token>

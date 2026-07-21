@@ -24,6 +24,7 @@ nav:
   - Golden Path: GOLDEN_PATH.md
   - Deployment: DEPLOYMENT.md
   - Observability: OBSERVABILITY.md
+  - Service testing & chaos: SERVICE_TESTING.md
   - Secrets: SECRETS.md
   - Agent enrollment: ENROLLMENT.md
   - Compliance & audit: COMPLIANCE.md
