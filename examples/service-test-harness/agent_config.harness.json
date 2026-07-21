@@ -1,0 +1,57 @@
+{
+  "_comment": "Service-test-harness allowlist profile. See docs/SERVICE_TESTING.md. Copy the allowed_commands entries into your own agent_config.json; the connection fields here are placeholders. Every args_regex is anchored to the WHOLE joined argument string by the agent, so these patterns match exactly what they read.",
+
+  "gateway_addr": "localhost:2222",
+  "private_key_path": "id_ed25519",
+  "agent_id": "test-target-1",
+
+  "allowed_commands": [
+    {
+      "_comment": "FAULT INJECTION. One script, fixed verb set, self-reverting. Durations are capped at 300s inside the script AND by this regex (1-3 digits).",
+      "name": "/opt/myrmex/chaos.sh",
+      "args_regex": "(cpu \\d{1,3} \\d{1,2})|(mem \\d{1,3} \\d{1,4})|((latency|loss) \\d{1,3} \\d{1,3} (eth|ens|enp)[a-z0-9]+)|(kill (TERM|KILL|HUP) /run/myservice\\.pid)|(status)"
+    },
+    {
+      "_comment": "PROBE the service under test, and any OTHER service reachable from this host. This is the 'use the host as a vantage point' capability - no proxy needed. Pin the hosts you actually test against; a bare .+ here turns the agent into a request forwarder. NOTE: ONE entry per command name - the allowlist matches the FIRST entry whose name matches and stops, so a second `curl` entry would be dead config. Add probe variants as alternations here, not as new entries.",
+      "name": "curl",
+      "args_regex": "-s (-o /dev/null -w %\\{http_code\\}:%\\{time_total\\} )?--max-time \\d{1,2} http://(localhost|127\\.0\\.0\\.1|myservice\\.internal)(:\\d{1,5})?/[a-zA-Z0-9/_-]*"
+    },
+    {
+      "_comment": "TCP reachability to a dependency (is the DB even listening?).",
+      "name": "nc",
+      "args_regex": "-z -w \\d{1,2} (localhost|127\\.0\\.0\\.1|db\\.internal|cache\\.internal) \\d{1,5}"
+    },
+    {
+      "_comment": "DNS resolution check - the failure nobody suspects until they do.",
+      "name": "dig",
+      "args_regex": "\\+short (myservice|db|cache)\\.internal"
+    },
+    {
+      "_comment": "APPLY a config change between test iterations. The script owns WHAT may change; this regex only picks which named variant. This is how you 'make changes while testing' without a file_write tool.",
+      "name": "/opt/myrmex/apply-config.sh",
+      "args_regex": "(baseline|high-timeout|low-memory|no-cache)"
+    },
+    {
+      "_comment": "Service lifecycle. service_control covers start/stop/restart/status for these too; this entry is for the non-systemd case.",
+      "name": "systemctl",
+      "args_regex": "(status|restart|start|stop) myservice"
+    },
+    {
+      "_comment": "READ-ONLY diagnostics. Safe to grant broadly.",
+      "name": "journalctl",
+      "args_regex": "-u myservice -n \\d{1,4} --no-pager"
+    },
+    {
+      "name": "ss",
+      "args_regex": "-tlnp"
+    },
+    {
+      "name": "uptime",
+      "args_regex": "^$"
+    },
+    {
+      "name": "df",
+      "args_regex": "-h"
+    }
+  ]
+}
