@@ -10,6 +10,39 @@ import (
 	"testing"
 )
 
+// docs/*.md are rendered by BOTH MkDocs (TechDocs) and Jekyll (the public
+// site at myrmex-hive.freundcloud.com), so they may only use syntax both
+// understand. MkDocs-Material admonitions (`!!! note`, `??? tip`) are the
+// trap: MkDocs draws a styled callout, Jekyll prints the marker as literal
+// text and renders the indented body as a code block with raw markdown links
+// inside it. That shipped to the live site and looked broken.
+//
+// Use a blockquote instead — both renderers handle it.
+func TestDocsAvoidMkDocsOnlyAdmonitions(t *testing.T) {
+	entries, err := os.ReadDir("../../docs")
+	if err != nil {
+		t.Fatalf("cannot read docs/: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join("../../docs", e.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("cannot read %s: %v", path, err)
+			continue
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			if strings.HasPrefix(line, "!!! ") || strings.HasPrefix(line, "??? ") {
+				t.Errorf("docs/%s:%d uses a MkDocs-only admonition, which Jekyll renders as "+
+					"literal text on the public site. Use a blockquote (\"> **Note.** …\").\n  %s",
+					e.Name(), i+1, line)
+			}
+		}
+	}
+}
+
 // A doc missing from mkdocs.yml's nav is invisible in Backstage while looking
 // perfectly fine in the repo — nobody notices until someone goes looking for a
 // page that was never published. This repo has been bitten three times by
