@@ -34,7 +34,7 @@ general "run anything" and no arbitrary file write.
 | `container_ps` | `docker ps` | No |
 | `k8s_get` | `kubectl get …` | No |
 | `package_query` | Query installed packages (dpkg/rpm/apk/pacman/dnf) | No |
-| `service_control` | `systemctl start\|stop\|restart\|status <svc>` | **Yes** |
+| `service_control` | `systemctl start/stop/restart/status <svc>` | **Yes** |
 | `run_command` | Run an **allowlisted** command with matching args | **Yes, if allowlisted** |
 
 So the honest answer to *"can we write to the host and stop/start services?"*:

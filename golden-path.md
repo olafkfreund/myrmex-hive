@@ -32,7 +32,7 @@ no general "run anything."
 | `read_logs` / `file_read` | Read a log / one file (bounded, no traversal) | No |
 | `container_ps` / `k8s_get` | `docker ps` / `kubectl get …` | No |
 | `package_query` | Query installed packages | No |
-| `service_control` | `systemctl start\|stop\|restart\|status` | **Yes** |
+| `service_control` | `systemctl start/stop/restart/status` | **Yes** |
 | `run_command` | Run an **allowlisted** command with matching args | **Yes, if allowlisted** |
 
 The default allowlist ships `systemctl` restricted to `status|restart` on
